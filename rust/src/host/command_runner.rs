@@ -12,8 +12,6 @@ use std::io::{BufRead, BufReader};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Command runner configuration
@@ -258,62 +256,72 @@ impl CommandRunner {
         options: &CommandOptions,
         deadline: Instant,
     ) -> Result<String, CommandError> {
-        let stop_flag = Arc::new(AtomicBool::new(false));
         let mut output = String::new();
         #[allow(unused_assignments)]
         let mut last_output_time = Instant::now();
-
-        // Read stdout in a separate thread
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| CommandError::IoError("Failed to capture stdout".to_string()))?;
-
-        let reader = BufReader::new(stdout);
+        let reader = Self::stdout_reader(child)?;
 
         for line_result in reader.lines() {
-            if stop_flag.load(Ordering::SeqCst) {
-                break;
-            }
-
-            if Instant::now() >= deadline {
+            if Self::past_deadline(deadline) {
                 break;
             }
 
             match line_result {
                 Ok(line) => {
-                    output.push_str(&line);
-                    output.push('\n');
+                    Self::append_output_line(&mut output, &line);
                     last_output_time = Instant::now();
 
-                    // Check stop conditions
-                    if options.stop_on_url
-                        && (line.contains("https://") || line.contains("http://"))
-                    {
+                    if Self::should_stop_after_line(&line, options) {
                         std::thread::sleep(options.settle_after_stop);
                         break;
-                    }
-
-                    for stop_substr in &options.stop_on_substrings {
-                        if line.contains(stop_substr) {
-                            std::thread::sleep(options.settle_after_stop);
-                            stop_flag.store(true, Ordering::SeqCst);
-                            break;
-                        }
                     }
                 }
                 Err(_) => break,
             }
 
-            // Check idle timeout
-            if let Some(idle_timeout) = options.idle_timeout
-                && last_output_time.elapsed() > idle_timeout
-            {
+            if Self::idle_timed_out(options.idle_timeout, last_output_time) {
                 break;
             }
         }
 
         Ok(output)
+    }
+
+    fn stdout_reader(child: &mut Child) -> Result<BufReader<impl std::io::Read>, CommandError> {
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| CommandError::IoError("Failed to capture stdout".to_string()))?;
+
+        Ok(BufReader::new(stdout))
+    }
+
+    fn past_deadline(deadline: Instant) -> bool {
+        Instant::now() >= deadline
+    }
+
+    fn append_output_line(output: &mut String, line: &str) {
+        output.push_str(line);
+        output.push('\n');
+    }
+
+    fn should_stop_after_line(line: &str, options: &CommandOptions) -> bool {
+        Self::line_has_stop_url(line, options.stop_on_url)
+            || Self::line_has_stop_substring(line, &options.stop_on_substrings)
+    }
+
+    fn line_has_stop_url(line: &str, stop_on_url: bool) -> bool {
+        stop_on_url && (line.contains("https://") || line.contains("http://"))
+    }
+
+    fn line_has_stop_substring(line: &str, stop_substrings: &[String]) -> bool {
+        stop_substrings
+            .iter()
+            .any(|stop_substr| line.contains(stop_substr))
+    }
+
+    fn idle_timed_out(idle_timeout: Option<Duration>, last_output_time: Instant) -> bool {
+        idle_timeout.is_some_and(|idle_timeout| last_output_time.elapsed() > idle_timeout)
     }
 
     /// Run a command asynchronously
