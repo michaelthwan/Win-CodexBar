@@ -5,10 +5,11 @@
 #![allow(dead_code)]
 
 use regex_lite::Regex;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// Result of a login attempt
 #[derive(Debug, Clone)]
@@ -116,157 +117,178 @@ async fn run_cli_login<F>(
 where
     F: Fn(LoginPhase) + Send + 'static,
 {
-    // Check if binary exists
     let binary_path = match which::which(binary) {
         Ok(p) => p,
-        Err(_) => {
-            return LoginResult {
-                outcome: LoginOutcome::MissingBinary,
-                output: format!("{} not found in PATH", binary),
-                auth_link: None,
-            };
-        }
+        Err(_) => return missing_binary_result(binary),
     };
 
     on_phase(LoginPhase::Requesting);
 
-    // Spawn process
+    let mut child = match spawn_login_process(binary_path.as_path(), args) {
+        Ok(c) => c,
+        Err(e) => return launch_failed_result(e),
+    };
+
+    let mut state = CliLoginState::new(timeout_secs, &on_phase, success_markers);
+
+    if let Some(outcome) = read_login_stream(child.stdout.take(), &mut state) {
+        return stop_child_with_outcome(&mut child, state, outcome);
+    }
+
+    if let Some(outcome) = read_login_stream(child.stderr.take(), &mut state) {
+        return stop_child_with_outcome(&mut child, state, outcome);
+    }
+
+    wait_for_login_exit(child, state, &on_phase)
+}
+
+fn missing_binary_result(binary: &str) -> LoginResult {
+    LoginResult {
+        outcome: LoginOutcome::MissingBinary,
+        output: format!("{} not found in PATH", binary),
+        auth_link: None,
+    }
+}
+
+fn launch_failed_result(error: String) -> LoginResult {
+    LoginResult {
+        outcome: LoginOutcome::LaunchFailed(error),
+        output: String::new(),
+        auth_link: None,
+    }
+}
+
+fn spawn_login_process(binary_path: &std::path::Path, args: &[&str]) -> Result<Child, String> {
     #[cfg(windows)]
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-    let mut cmd = Command::new(&binary_path);
+    let mut cmd = Command::new(binary_path);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            return LoginResult {
-                outcome: LoginOutcome::LaunchFailed(e.to_string()),
-                output: String::new(),
-                auth_link: None,
-            };
-        }
-    };
+    cmd.spawn().map_err(|e| e.to_string())
+}
 
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+struct CliLoginState<'a, F>
+where
+    F: Fn(LoginPhase),
+{
+    output: String,
+    auth_link: Option<String>,
+    url_regex: Regex,
+    on_phase: &'a F,
+    success_markers: &'a [&'a str],
+    start: Instant,
+    timeout: Duration,
+}
 
-    let mut output = String::new();
-    let mut auth_link = None;
-    let url_regex = Regex::new(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+").unwrap();
-
-    // Read output with timeout
-    let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(timeout_secs);
-
-    // Read stdout
-    if let Some(stdout) = stdout {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            output.push_str(&line);
-            output.push('\n');
-
-            // Check for URL (indicates browser login)
-            if auth_link.is_none()
-                && let Some(m) = url_regex.find(&line)
-            {
-                auth_link = Some(m.as_str().to_string());
-                on_phase(LoginPhase::WaitingBrowser);
-
-                // Open the URL in browser
-                let _ = open::that(m.as_str());
-            }
-
-            // Check for success markers
-            for marker in success_markers {
-                if line.contains(marker) {
-                    on_phase(LoginPhase::Complete);
-                    let _ = child.kill();
-                    return LoginResult {
-                        outcome: LoginOutcome::Success,
-                        output,
-                        auth_link,
-                    };
-                }
-            }
-
-            // Check timeout
-            if start.elapsed() > timeout {
-                let _ = child.kill();
-                return LoginResult {
-                    outcome: LoginOutcome::TimedOut,
-                    output,
-                    auth_link,
-                };
-            }
+impl<'a, F> CliLoginState<'a, F>
+where
+    F: Fn(LoginPhase),
+{
+    fn new(timeout_secs: u64, on_phase: &'a F, success_markers: &'a [&'a str]) -> Self {
+        Self {
+            output: String::new(),
+            auth_link: None,
+            url_regex: Regex::new(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+").unwrap(),
+            on_phase,
+            success_markers,
+            start: Instant::now(),
+            timeout: Duration::from_secs(timeout_secs),
         }
     }
 
-    // Read stderr too
-    if let Some(stderr) = stderr {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().map_while(Result::ok) {
-            output.push_str(&line);
-            output.push('\n');
+    fn handle_line(&mut self, line: &str) -> Option<LoginOutcome> {
+        self.output.push_str(line);
+        self.output.push('\n');
+        self.capture_auth_link(line);
 
-            if auth_link.is_none()
-                && let Some(m) = url_regex.find(&line)
-            {
-                auth_link = Some(m.as_str().to_string());
-                on_phase(LoginPhase::WaitingBrowser);
-                let _ = open::that(m.as_str());
-            }
-
-            for marker in success_markers {
-                if line.contains(marker) {
-                    on_phase(LoginPhase::Complete);
-                    let _ = child.kill();
-                    return LoginResult {
-                        outcome: LoginOutcome::Success,
-                        output,
-                        auth_link,
-                    };
-                }
-            }
-
-            if start.elapsed() > timeout {
-                let _ = child.kill();
-                return LoginResult {
-                    outcome: LoginOutcome::TimedOut,
-                    output,
-                    auth_link,
-                };
-            }
+        if self
+            .success_markers
+            .iter()
+            .any(|marker| line.contains(marker))
+        {
+            (self.on_phase)(LoginPhase::Complete);
+            return Some(LoginOutcome::Success);
         }
+
+        self.start
+            .elapsed()
+            .gt(&self.timeout)
+            .then_some(LoginOutcome::TimedOut)
     }
 
-    // Wait for process to complete
+    fn capture_auth_link(&mut self, line: &str) {
+        if self.auth_link.is_some() {
+            return;
+        }
+
+        let Some(m) = self.url_regex.find(line) else {
+            return;
+        };
+
+        self.auth_link = Some(m.as_str().to_string());
+        (self.on_phase)(LoginPhase::WaitingBrowser);
+        let _ = open::that(m.as_str());
+    }
+
+    fn into_result(self, outcome: LoginOutcome) -> LoginResult {
+        LoginResult {
+            outcome,
+            output: self.output,
+            auth_link: self.auth_link,
+        }
+    }
+}
+
+fn read_login_stream<R, F>(
+    stream: Option<R>,
+    state: &mut CliLoginState<'_, F>,
+) -> Option<LoginOutcome>
+where
+    R: Read,
+    F: Fn(LoginPhase),
+{
+    let reader = BufReader::new(stream?);
+    reader
+        .lines()
+        .map_while(Result::ok)
+        .find_map(|line| state.handle_line(&line))
+}
+
+fn stop_child_with_outcome<F>(
+    child: &mut Child,
+    state: CliLoginState<'_, F>,
+    outcome: LoginOutcome,
+) -> LoginResult
+where
+    F: Fn(LoginPhase),
+{
+    let _ = child.kill();
+    state.into_result(outcome)
+}
+
+fn wait_for_login_exit<F>(
+    mut child: Child,
+    state: CliLoginState<'_, F>,
+    on_phase: &F,
+) -> LoginResult
+where
+    F: Fn(LoginPhase),
+{
     match child.wait() {
         Ok(status) => {
             if status.success() {
                 on_phase(LoginPhase::Complete);
-                LoginResult {
-                    outcome: LoginOutcome::Success,
-                    output,
-                    auth_link,
-                }
+                state.into_result(LoginOutcome::Success)
             } else {
-                LoginResult {
-                    outcome: LoginOutcome::Failed {
-                        status: status.code().unwrap_or(-1),
-                    },
-                    output,
-                    auth_link,
-                }
+                state.into_result(LoginOutcome::Failed {
+                    status: status.code().unwrap_or(-1),
+                })
             }
         }
-        Err(e) => LoginResult {
-            outcome: LoginOutcome::LaunchFailed(e.to_string()),
-            output,
-            auth_link,
-        },
+        Err(e) => state.into_result(LoginOutcome::LaunchFailed(e.to_string())),
     }
 }
 
