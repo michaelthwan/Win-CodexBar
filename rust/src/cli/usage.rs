@@ -138,105 +138,174 @@ struct ErrorPayload {
 
 /// Run the usage command
 pub async fn run(args: UsageArgs) -> anyhow::Result<()> {
-    let format = if args.json {
+    let command = UsageCommand::from_args(args)?;
+    command.log();
+    let output = collect_usage_output(&command).await;
+    print_usage_output(output)
+}
+
+struct UsageCommand {
+    format: OutputFormat,
+    providers: Vec<ProviderId>,
+    use_color: bool,
+    fetch_status: bool,
+    pretty: bool,
+    ctx: FetchContext,
+}
+
+impl UsageCommand {
+    fn from_args(args: UsageArgs) -> anyhow::Result<Self> {
+        let format = effective_format(&args);
+        let source_mode = SourceMode::parse(&args.source).unwrap_or(SourceMode::Auto);
+        let providers = ProviderSelection::from_arg(args.provider.as_deref())?.as_list();
+
+        Ok(Self {
+            format,
+            providers,
+            use_color: !args.no_color && is_terminal(),
+            fetch_status: args.status,
+            pretty: args.pretty,
+            ctx: build_usage_fetch_context(&args, source_mode),
+        })
+    }
+
+    fn log(&self) {
+        tracing::debug!(
+            "Running usage command: providers={:?}, format={:?}, source={:?}, status={}",
+            self.providers,
+            self.format,
+            self.ctx.source_mode,
+            self.fetch_status
+        );
+    }
+}
+
+fn effective_format(args: &UsageArgs) -> OutputFormat {
+    if args.json {
         OutputFormat::Json
     } else {
         args.format
-    };
+    }
+}
 
-    let source_mode = SourceMode::parse(&args.source).unwrap_or(SourceMode::Auto);
-    let providers = ProviderSelection::from_arg(args.provider.as_deref())?;
-    let use_color = !args.no_color && is_terminal();
-    let fetch_status = args.status;
-
-    tracing::debug!(
-        "Running usage command: providers={:?}, format={:?}, source={:?}, status={}",
-        providers.as_list(),
-        format,
-        source_mode,
-        fetch_status
-    );
-
-    let ctx = FetchContext {
+fn build_usage_fetch_context(args: &UsageArgs, source_mode: SourceMode) -> FetchContext {
+    FetchContext {
         source_mode,
         include_credits: !args.no_credits,
         web_timeout: args.web_timeout,
         verbose: false,
         manual_cookie_header: None,
         api_key: None,
-    };
+    }
+}
 
-    let mut results: Vec<serde_json::Value> = Vec::new();
-    let mut text_sections: Vec<String> = Vec::new();
+enum UsageOutput {
+    Text(Vec<String>),
+    Json {
+        results: Vec<serde_json::Value>,
+        pretty: bool,
+    },
+}
 
-    for provider_id in providers.as_list() {
-        let provider = instantiate_provider(provider_id);
-
-        // Optionally fetch status in parallel with usage
-        let status_future = if fetch_status {
-            Some(fetch_provider_status(provider_id.cli_name()))
-        } else {
-            None
-        };
-
-        match provider.fetch_usage(&ctx).await {
-            Ok(result) => {
-                let status = if let Some(fut) = status_future {
-                    fut.await
-                } else {
-                    None
-                };
-
-                if format == OutputFormat::Text {
-                    text_sections.push(render_text_with_status(
-                        provider_id,
-                        &result,
-                        status.as_ref(),
-                        use_color,
-                    ));
-                } else {
-                    let mut json_result = serde_json::json!({
-                        "provider": provider_id.cli_name(),
-                        "source": result.source_label,
-                        "usage": result.usage,
-                        "cost": result.cost,
-                    });
-
-                    if let Some(ref s) = status {
-                        json_result["status"] = serde_json::json!({
-                            "level": format!("{:?}", s.level).to_lowercase(),
-                            "description": s.description,
-                        });
-                    }
-
-                    results.push(json_result);
-                }
+async fn collect_usage_output(command: &UsageCommand) -> UsageOutput {
+    match command.format {
+        OutputFormat::Text => {
+            let mut sections = Vec::new();
+            for provider_id in &command.providers {
+                sections.push(fetch_provider_text_output(*provider_id, command).await);
             }
-            Err(e) => {
-                let error_msg = e.to_string();
-                if format == OutputFormat::Text {
-                    let header = if use_color {
-                        format!("\x1b[1m{}\x1b[0m", provider_id.display_name())
-                    } else {
-                        provider_id.display_name().to_string()
-                    };
-                    text_sections.push(format!("{}  Error: {}", header, error_msg));
-                } else {
-                    results.push(serde_json::json!({
-                        "provider": provider_id.cli_name(),
-                        "error": error_msg,
-                    }));
-                }
+            UsageOutput::Text(sections)
+        }
+        OutputFormat::Json => {
+            let mut results = Vec::new();
+            for provider_id in &command.providers {
+                results.push(fetch_provider_json_output(*provider_id, command).await);
+            }
+            UsageOutput::Json {
+                results,
+                pretty: command.pretty,
             }
         }
     }
+}
 
-    match format {
-        OutputFormat::Text => {
-            println!("{}", text_sections.join("\n\n"));
+async fn fetch_provider_text_output(provider_id: ProviderId, command: &UsageCommand) -> String {
+    match fetch_provider_result(provider_id, command).await {
+        Ok((result, status)) => {
+            render_text_with_status(provider_id, &result, status.as_ref(), command.use_color)
         }
-        OutputFormat::Json => {
-            let output = if args.pretty {
+        Err(e) => render_text_error(provider_id, &e.to_string(), command.use_color),
+    }
+}
+
+async fn fetch_provider_json_output(
+    provider_id: ProviderId,
+    command: &UsageCommand,
+) -> serde_json::Value {
+    match fetch_provider_result(provider_id, command).await {
+        Ok((result, status)) => render_json_result(provider_id, result, status.as_ref()),
+        Err(e) => serde_json::json!({
+            "provider": provider_id.cli_name(),
+            "error": e.to_string(),
+        }),
+    }
+}
+
+async fn fetch_provider_result(
+    provider_id: ProviderId,
+    command: &UsageCommand,
+) -> anyhow::Result<(ProviderFetchResult, Option<StatusInfo>)> {
+    let provider = instantiate_provider(provider_id);
+    let status_future = command
+        .fetch_status
+        .then(|| fetch_provider_status(provider_id.cli_name()));
+    let result = provider.fetch_usage(&command.ctx).await?;
+    let status = if let Some(fut) = status_future {
+        fut.await
+    } else {
+        None
+    };
+    Ok((result, status))
+}
+
+fn render_text_error(provider_id: ProviderId, error_msg: &str, use_color: bool) -> String {
+    let header = if use_color {
+        format!("\x1b[1m{}\x1b[0m", provider_id.display_name())
+    } else {
+        provider_id.display_name().to_string()
+    };
+    format!("{}  Error: {}", header, error_msg)
+}
+
+fn render_json_result(
+    provider_id: ProviderId,
+    result: ProviderFetchResult,
+    status: Option<&StatusInfo>,
+) -> serde_json::Value {
+    let mut json_result = serde_json::json!({
+        "provider": provider_id.cli_name(),
+        "source": result.source_label,
+        "usage": result.usage,
+        "cost": result.cost,
+    });
+
+    if let Some(s) = status {
+        json_result["status"] = serde_json::json!({
+            "level": format!("{:?}", s.level).to_lowercase(),
+            "description": s.description,
+        });
+    }
+
+    json_result
+}
+
+fn print_usage_output(output: UsageOutput) -> anyhow::Result<()> {
+    match output {
+        UsageOutput::Text(sections) => {
+            println!("{}", sections.join("\n\n"));
+        }
+        UsageOutput::Json { results, pretty } => {
+            let output = if pretty {
                 serde_json::to_string_pretty(&results)?
             } else {
                 serde_json::to_string(&results)?
