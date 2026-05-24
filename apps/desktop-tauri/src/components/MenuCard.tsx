@@ -62,6 +62,59 @@ function formatCurrency(amount: number, code: string): string {
   }
 }
 
+const DEMO_COST_BARS = [
+  0.58, 0.73, 0.66, 0.62, 0.26, 0.86, 0.17, 0.10, 0.21, 0.19,
+  0.23, 0.38, 0.09, 0.34, 0.24, 1.0, 0.42, 0.51, 0.14, 0.08,
+  0.20, 0.15, 0.22, 0.11, 0.18, 0.41, 0.55, 0.16, 0.44, 0.31,
+];
+
+function DemoLocalUsageBlock({ providerId }: { providerId: string }) {
+  const isCodex = providerId === "codex";
+  const isClaude = providerId === "claude";
+  if (!DEMO_ENABLED || (!isCodex && !isClaude)) return null;
+
+  return (
+    <section className="menu-card__group menu-card__local-usage">
+      <div className="menu-card__local-grid">
+        <div>
+          <span className="menu-card__local-label">Today</span>
+          <strong>{isCodex ? "$75.24" : "—"}</strong>
+        </div>
+        <div>
+          <span className="menu-card__local-label">30d cost</span>
+          <strong>{isCodex ? "$3,442.16" : "—"}</strong>
+        </div>
+        <div>
+          <span className="menu-card__local-label">30d tokens</span>
+          <strong>{isCodex ? "4.7B" : "584K"}</strong>
+        </div>
+        <div>
+          <span className="menu-card__local-label">Latest tokens</span>
+          <strong>{isCodex ? "115M" : "352K"}</strong>
+        </div>
+      </div>
+
+      {isCodex && (
+        <div className="menu-card__local-chart" aria-label="30 day cost histogram">
+          {DEMO_COST_BARS.map((height, index) => (
+            <span
+              key={index}
+              style={{ height: `${Math.max(4, Math.round(height * 64))}px` }}
+            />
+          ))}
+        </div>
+      )}
+
+      <div className="menu-card__local-note">
+        <strong>Top model: {isCodex ? "gpt-5.5" : "glm-4.6"}</strong>
+        <span>
+          Estimated from local {isCodex ? "logs" : "Claude logs at API rates; token totals may differ from your bill"}
+        </span>
+      </div>
+    </section>
+  );
+}
+
 /**
  * Format a backend `updatedAt` timestamp as a short relative string
  * ("just now", "2m ago", "3h ago", "5d ago"). If the value isn't a parseable
@@ -242,7 +295,11 @@ export default function MenuCard({ provider, hideEmail, resetTimeRelative }: Men
   const hasMetrics = metrics.length > 0;
   const hasCost = !!provider.cost;
   const hasPace = !!provider.pace;
-  const hasDetails = !provider.error && (hasMetrics || hasCost || hasPace || hasCharts);
+  const hasDemoLocalUsage =
+    DEMO_ENABLED && ["codex", "claude"].includes(provider.providerId);
+  const hasDetails =
+    (!provider.error && (hasMetrics || hasCost || hasPace || hasCharts)) ||
+    hasDemoLocalUsage;
 
   return (
     <article className={`menu-card${provider.error ? " menu-card--error" : ""}`}>
@@ -255,9 +312,7 @@ export default function MenuCard({ provider, hideEmail, resetTimeRelative }: Men
         </div>
         {provider.error ? (
           <div className="menu-card__error-block">
-            <div style={{ display: 'table', tableLayout: 'fixed', width: '130px' }}>
-              <div className="menu-card__error-text" style={{ display: 'table-cell' }}>{provider.error}</div>
-            </div>
+            <div className="menu-card__error-text">{provider.error}</div>
             <CopyIconButton text={provider.error} />
           </div>
         ) : (
@@ -276,7 +331,7 @@ export default function MenuCard({ provider, hideEmail, resetTimeRelative }: Men
 
       {hasDetails && (
         <div className="menu-card__content">
-          {hasMetrics && (
+          {!provider.error && hasMetrics && (
             <section className="menu-card__group menu-card__metrics">
               {metrics.map((m) => (
                 <MetricRow
@@ -289,6 +344,8 @@ export default function MenuCard({ provider, hideEmail, resetTimeRelative }: Men
               ))}
             </section>
           )}
+
+          <DemoLocalUsageBlock providerId={provider.providerId} />
 
           {hasMetrics && hasCost && <div className="menu-card__divider" />}
 

@@ -122,7 +122,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
   // bounce to max height and back while providers finish refreshing.
   useEffect(() => {
     const TRAY_WIDTH = 310;
-    const MAX_HEIGHT = 800;
+    const MAX_HEIGHT = 920;
     const MIN_HEIGHT = 200;
 
     const resize = async () => {
