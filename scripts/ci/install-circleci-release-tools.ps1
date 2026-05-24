@@ -2,6 +2,9 @@
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$env:CARGO_TERM_COLOR = "never"
+$env:CARGO_TERM_PROGRESS_WHEN = "never"
+$env:NO_COLOR = "1"
 trap {
     Write-Host $_
     [Environment]::Exit(1)

@@ -61,6 +61,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$env:CARGO_TERM_COLOR = "never"
+$env:CARGO_TERM_PROGRESS_WHEN = "never"
+$env:NO_COLOR = "1"
 trap {
     Write-Host $_
     [Environment]::Exit(1)
@@ -210,13 +213,20 @@ try {
         "--store-dir", $PnpmStoreDir
     )
 
-    Invoke-Native $pnpm.Source @(
+    $tauriBuildLog = Join-Path $AssetsDir "tauri-build.log"
+    Write-Host "Running Tauri build. Full log: $tauriBuildLog"
+    & $pnpm.Source @(
         "--dir", "apps\desktop-tauri",
         "exec",
         "tauri",
         "build",
         "--no-bundle"
-    )
+    ) *> $tauriBuildLog
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Tauri build failed with exit code $LASTEXITCODE. Last 300 log lines:"
+        Get-Content $tauriBuildLog -Tail 300
+        throw "$($pnpm.Source) exited with code $LASTEXITCODE"
+    }
 
     $releaseBinDir = if ($env:CARGO_BUILD_TARGET) {
         Join-Path $DesktopCargoTargetDir "$($env:CARGO_BUILD_TARGET)\release"
