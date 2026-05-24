@@ -412,11 +412,21 @@ export interface DailyUsageBreakdown {
   totalCreditsUsed: number;
 }
 
+export interface ProviderLocalUsageSummary {
+  todayCost: number | null;
+  thirtyDayCost: number | null;
+  thirtyDayTokens: number | null;
+  latestTokens: number | null;
+  topModel: string | null;
+  estimateNote: string;
+}
+
 export interface ProviderChartData {
   providerId: string;
   costHistory: DailyCostPoint[];
   creditsHistory: DailyCostPoint[];
   usageBreakdown: DailyUsageBreakdown[];
+  localUsage: ProviderLocalUsageSummary | null;
 }
 
 // ── Token account types ──────────────────────────────────────────────

@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import type {
+  DailyCostPoint,
   PaceSnapshot,
   ProviderChartData,
+  ProviderLocalUsageSummary,
   ProviderUsageSnapshot,
   RateWindowSnapshot,
 } from "../types/bridge";
@@ -68,48 +70,106 @@ const DEMO_COST_BARS = [
   0.20, 0.15, 0.22, 0.11, 0.18, 0.41, 0.55, 0.16, 0.44, 0.31,
 ];
 
-function DemoLocalUsageBlock({ providerId }: { providerId: string }) {
+const DEMO_LOCAL_USAGE: Record<string, ProviderLocalUsageSummary> = {
+  codex: {
+    todayCost: 75.24,
+    thirtyDayCost: 3442.16,
+    thirtyDayTokens: 4_700_000_000,
+    latestTokens: 115_000_000,
+    topModel: "gpt-5.5",
+    estimateNote: "Estimated from local logs; may differ from your bill",
+  },
+  claude: {
+    todayCost: null,
+    thirtyDayCost: null,
+    thirtyDayTokens: 584_000,
+    latestTokens: 352_000,
+    topModel: "glm-4.6",
+    estimateNote:
+      "Estimated from local Claude logs at API rates; token totals may differ from your bill",
+  },
+};
+
+function formatCompactCount(value: number | null): string {
+  if (value == null || value <= 0) return "—";
+  return new Intl.NumberFormat("en-US", {
+    notation: "compact",
+    maximumFractionDigits: value >= 1_000_000 ? 1 : 0,
+  }).format(value);
+}
+
+function localUsageForDemo(providerId: string): ProviderLocalUsageSummary | null {
+  return DEMO_ENABLED ? DEMO_LOCAL_USAGE[providerId] ?? null : null;
+}
+
+function costBarsForDemo(): DailyCostPoint[] {
+  return DEMO_COST_BARS.map((value, index) => ({
+    date: String(index),
+    value,
+  }));
+}
+
+function LocalUsageBlock({
+  providerId,
+  summary,
+  costHistory,
+}: {
+  providerId: string;
+  summary: ProviderLocalUsageSummary;
+  costHistory: DailyCostPoint[];
+}) {
   const isCodex = providerId === "codex";
-  const isClaude = providerId === "claude";
-  if (!DEMO_ENABLED || (!isCodex && !isClaude)) return null;
+  const visibleHistory = costHistory
+    .slice(-30)
+    .filter((point) => point.value > 0);
+  const maxCost = Math.max(...visibleHistory.map((point) => point.value), 0);
 
   return (
     <section className="menu-card__group menu-card__local-usage">
       <div className="menu-card__local-grid">
         <div>
           <span className="menu-card__local-label">Today</span>
-          <strong>{isCodex ? "$75.24" : "—"}</strong>
+          <strong>
+            {summary.todayCost != null
+              ? formatCurrency(summary.todayCost, "USD")
+              : "—"}
+          </strong>
         </div>
         <div>
           <span className="menu-card__local-label">30d cost</span>
-          <strong>{isCodex ? "$3,442.16" : "—"}</strong>
+          <strong>
+            {summary.thirtyDayCost != null
+              ? formatCurrency(summary.thirtyDayCost, "USD")
+              : "—"}
+          </strong>
         </div>
         <div>
           <span className="menu-card__local-label">30d tokens</span>
-          <strong>{isCodex ? "4.7B" : "584K"}</strong>
+          <strong>{formatCompactCount(summary.thirtyDayTokens)}</strong>
         </div>
         <div>
           <span className="menu-card__local-label">Latest tokens</span>
-          <strong>{isCodex ? "115M" : "352K"}</strong>
+          <strong>{formatCompactCount(summary.latestTokens)}</strong>
         </div>
       </div>
 
-      {isCodex && (
+      {isCodex && visibleHistory.length > 0 && (
         <div className="menu-card__local-chart" aria-label="30 day cost histogram">
-          {DEMO_COST_BARS.map((height, index) => (
+          {visibleHistory.map((point, index) => (
             <span
-              key={index}
-              style={{ height: `${Math.max(4, Math.round(height * 64))}px` }}
+              key={`${point.date}-${index}`}
+              style={{
+                height: `${Math.max(4, Math.round((point.value / maxCost) * 64))}px`,
+              }}
+              title={`${point.date}: ${formatCurrency(point.value, "USD")}`}
             />
           ))}
         </div>
       )}
 
       <div className="menu-card__local-note">
-        <strong>Top model: {isCodex ? "gpt-5.5" : "glm-4.6"}</strong>
-        <span>
-          Estimated from local {isCodex ? "logs" : "Claude logs at API rates; token totals may differ from your bill"}
-        </span>
+        {summary.topModel && <strong>Top model: {summary.topModel}</strong>}
+        <span>{summary.estimateNote}</span>
       </div>
     </section>
   );
@@ -286,20 +346,24 @@ export default function MenuCard({ provider, hideEmail, resetTimeRelative }: Men
     metrics.push({ label: extra.title, snap: extra.window });
   }
 
-  const hasCostHistory = chartData !== null && chartData.costHistory.length > 0;
+  const hasCostHistory =
+    chartData !== null && chartData.costHistory.some((point) => point.value > 0);
   const hasCreditsHistory =
     chartData !== null && chartData.creditsHistory.length > 0;
   const hasUsageBreakdown =
     chartData !== null && chartData.usageBreakdown.length > 0;
   const hasCharts = hasCostHistory || hasCreditsHistory || hasUsageBreakdown;
+  const demoLocalUsage = localUsageForDemo(provider.providerId);
+  const localUsage = chartData?.localUsage ?? demoLocalUsage;
+  const localCostHistory = DEMO_ENABLED
+    ? costBarsForDemo()
+    : chartData?.costHistory ?? [];
   const hasMetrics = metrics.length > 0;
   const hasCost = !!provider.cost;
   const hasPace = !!provider.pace;
-  const hasDemoLocalUsage =
-    DEMO_ENABLED && ["codex", "claude"].includes(provider.providerId);
   const hasDetails =
     (!provider.error && (hasMetrics || hasCost || hasPace || hasCharts)) ||
-    hasDemoLocalUsage;
+    !!localUsage;
 
   return (
     <article className={`menu-card${provider.error ? " menu-card--error" : ""}`}>
@@ -345,7 +409,13 @@ export default function MenuCard({ provider, hideEmail, resetTimeRelative }: Men
             </section>
           )}
 
-          <DemoLocalUsageBlock providerId={provider.providerId} />
+          {localUsage && (
+            <LocalUsageBlock
+              providerId={provider.providerId}
+              summary={localUsage}
+              costHistory={localCostHistory}
+            />
+          )}
 
           {hasMetrics && hasCost && <div className="menu-card__divider" />}
 
