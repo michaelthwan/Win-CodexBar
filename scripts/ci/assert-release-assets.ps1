@@ -4,7 +4,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 trap {
     Write-Error $_
-    exit 1
+    [Environment]::Exit(1)
 }
 
 $versionLine = Get-Content rust\Cargo.toml | Where-Object { $_ -match '^version = "([^"]+)"' } | Select-Object -First 1
