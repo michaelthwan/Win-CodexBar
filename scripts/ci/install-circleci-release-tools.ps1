@@ -33,6 +33,41 @@ function Install-ChocoPackages {
     choco install @Packages -y --no-progress
 }
 
+function Add-CargoPath {
+    if (Test-Path $cargoBin) {
+        $env:Path = "$cargoBin;$env:Path"
+    }
+}
+
+function Install-MinimalRustupToolchain {
+    if (-not (Test-Command "rustup")) {
+        $rustupInit = Join-Path $env:TEMP "rustup-init.exe"
+        $rustupUrl = "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe"
+        Invoke-WebRequest -Uri $rustupUrl -OutFile $rustupInit
+        & $rustupInit -y --no-modify-path --profile minimal --default-toolchain stable-x86_64-pc-windows-msvc
+        if ($LASTEXITCODE -ne 0) {
+            throw "rustup-init failed with exit code $LASTEXITCODE"
+        }
+
+        Add-CargoPath
+    } else {
+        rustup set profile minimal
+        if ($LASTEXITCODE -ne 0) {
+            throw "rustup set profile failed with exit code $LASTEXITCODE"
+        }
+
+        rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --no-self-update
+        if ($LASTEXITCODE -ne 0) {
+            throw "rustup toolchain install failed with exit code $LASTEXITCODE"
+        }
+
+        rustup default stable-x86_64-pc-windows-msvc
+        if ($LASTEXITCODE -ne 0) {
+            throw "rustup default failed with exit code $LASTEXITCODE"
+        }
+    }
+}
+
 $fullRelease = $env:FULL_WINDOWS_RELEASE -eq "true"
 $packages = @()
 if (-not (Test-Command "git")) {
@@ -52,25 +87,11 @@ Install-ChocoPackages $packages
 
 $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
     [System.Environment]::GetEnvironmentVariable("Path", "User")
-if (Test-Path $cargoBin) {
-    $env:Path = "$cargoBin;$env:Path"
-}
+Add-CargoPath
 
-if (-not (Test-Command "rustup")) {
-    choco install rustup.install -y --no-progress
-    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
-        [System.Environment]::GetEnvironmentVariable("Path", "User")
-    if (Test-Path $cargoBin) {
-        $env:Path = "$cargoBin;$env:Path"
-    }
-}
+Install-MinimalRustupToolchain
 
 if (Test-Command "rustup") {
-    rustup default stable-x86_64-pc-windows-msvc
-    if ($LASTEXITCODE -ne 0) {
-        throw "rustup default failed with exit code $LASTEXITCODE"
-    }
-
     rustup set auto-self-update disable
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Warning: rustup auto-self-update disable failed with exit code $LASTEXITCODE"
