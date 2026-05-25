@@ -101,22 +101,14 @@ function Install-RustPackage {
 
     $componentList = Join-Path $Directory "components"
     foreach ($component in Get-Content $componentList) {
-        $manifest = Join-Path (Join-Path $Directory $component) "manifest.in"
-        foreach ($entry in Get-Content $manifest) {
-            if ($entry.StartsWith("file:") -or $entry.StartsWith("dir:")) {
-                if ($entry.StartsWith("file:")) {
-                    $relativePath = $entry.Substring(5)
-                } else {
-                    $relativePath = $entry.Substring(4)
-                }
-                $source = Join-Path (Join-Path $Directory $component) $relativePath
-                $target = Join-Path $rustRoot $relativePath
-                $targetParent = Split-Path -Parent $target
-                if ($targetParent -and -not (Test-Path $targetParent)) {
-                    New-Item -ItemType Directory -Force $targetParent | Out-Null
-                }
-                Move-Item -Force $source $target
-            }
+        $componentDir = Join-Path $Directory $component
+        if (-not (Test-Path $componentDir)) {
+            throw "Missing Rust component directory $componentDir"
+        }
+
+        & robocopy.exe $componentDir $rustRoot /E /NFL /NDL /NJH /NJS /NP
+        if ($LASTEXITCODE -gt 7) {
+            throw "robocopy failed installing Rust component $component with exit code $LASTEXITCODE"
         }
     }
 }
