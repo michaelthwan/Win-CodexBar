@@ -46,24 +46,18 @@ function Install-MinimalRustupToolchain {
         $rustupInit = Join-Path $env:TEMP "rustup-init.exe"
         $rustupUrl = "https://static.rust-lang.org/rustup/archive/1.27.1/x86_64-pc-windows-msvc/rustup-init.exe"
         $rustupChecksum = "193d6c727e18734edbf7303180657e96e9d5a08432002b4e6c5bbe77c60cb3e8"
-        $chocoHelpers = Join-Path $env:ChocolateyInstall "helpers\chocolateyInstaller.psm1"
-
-        if (-not (Test-Path $chocoHelpers)) {
-            throw "Chocolatey helper module not found at $chocoHelpers"
-        }
-
-        Import-Module $chocoHelpers -Force
-        Write-Host "Downloading rustup-init through Chocolatey helper..."
-        Get-ChocolateyWebFile `
-            -PackageName "rustup.install" `
-            -FileFullPath $rustupInit `
-            -Url64bit $rustupUrl `
-            -Checksum64 $rustupChecksum `
-            -ChecksumType64 "sha256" | Out-Null
+        Write-Host "Downloading rustup-init through BITS..."
+        Start-BitsTransfer -Source $rustupUrl -Destination $rustupInit
 
         if (-not (Test-Path $rustupInit)) {
             throw "rustup-init download did not create $rustupInit"
         }
+
+        $actualChecksum = (Get-FileHash -Path $rustupInit -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualChecksum -ne $rustupChecksum) {
+            throw "rustup-init SHA-256 mismatch: expected $rustupChecksum, got $actualChecksum"
+        }
+        Write-Host "rustup-init SHA-256 verified."
 
         Write-Host "Installing rustup without a default toolchain..."
         & $rustupInit -y --no-modify-path --profile minimal --default-toolchain none
