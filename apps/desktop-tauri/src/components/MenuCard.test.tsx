@@ -1,6 +1,4 @@
 import { render, screen, waitFor } from "@testing-library/react";
-// @ts-expect-error Vitest runs this test in Node; the app tsconfig omits Node types.
-import { readFileSync } from "node:fs";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const tauriMocks = vi.hoisted(() => ({
@@ -62,7 +60,7 @@ function provider(error: string | null, usedPercent = 0): ProviderUsageSnapshot 
 
 function renderCard(
   snapshot: ProviderUsageSnapshot,
-  opts: { showAsUsed?: boolean } = {},
+  opts: { showAsUsed?: boolean; onLayoutChange?: () => void } = {},
 ) {
   return render(
     <LocaleProvider>
@@ -71,6 +69,7 @@ function renderCard(
         hideEmail={false}
         resetTimeRelative={true}
         showAsUsed={opts.showAsUsed}
+        onLayoutChange={opts.onLayoutChange}
       />
     </LocaleProvider>,
   );
@@ -124,29 +123,22 @@ describe("MenuCard", () => {
   });
 
   it("notifies the tray panel after async local usage data loads", async () => {
-    const listener = vi.fn();
-    window.addEventListener("codexbar:menu-card-layout-change", listener);
+    const onLayoutChange = vi.fn();
 
-    renderCard(provider(null));
+    renderCard(provider(null), { onLayoutChange });
 
     await waitFor(() => {
-      expect(listener).toHaveBeenCalled();
+      expect(onLayoutChange).toHaveBeenCalled();
     });
-
-    window.removeEventListener("codexbar:menu-card-layout-change", listener);
   });
 
-  it("keeps local token and cost totals visible in the tray panel", () => {
-    const styles = readFileSync("src/styles.css", "utf8");
+  it("renders local token and cost totals after chart data loads", async () => {
+    renderCard(provider(null));
 
-    expect(styles).not.toMatch(
-      /\.menu-surface--tray\s+\.menu-card__local-usage\s*\{[^}]*display:\s*none/s,
-    );
-    expect(styles).toMatch(
-      /\.menu-surface--tray\s+\.menu-stack\s*\{[^}]*flex:\s*0\s+0\s+auto/s,
-    );
-    expect(styles).toMatch(
-      /\.menu-surface--tray\s+\.menu-card__local-chart\s*\{[^}]*display:\s*none/s,
-    );
+    expect(await screen.findByText("30d cost")).toBeInTheDocument();
+    expect(screen.getAllByText("$1.23").length).toBeGreaterThan(0);
+    expect(screen.getByText("30d tokens")).toBeInTheDocument();
+    expect(screen.getByText("584K")).toBeInTheDocument();
+    expect(screen.getByText("Estimated from local logs")).toBeInTheDocument();
   });
 });

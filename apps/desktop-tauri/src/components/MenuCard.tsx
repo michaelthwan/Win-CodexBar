@@ -48,6 +48,7 @@ interface MenuCardProps {
   resetTimeRelative: boolean;
   showAsUsed?: boolean;
   compactMetrics?: boolean;
+  onLayoutChange?: () => void;
 }
 
 function maskEmail(email: string): string {
@@ -92,14 +93,6 @@ const DEMO_LOCAL_USAGE: Record<string, ProviderLocalUsageSummary> = {
       "Estimated from local Claude logs at API rates; token totals may differ from your bill",
   },
 };
-
-const MENU_CARD_LAYOUT_CHANGE_EVENT = "codexbar:menu-card-layout-change";
-
-function notifyMenuCardLayoutChange() {
-  requestAnimationFrame(() => {
-    window.dispatchEvent(new Event(MENU_CARD_LAYOUT_CHANGE_EVENT));
-  });
-}
 
 function formatCompactCount(value: number | null): string {
   if (value == null || value <= 0) return "—";
@@ -324,6 +317,7 @@ export default function MenuCard({
   resetTimeRelative,
   showAsUsed = false,
   compactMetrics = false,
+  onLayoutChange,
 }: MenuCardProps) {
   const { t } = useLocale();
   const [chartData, setChartData] = useState<ProviderChartData | null>(null);
@@ -347,7 +341,7 @@ export default function MenuCard({
       .then((data) => {
         if (!cancelled) {
           setChartData(data);
-          notifyMenuCardLayoutChange();
+          requestAnimationFrame(() => onLayoutChange?.());
         }
       })
       .catch(() => {
@@ -356,7 +350,7 @@ export default function MenuCard({
     return () => {
       cancelled = true;
     };
-  }, [provider.providerId, provider.accountEmail]);
+  }, [provider.providerId, provider.accountEmail, onLayoutChange]);
 
   const email = provider.accountEmail
     ? hideEmail

@@ -98,6 +98,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
   const [layoutRevision, setLayoutRevision] = useState(0);
   const layoutReadyRef = useRef(false);
   const resizeRunRef = useRef(0);
+  const layoutTimerRef = useRef<number | undefined>(undefined);
 
   // Cards to display based on mode
   // Overview: all providers in the grid — non-error first, then errors
@@ -127,23 +128,20 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
     return [match];
   }, [sorted, selectedProviderId, gridExpanded]);
 
-  useEffect(() => {
-    let timer: number | undefined;
-    const scheduleResize = () => {
-      if (timer !== undefined) {
-        window.clearTimeout(timer);
-      }
-      timer = window.setTimeout(() => {
-        setLayoutRevision((current) => current + 1);
-      }, 50);
-    };
+  const handleMenuCardLayoutChange = useCallback(() => {
+    if (layoutTimerRef.current !== undefined) {
+      window.clearTimeout(layoutTimerRef.current);
+    }
+    layoutTimerRef.current = window.setTimeout(() => {
+      setLayoutRevision((current) => current + 1);
+    }, 50);
+  }, []);
 
-    window.addEventListener("codexbar:menu-card-layout-change", scheduleResize);
+  useEffect(() => {
     return () => {
-      if (timer !== undefined) {
-        window.clearTimeout(timer);
+      if (layoutTimerRef.current !== undefined) {
+        window.clearTimeout(layoutTimerRef.current);
       }
-      window.removeEventListener("codexbar:menu-card-layout-change", scheduleResize);
     };
   }, []);
 
@@ -396,6 +394,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
                   resetTimeRelative={settings.resetTimeRelative}
                   showAsUsed={settings.showAsUsed}
                   compactMetrics={selectedProviderId === null}
+                  onLayoutChange={handleMenuCardLayoutChange}
                 />
               </div>
             </Fragment>

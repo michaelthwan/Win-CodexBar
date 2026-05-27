@@ -7,9 +7,9 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::core::CostUsagePricing;
+use crate::core::{CostUsageDayRange, CostUsagePricing, JsonlScanner};
 
 /// Cost summary from scanning local logs
 #[derive(Debug, Clone, Default)]
@@ -48,20 +48,7 @@ pub struct ModelTokenCounts {
 
 impl ModelTokenCounts {
     pub fn total(&self) -> u64 {
-        self.input_tokens + self.output_tokens + self.cached_tokens
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct TokenCounts {
-    input: u64,
-    cached: u64,
-    output: u64,
-}
-
-impl TokenCounts {
-    fn total(&self) -> u64 {
-        self.input + self.cached + self.output
+        self.input_tokens + self.output_tokens
     }
 }
 
@@ -284,75 +271,15 @@ impl CostScanner {
     }
 
     fn parse_codex_file(&self, path: &PathBuf, summary: &mut CostSummary) {
-        let file = match File::open(path) {
-            Ok(f) => f,
+        let today = Utc::now().date_naive();
+        let start_date = today - Duration::days(self.days as i64);
+        let range = CostUsageDayRange::new(start_date, today);
+        let parse_result = match JsonlScanner::parse_codex_file(path, &range, 0, None, None) {
+            Ok(result) => result,
             Err(_) => return,
         };
 
-        let reader = BufReader::new(file);
-        let mut current_model = String::from("gpt-4o");
-        let mut previous_totals: Option<TokenCounts> = None;
-        let mut session_cost = 0.0;
-        let mut has_tokens = false;
-
-        for line in reader.lines().map_while(Result::ok) {
-            if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
-                if let Some(model) = event.get("model").and_then(|m| m.as_str()) {
-                    current_model = model.to_string();
-                }
-                if event.get("type").and_then(|t| t.as_str()) == Some("turn_context")
-                    && let Some(model) = event
-                        .get("payload")
-                        .and_then(|payload| payload.get("model"))
-                        .or_else(|| {
-                            event
-                                .get("payload")
-                                .and_then(|payload| payload.get("info"))
-                                .and_then(|info| info.get("model"))
-                        })
-                        .and_then(|m| m.as_str())
-                {
-                    current_model = model.to_string();
-                }
-
-                if let Some((tokens, model)) =
-                    codex_token_counts_from_event(&event, &current_model, &mut previous_totals)
-                {
-                    if tokens.total() == 0 {
-                        continue;
-                    }
-
-                    let cached = tokens.cached.min(tokens.input);
-                    summary.input_tokens += tokens.input;
-                    summary.cached_tokens += cached;
-                    summary.output_tokens += tokens.output;
-
-                    let cost = CodexPricing::cost_usd(&model, tokens.input, cached, tokens.output);
-                    session_cost += cost;
-                    has_tokens = true;
-
-                    *summary.by_model.entry(model.clone()).or_insert(0.0) += cost;
-                    let speed_bucket = codex_speed_bucket(&model);
-                    *summary
-                        .by_speed
-                        .entry(speed_bucket.to_string())
-                        .or_insert(0.0) += cost;
-
-                    let model_tokens = summary.by_model_tokens.entry(model).or_default();
-                    model_tokens.input_tokens += tokens.input;
-                    model_tokens.output_tokens += tokens.output;
-                    model_tokens.cached_tokens += cached;
-
-                    let speed_tokens = summary
-                        .by_speed_tokens
-                        .entry(speed_bucket.to_string())
-                        .or_default();
-                    speed_tokens.input_tokens += tokens.input;
-                    speed_tokens.output_tokens += tokens.output;
-                    speed_tokens.cached_tokens += cached;
-                }
-            }
-        }
+        let (session_cost, has_tokens) = add_codex_days_to_summary(summary, &parse_result.days);
 
         if has_tokens {
             summary.total_cost_usd += session_cost;
@@ -453,70 +380,73 @@ impl CostScanner {
     }
 }
 
-fn codex_token_counts_from_event(
-    event: &serde_json::Value,
-    current_model: &str,
-    previous_totals: &mut Option<TokenCounts>,
-) -> Option<(TokenCounts, String)> {
-    let token_payload =
-        current_codex_token_payload(event).or_else(|| legacy_codex_token_payload(event))?;
-    let info = token_payload.get("info");
-    let model = info
-        .and_then(|value| value.get("model").or_else(|| value.get("model_name")))
-        .or_else(|| token_payload.get("model"))
-        .or_else(|| event.get("model"))
-        .and_then(|value| value.as_str())
-        .unwrap_or(current_model)
-        .to_string();
+type CodexDays = HashMap<String, HashMap<String, Vec<i32>>>;
 
-    if let Some(total) = info.and_then(|value| value.get("total_token_usage")) {
-        let totals = token_counts_from_value(total);
-        let previous = previous_totals.unwrap_or_default();
-        *previous_totals = Some(totals);
-        return Some((
-            TokenCounts {
-                input: totals.input.saturating_sub(previous.input),
-                cached: totals.cached.saturating_sub(previous.cached),
-                output: totals.output.saturating_sub(previous.output),
-            },
-            model,
-        ));
+fn add_codex_days_to_summary(summary: &mut CostSummary, days: &CodexDays) -> (f64, bool) {
+    let mut total_cost = 0.0;
+    let mut has_tokens = false;
+
+    for models in days.values() {
+        for (model, packed) in models {
+            let input = packed.first().copied().unwrap_or(0).max(0) as u64;
+            let cached = (packed.get(1).copied().unwrap_or(0).max(0) as u64).min(input);
+            let output = packed.get(2).copied().unwrap_or(0).max(0) as u64;
+
+            if input == 0 && cached == 0 && output == 0 {
+                continue;
+            }
+
+            let cost = CodexPricing::cost_usd(model, input, cached, output);
+            total_cost += cost;
+            has_tokens = true;
+
+            summary.input_tokens += input;
+            summary.cached_tokens += cached;
+            summary.output_tokens += output;
+            *summary.by_model.entry(model.clone()).or_insert(0.0) += cost;
+
+            let speed_bucket = codex_speed_bucket(model);
+            *summary
+                .by_speed
+                .entry(speed_bucket.to_string())
+                .or_insert(0.0) += cost;
+
+            let model_tokens = summary.by_model_tokens.entry(model.clone()).or_default();
+            model_tokens.input_tokens += input;
+            model_tokens.output_tokens += output;
+            model_tokens.cached_tokens += cached;
+
+            let speed_tokens = summary
+                .by_speed_tokens
+                .entry(speed_bucket.to_string())
+                .or_default();
+            speed_tokens.input_tokens += input;
+            speed_tokens.output_tokens += output;
+            speed_tokens.cached_tokens += cached;
+        }
     }
 
-    if let Some(last) = info.and_then(|value| value.get("last_token_usage")) {
-        return Some((token_counts_from_value(last), model));
+    (total_cost, has_tokens)
+}
+
+fn codex_days_cost(days: &CodexDays) -> f64 {
+    let mut total_cost = 0.0;
+
+    for models in days.values() {
+        for (model, packed) in models {
+            let input = packed.first().copied().unwrap_or(0).max(0) as u64;
+            let cached = (packed.get(1).copied().unwrap_or(0).max(0) as u64).min(input);
+            let output = packed.get(2).copied().unwrap_or(0).max(0) as u64;
+
+            if input == 0 && cached == 0 && output == 0 {
+                continue;
+            }
+
+            total_cost += CodexPricing::cost_usd(model, input, cached, output);
+        }
     }
 
-    Some((token_counts_from_value(token_payload), model))
-}
-
-fn current_codex_token_payload(event: &serde_json::Value) -> Option<&serde_json::Value> {
-    let payload = event.get("payload")?;
-    (event.get("type").and_then(|value| value.as_str()) == Some("event_msg")
-        && payload.get("type").and_then(|value| value.as_str()) == Some("token_count"))
-    .then_some(payload)
-}
-
-fn legacy_codex_token_payload(event: &serde_json::Value) -> Option<&serde_json::Value> {
-    let event_msg = event.get("event_msg")?;
-    (event_msg.get("type").and_then(|value| value.as_str()) == Some("token_count"))
-        .then_some(event_msg)
-}
-
-fn token_counts_from_value(value: &serde_json::Value) -> TokenCounts {
-    TokenCounts {
-        input: token_u64(value, "input_tokens"),
-        cached: value
-            .get("cached_input_tokens")
-            .or_else(|| value.get("cache_read_input_tokens"))
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0),
-        output: token_u64(value, "output_tokens"),
-    }
-}
-
-fn token_u64(value: &serde_json::Value, key: &str) -> u64 {
-    value.get(key).and_then(|value| value.as_u64()).unwrap_or(0)
+    total_cost
 }
 
 /// Check if any cost usage sources are available
@@ -559,7 +489,8 @@ pub fn get_daily_cost_history(provider: &str, days: u32) -> Vec<(String, f64)> {
                             for entry in entries.flatten() {
                                 let path = entry.path();
                                 if path.extension().is_some_and(|e| e == "jsonl") {
-                                    day_cost += scan_codex_file_cost(&path);
+                                    let range = CostUsageDayRange::new(date, date);
+                                    day_cost += scan_codex_file_cost_for_range(&path, &range);
                                 }
                             }
                         }
@@ -590,55 +521,20 @@ pub fn get_daily_cost_history(provider: &str, days: u32) -> Vec<(String, f64)> {
 }
 
 /// Scan a single Codex file and return its cost
-fn scan_codex_file_cost(path: &PathBuf) -> f64 {
-    let file = match File::open(path) {
-        Ok(f) => f,
+#[cfg(test)]
+fn scan_codex_file_cost(path: &Path) -> f64 {
+    let today = Utc::now().date_naive();
+    let range = CostUsageDayRange::new(today - Duration::days(30), today);
+    scan_codex_file_cost_for_range(path, &range)
+}
+
+fn scan_codex_file_cost_for_range(path: &Path, range: &CostUsageDayRange) -> f64 {
+    let parse_result = match JsonlScanner::parse_codex_file(path, range, 0, None, None) {
+        Ok(result) => result,
         Err(_) => return 0.0,
     };
 
-    let reader = BufReader::new(file);
-    let mut current_model = String::from("gpt-4o");
-    let mut previous_totals: Option<TokenCounts> = None;
-    let mut total_cost = 0.0;
-
-    for line in reader.lines().map_while(Result::ok) {
-        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
-            if let Some(model) = event.get("model").and_then(|m| m.as_str()) {
-                current_model = model.to_string();
-            }
-            if event.get("type").and_then(|t| t.as_str()) == Some("turn_context")
-                && let Some(model) = event
-                    .get("payload")
-                    .and_then(|payload| payload.get("model"))
-                    .or_else(|| {
-                        event
-                            .get("payload")
-                            .and_then(|payload| payload.get("info"))
-                            .and_then(|info| info.get("model"))
-                    })
-                    .and_then(|m| m.as_str())
-            {
-                current_model = model.to_string();
-            }
-
-            if let Some((tokens, model)) =
-                codex_token_counts_from_event(&event, &current_model, &mut previous_totals)
-            {
-                if tokens.total() == 0 {
-                    continue;
-                }
-
-                total_cost += CodexPricing::cost_usd(
-                    &model,
-                    tokens.input,
-                    tokens.cached.min(tokens.input),
-                    tokens.output,
-                );
-            }
-        }
-    }
-
-    total_cost
+    codex_days_cost(&parse_result.days)
 }
 
 #[cfg(test)]
@@ -704,7 +600,7 @@ mod tests {
                 .by_model_tokens
                 .get("gpt-5")
                 .map(ModelTokenCounts::total),
-            Some(170)
+            Some(140)
         );
         assert!(scan_codex_file_cost(&path) > 0.0);
         let _ = std::fs::remove_file(&path);
