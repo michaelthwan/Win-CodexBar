@@ -82,7 +82,7 @@ describe("AboutTab", () => {
     vi.clearAllMocks();
     tauriMocks.getAppInfo.mockResolvedValue({
       name: "CodexBar",
-      version: "0.30.2",
+      version: "0.30.3",
       buildNumber: "dev",
       updateChannel: "stable",
       tagline: "Keep agent limits in view.",
