@@ -4,6 +4,20 @@
 
 ---
 
+## [Windows] 0.32.7 - 2026-06-08
+
+### Added
+- Expand Alibaba Coding Plan support with selectable Singapore, US, Germany, Hong Kong, and China Mainland regions.
+
+### Changed
+- Route Alibaba Coding Plan cookies, dashboard links, gateway requests, and SEC_TOKEN caching through a canonical region model so region behavior stays consistent.
+
+### Fixed
+- Fix Cursor usage percentages by trusting Cursor's `totalPercentUsed`, `autoPercentUsed`, and `apiPercentUsed` fields as 0-100 percentages instead of recalculating or multiplying them.
+- Keep Cursor bonus-credit breakdown totals from distorting fallback percentage calculations.
+
+---
+
 ## [Windows] 0.32.6 - 2026-06-05
 
 ### Changed
