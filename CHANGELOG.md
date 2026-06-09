@@ -4,6 +4,19 @@
 
 ---
 
+## [Windows] 0.32.8 - 2026-06-09
+
+### Changed
+- Install `codexbar.exe` as the console CLI and `codexbar-desktop.exe` as the tray app so Start Menu shortcuts launch the desktop UI while terminal diagnostics print real output.
+- Build the console CLI during every Windows release packaging run.
+
+### Fixed
+- Run provider auto-refresh from the Tauri backend even when the tray panel is closed and the floating bar is disabled.
+- Keep `refresh_interval_secs = 0` as manual-only and prevent overlapping background refreshes.
+- Extend Windows smoke install validation to prove installed CLI `--version` and `--help` output.
+
+---
+
 ## [Windows] 0.32.7 - 2026-06-08
 
 ### Added
