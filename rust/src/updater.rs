@@ -88,17 +88,9 @@ pub async fn check_for_updates() -> Option<UpdateInfo> {
 ///
 /// When `channel` is `UpdateChannel::Beta`, includes pre-release versions.
 /// When `channel` is `UpdateChannel::Stable`, only considers stable releases.
-pub async fn check_for_updates_with_channel(channel: UpdateChannel) -> Option<UpdateInfo> {
-    let client = update_client()?;
-    let response = client.get(release_url(channel)).send().await.ok()?;
-    let release = parse_release_response(response, channel).await?;
-    let remote_version = remote_version_from_tag(&release.tag_name);
-
-    if is_newer_version(remote_version, CURRENT_VERSION) {
-        select_release_target(&release)
-    } else {
-        None
-    }
+pub async fn check_for_updates_with_channel(_channel: UpdateChannel) -> Option<UpdateInfo> {
+    // Self-build: auto-update disabled. Updates are applied by pulling source and rebuilding.
+    None
 }
 
 fn release_url(channel: UpdateChannel) -> String {
