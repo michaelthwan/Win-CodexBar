@@ -35,7 +35,7 @@ fn query_secret_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
         Regex::new(
-            r"(?i)([?&](?:token|code|client_secret|api_key|access_token|refresh_token)=)[^&#\s]+",
+            r"(?i)([?&](?:token|code|device_code|verification_code|authorization_code|client_secret|api_key|access_token|refresh_token)=)[^&#\s]+",
         )
         .expect("Invalid query secret regex")
     })
@@ -45,17 +45,29 @@ fn json_secret_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
         Regex::new(
-            r#"(?i)("?(?:api_key|apiKey|token|access_token|refresh_token|client_secret)"?\s*[:=]\s*")[^"]+""#,
+            r#"(?i)("?(?:api_key|apiKey|token|access_token|refresh_token|id_token|oauth_token|device_code|verification_code|authorization_code|client_secret)"?\s*[:=]\s*")[^"]+""#,
         )
         .expect("Invalid JSON secret regex")
+    })
+}
+
+fn secret_field_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r"(?i)(\b(?:api_key|access_token|refresh_token|id_token|oauth_token|device_code|verification_code|authorization_code|client_secret|secret|password)\b\s*[:=]\s*)[^\s,;}\]]+",
+        )
+        .expect("Invalid secret field regex")
     })
 }
 
 fn api_key_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r"(?i)\b(?:sk|ghp|gho|github_pat|zai|nanogpt|openrouter)-[A-Za-z0-9_\-]{8,}\b")
-            .expect("Invalid API key regex")
+        Regex::new(
+            r"(?i)\b(?:sk|ghp|gho|github_pat|zai|nanogpt|openrouter|fk)-[A-Za-z0-9_\-]{8,}\b",
+        )
+        .expect("Invalid API key regex")
     })
 }
 
@@ -68,6 +80,7 @@ impl SecretRedactor {
         let redacted = cookie_header_regex().replace_all(&redacted, "${1}[REDACTED]");
         let redacted = query_secret_regex().replace_all(&redacted, "${1}[REDACTED]");
         let redacted = json_secret_regex().replace_all(&redacted, "${1}[REDACTED]\"");
+        let redacted = secret_field_regex().replace_all(&redacted, "${1}[REDACTED]");
         api_key_regex()
             .replace_all(&redacted, "[REDACTED]")
             .to_string()
@@ -238,5 +251,26 @@ mod tests {
         assert!(!redacted.contains("other-secret"));
         assert!(redacted.contains(r#""api_key":"[REDACTED]""#));
         assert!(redacted.contains(r#""client_secret":"[REDACTED]""#));
+    }
+
+    #[test]
+    fn redacts_factory_api_keys() {
+        let input = "Factory key fk-test-key-abcdef";
+        let redacted = SecretRedactor::redact(input);
+        assert!(!redacted.contains("fk-test-key"));
+        assert_eq!(redacted, "Factory key [REDACTED]");
+    }
+
+    #[test]
+    fn redacts_oauth_code_and_token_fields() {
+        let input = "device_code=DEV-SECRET verification_code: VERIFY-SECRET id_token=ID-SECRET";
+        let redacted = SecretRedactor::redact(input);
+        assert!(!redacted.contains("DEV-SECRET"));
+        assert!(!redacted.contains("VERIFY-SECRET"));
+        assert!(!redacted.contains("ID-SECRET"));
+        assert_eq!(
+            redacted,
+            "device_code=[REDACTED] verification_code: [REDACTED] id_token=[REDACTED]"
+        );
     }
 }

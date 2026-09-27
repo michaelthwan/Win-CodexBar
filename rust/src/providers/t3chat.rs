@@ -8,11 +8,11 @@ use chrono::{DateTime, TimeZone, Utc};
 use regex_lite::Regex;
 use serde::Deserialize;
 
-use crate::browser::cookies::get_cookie_header;
 use crate::core::{
     FetchContext, Provider, ProviderError, ProviderFetchResult, ProviderId, ProviderMetadata,
     RateWindow, SourceMode, UsageSnapshot,
 };
+use crate::providers::browser_cookie_header;
 
 const BASE_URL: &str = "https://t3.chat";
 const CUSTOMER_DATA_URL: &str = "https://t3.chat/api/trpc/getCustomerData";
@@ -64,13 +64,14 @@ impl T3ChatProvider {
                 is_primary: false,
                 dashboard_url: Some("https://t3.chat/settings/customization"),
                 status_page_url: None,
+                tertiary_label_key: None,
             },
         }
     }
 
     async fn fetch_via_web(&self, ctx: &FetchContext) -> Result<UsageSnapshot, ProviderError> {
         let request_context = self.resolve_request_context(ctx)?;
-        let client = reqwest::Client::builder()
+        let client = crate::core::credentialed_http_client_builder()
             .timeout(std::time::Duration::from_secs(ctx.web_timeout.max(1)))
             .build()
             .map_err(|e| ProviderError::Other(e.to_string()))?;
@@ -140,18 +141,11 @@ impl T3ChatProvider {
             return Ok(context);
         }
 
-        for domain in COOKIE_DOMAINS {
-            if let Ok(cookie_header) = get_cookie_header(domain)
-                && !cookie_header.trim().is_empty()
-            {
-                return Ok(T3RequestContext {
-                    cookie_header,
-                    headers: Vec::new(),
-                });
-            }
-        }
-
-        Err(ProviderError::NoCookies)
+        let cookie_header = browser_cookie_header(&COOKIE_DOMAINS)?;
+        Ok(T3RequestContext {
+            cookie_header,
+            headers: Vec::new(),
+        })
     }
 
     fn request_context_from_raw(raw: &str) -> Option<T3RequestContext> {
@@ -342,7 +336,13 @@ fn date_from_epoch(value: Option<f64>) -> Option<DateTime<Utc>> {
     } else {
         raw
     };
-    Utc.timestamp_opt(seconds as i64, 0).single()
+    // Epoch seconds (normalized above) are far below i64::MAX for real dates.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "normalized epoch seconds fit i64"
+    )]
+    let secs = seconds as i64;
+    Utc.timestamp_opt(secs, 0).single()
 }
 
 fn plan_name(customer: &T3CustomerData) -> Option<String> {

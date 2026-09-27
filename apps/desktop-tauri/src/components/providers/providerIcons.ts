@@ -10,12 +10,22 @@ import augment from "./icons/ProviderIcon-augment.svg?raw";
 import bedrock from "./icons/ProviderIcon-bedrock.svg?raw";
 import claude from "./icons/ProviderIcon-claude.svg?raw";
 import codebuff from "./icons/ProviderIcon-codebuff.svg?raw";
+import coderabbit from "./icons/ProviderIcon-coderabbit.svg?raw";
 import codex from "./icons/ProviderIcon-codex.svg?raw";
 import commandcode from "./icons/ProviderIcon-commandcode.svg?raw";
 import copilot from "./icons/ProviderIcon-copilot.svg?raw";
 import crof from "./icons/ProviderIcon-crof.svg?raw";
+import crossmodel from "./icons/ProviderIcon-crossmodel.svg?raw";
 import cursor from "./icons/ProviderIcon-cursor.svg?raw";
 import deepgram from "./icons/ProviderIcon-deepgram.svg?raw";
+import deepinfra from "./icons/ProviderIcon-deepinfra.svg?raw";
+import fireworks from "./icons/ProviderIcon-fireworks.svg?raw";
+import aiand from "./icons/ProviderIcon-aiand.svg?raw";
+import clinepass from "./icons/ProviderIcon-clinepass.svg?raw";
+import longcat from "./icons/ProviderIcon-longcat.svg?raw";
+import neuralwatt from "./icons/ProviderIcon-neuralwatt.svg?raw";
+import zoommate from "./icons/ProviderIcon-zoommate.svg?raw";
+import zenmux from "./icons/ProviderIcon-zenmux.svg?raw";
 import deepseek from "./icons/ProviderIcon-deepseek.svg?raw";
 import doubao from "./icons/ProviderIcon-doubao.svg?raw";
 import elevenlabs from "./icons/ProviderIcon-elevenlabs.svg?raw";
@@ -23,22 +33,31 @@ import factory from "./icons/ProviderIcon-factory.svg?raw";
 import gemini from "./icons/ProviderIcon-gemini.svg?raw";
 import grok from "./icons/ProviderIcon-grok.svg?raw";
 import groq from "./icons/ProviderIcon-groq.svg?raw";
+import huggingface from "./icons/ProviderIcon-huggingface.svg?raw";
 import jetbrains from "./icons/ProviderIcon-jetbrains.svg?raw";
 import kilo from "./icons/ProviderIcon-kilo.svg?raw";
 import kimi from "./icons/ProviderIcon-kimi.svg?raw";
 import kiro from "./icons/ProviderIcon-kiro.svg?raw";
 import llmproxy from "./icons/ProviderIcon-llmproxy.svg?raw";
 import manus from "./icons/ProviderIcon-manus.svg?raw";
+import meta from "./icons/ProviderIcon-meta.svg?raw";
 import mimo from "./icons/ProviderIcon-mimo.svg?raw";
 import minimax from "./icons/ProviderIcon-minimax.svg?raw";
 import mistral from "./icons/ProviderIcon-mistral.svg?raw";
+import muse from "./icons/ProviderIcon-muse.svg?raw";
+import notion from "./icons/ProviderIcon-notion.svg?raw";
+import nous from "./icons/ProviderIcon-nous.svg?raw";
+import xai from "./icons/ProviderIcon-xai.svg?raw";
 import ollama from "./icons/ProviderIcon-ollama.svg?raw";
 import opencode from "./icons/ProviderIcon-opencode.svg?raw";
 import opencodego from "./icons/ProviderIcon-opencodego.svg?raw";
 import openrouter from "./icons/ProviderIcon-openrouter.svg?raw";
 import perplexity from "./icons/ProviderIcon-perplexity.svg?raw";
+import qoder from "./icons/ProviderIcon-qoder.svg?raw";
+import replicate from "./icons/ProviderIcon-replicate.svg?raw";
+import sakana from "./icons/ProviderIcon-sakana.svg?raw";
 import stepfun from "./icons/ProviderIcon-stepfun.svg?raw";
-import synthetic from "./icons/ProviderIcon-synthetic.svg?raw";
+import sub2api from "./icons/ProviderIcon-sub2api.svg?raw";
 import t3chat from "./icons/ProviderIcon-t3chat.svg?raw";
 import venice from "./icons/ProviderIcon-venice.svg?raw";
 import vertexai from "./icons/ProviderIcon-vertexai.svg?raw";
@@ -79,12 +98,22 @@ const RAW: Record<string, string> = {
   bedrock: tint(bedrock),
   claude: tint(claude),
   codebuff: tint(codebuff),
+  coderabbit: tint(coderabbit),
   codex: tint(codex),
   commandcode: tint(commandcode),
   copilot: tint(copilot),
   crof: tint(crof),
+  crossmodel: tint(crossmodel),
   cursor: tint(cursor),
   deepgram: tint(deepgram),
+  deepinfra: tint(deepinfra),
+  fireworks: tint(fireworks),
+  aiand: tint(aiand),
+  clinepass: tint(clinepass),
+  longcat: tint(longcat),
+  neuralwatt: tint(neuralwatt),
+  zoommate: tint(zoommate),
+  zenmux: tint(zenmux),
   deepseek: tint(deepseek),
   doubao: tint(doubao),
   elevenlabs: tint(elevenlabs),
@@ -92,22 +121,31 @@ const RAW: Record<string, string> = {
   gemini: tint(gemini),
   grok: tint(grok),
   groq: tint(groq),
+  huggingface: tint(huggingface),
   jetbrains: tint(jetbrains),
   kilo: tint(kilo),
   kimi: tint(kimi),
   kiro: tint(kiro),
   llmproxy: tint(llmproxy),
   manus: tint(manus),
+  meta: tint(meta),
   mimo: tint(mimo),
   minimax: tint(minimax),
+  notion: tint(notion),
+  nous: tint(nous),
+  xai: tint(xai),
   mistral: tint(mistral),
+  muse: tint(muse),
   ollama: tint(ollama),
   opencode: tint(opencode),
   opencodego: tint(opencodego),
   openrouter: tint(openrouter),
   perplexity: tint(perplexity),
+  qoder: tint(qoder),
+  replicate: tint(replicate),
+  sakana: tint(sakana),
   stepfun: tint(stepfun),
-  synthetic: tint(synthetic),
+  sub2api: tint(sub2api),
   t3chat: tint(t3chat),
   venice: tint(venice),
   vertexai: tint(vertexai),
@@ -128,17 +166,31 @@ export const PROVIDER_ICON_REGISTRY: Record<string, ProviderIcon> = {
   antigravity: { id: "antigravity", brandColor: "#60ba7e", fallbackLetter: "◉", svgPath: RAW.antigravity },
   augment:     { id: "augment",     brandColor: "#6366f1", fallbackLetter: "A", svgPath: RAW.augment },
   claude:      { id: "claude",      brandColor: "#cc7c5e", fallbackLetter: "◈", svgPath: RAW.claude },
+  pi:          { id: "pi",          brandColor: "#7c3aed", fallbackLetter: "P" },
   codebuff:    { id: "codebuff",    brandColor: "#44ff00", fallbackLetter: "B", svgPath: RAW.codebuff },
+  coderabbit:  { id: "coderabbit",  brandColor: "#ff5c35", fallbackLetter: "C", svgPath: RAW.coderabbit },
   codex:       { id: "codex",       brandColor: "#49a3b0", fallbackLetter: "◆", svgPath: RAW.codex },
   copilot:     { id: "copilot",     brandColor: "#a855f7", fallbackLetter: "⬡", svgPath: RAW.copilot },
   cursor:      { id: "cursor",      brandColor: "#00bfa5", fallbackLetter: "▸", svgPath: RAW.cursor },
   deepgram:    { id: "deepgram",    brandColor: "#13ef93", fallbackLetter: "D", svgPath: RAW.deepgram },
+  deepinfra:   { id: "deepinfra",   brandColor: "#2a3275", fallbackLetter: "D", svgPath: RAW.deepinfra },
+  fireworks:   { id: "fireworks",   brandColor: "#f25b1c", fallbackLetter: "F", svgPath: RAW.fireworks },
+  aiand:       { id: "aiand",       brandColor: "#e25c2b", fallbackLetter: "&", svgPath: RAW.aiand },
+  clinepass:   { id: "clinepass",   brandColor: "#61a3fa", fallbackLetter: "C", svgPath: RAW.clinepass },
+  longcat:     { id: "longcat",     brandColor: "#ffd100", fallbackLetter: "L", svgPath: RAW.longcat },
+  neuralwatt:  { id: "neuralwatt",  brandColor: "#38d98c", fallbackLetter: "N", svgPath: RAW.neuralwatt },
+  zoommate:    { id: "zoommate",    brandColor: "#0B5CFF", fallbackLetter: "Z", svgPath: RAW.zoommate },
+  zenmux:      { id: "zenmux",      brandColor: "#6c5ce7", fallbackLetter: "Z", svgPath: RAW.zenmux },
   deepseek:    { id: "deepseek",    brandColor: "#527df0", fallbackLetter: "D", svgPath: RAW.deepseek },
   elevenlabs:  { id: "elevenlabs",  brandColor: "#111827", fallbackLetter: "E", svgPath: RAW.elevenlabs },
   factory:     { id: "factory",     brandColor: "#ff6b35", fallbackLetter: "◎", svgPath: RAW.factory },
   gemini:      { id: "gemini",      brandColor: "#ab87ea", fallbackLetter: "✦", svgPath: RAW.gemini },
   grok:        { id: "grok",        brandColor: "#111827", fallbackLetter: "G", svgPath: RAW.grok },
   groq:        { id: "groq",        brandColor: "#f55036", fallbackLetter: "G", svgPath: RAW.groq },
+  huggingface: { id: "huggingface", brandColor: "#ffd21e", fallbackLetter: "H", svgPath: RAW.huggingface },
+  helmcode:    { id: "helmcode",    brandColor: "#4f46e5", fallbackLetter: "H" },
+  v0:          { id: "v0",          brandColor: "#111827", fallbackLetter: "V" },
+  typesafe:    { id: "typesafe",    brandColor: "#2563eb", fallbackLetter: "T" },
   jetbrains:   { id: "jetbrains",   brandColor: "#ff3399", fallbackLetter: "J", svgPath: RAW.jetbrains },
   kilo:        { id: "kilo",        brandColor: "#5d87ff", fallbackLetter: "K", svgPath: RAW.kilo },
   bedrock:     { id: "bedrock",     brandColor: "#ff9900", fallbackLetter: "B", svgPath: RAW.bedrock },
@@ -148,6 +200,7 @@ export const PROVIDER_ICON_REGISTRY: Record<string, ProviderIcon> = {
   llmproxy:    { id: "llmproxy",    brandColor: "#4f46e5", fallbackLetter: "L", svgPath: RAW.llmproxy },
   minimax:     { id: "minimax",     brandColor: "#fe603c", fallbackLetter: "M", svgPath: RAW.minimax },
   mistral:     { id: "mistral",     brandColor: "#ff500f", fallbackLetter: "M", svgPath: RAW.mistral },
+  muse:        { id: "muse",        brandColor: "#0668e1", fallbackLetter: "M", svgPath: RAW.muse },
   ollama:      { id: "ollama",      brandColor: "#8b95b0", fallbackLetter: "○", svgPath: RAW.ollama },
   azureopenai: { id: "azureopenai", brandColor: "#0078d4", fallbackLetter: "A" },
   t3chat:      { id: "t3chat",      brandColor: "#8b5cf6", fallbackLetter: "T", svgPath: RAW.t3chat },
@@ -155,10 +208,10 @@ export const PROVIDER_ICON_REGISTRY: Record<string, ProviderIcon> = {
   opencodego:  { id: "opencodego",  brandColor: "#3b82f6", fallbackLetter: "○", svgPath: RAW.opencodego },
   openrouter:  { id: "openrouter",  brandColor: "#6b7280", fallbackLetter: "R", svgPath: RAW.openrouter },
   perplexity:  { id: "perplexity",  brandColor: "#1fb8cd", fallbackLetter: "P", svgPath: RAW.perplexity },
-  synthetic:   { id: "synthetic",   brandColor: "#141414", fallbackLetter: "◇", svgPath: RAW.synthetic },
   vertexai:    { id: "vertexai",    brandColor: "#4285f4", fallbackLetter: "△", svgPath: RAW.vertexai },
   warp:        { id: "warp",        brandColor: "#6366f1", fallbackLetter: "W", svgPath: RAW.warp },
   windsurf:    { id: "windsurf",    brandColor: "#22c55e", fallbackLetter: "W", svgPath: RAW.windsurf },
+  wayfinder:   { id: "wayfinder",   brandColor: "#14b8a6", fallbackLetter: "W" },
   zai:         { id: "zai",         brandColor: "#e85a6a", fallbackLetter: "Z", svgPath: RAW.zai },
   // Aliases / Rust-side normalizations without their own SVG.
   nanogpt:     { id: "nanogpt",     brandColor: "#687fa1", fallbackLetter: "N" },
@@ -169,9 +222,25 @@ export const PROVIDER_ICON_REGISTRY: Record<string, ProviderIcon> = {
   doubao:      { id: "doubao",      brandColor: "#2563eb", fallbackLetter: "D", svgPath: RAW.doubao },
   commandcode: { id: "commandcode", brandColor: "#44ff00", fallbackLetter: "C", svgPath: RAW.commandcode },
   crof:        { id: "crof",        brandColor: "#7c3aed", fallbackLetter: "C", svgPath: RAW.crof },
+  crossmodel:  { id: "crossmodel",  brandColor: "#c084fc", fallbackLetter: "X", svgPath: RAW.crossmodel },
+  qoder:       { id: "qoder",       brandColor: "#2563eb", fallbackLetter: "Q", svgPath: RAW.qoder },
+  replicate:   { id: "replicate",   brandColor: "#000000", fallbackLetter: "R", svgPath: RAW.replicate },
+  codebuddy:   { id: "codebuddy",   brandColor: "#0052d9", fallbackLetter: "C" },
+  sakana:      { id: "sakana",      brandColor: "#0ea5e9", fallbackLetter: "S", svgPath: RAW.sakana },
   stepfun:     { id: "stepfun",     brandColor: "#999999", fallbackLetter: "S", svgPath: RAW.stepfun },
+  sub2api:     { id: "sub2api",     brandColor: "#2dc6d8", fallbackLetter: "S", svgPath: RAW.sub2api },
   venice:      { id: "venice",      brandColor: "#111827", fallbackLetter: "V", svgPath: RAW.venice },
   openaiapi:   { id: "openaiapi",   brandColor: "#10a37f", fallbackLetter: "O" },
+  chutes:      { id: "chutes",      brandColor: "#ff5c35", fallbackLetter: "C" },
+  litellm:     { id: "litellm",     brandColor: "#0ea5e9", fallbackLetter: "L" },
+  poe:         { id: "poe",         brandColor: "#5d5fef", fallbackLetter: "P" },
+  devin:       { id: "devin",       brandColor: "#111827", fallbackLetter: "D" },
+  zed:         { id: "zed",         brandColor: "#084ccf", fallbackLetter: "Z" },
+  qwencloud:   { id: "qwencloud",   brandColor: "#615CED", fallbackLetter: "Q" },
+  notion:      { id: "notion",      brandColor: "#337EA9", fallbackLetter: "N", svgPath: RAW.notion },
+  nous:        { id: "nous",        brandColor: "#D6A55C", fallbackLetter: "N", svgPath: RAW.nous },
+  xai:         { id: "xai",         brandColor: "#8e8e93", fallbackLetter: "X", svgPath: RAW.xai },
+  meta:        { id: "meta",        brandColor: "#0467DF", fallbackLetter: "M", svgPath: RAW.meta },
 };
 
 const ALIASES: Record<string, string> = {
@@ -181,7 +250,12 @@ const ALIASES: Record<string, string> = {
   "jetbrains ai": "jetbrains",
   "kimi k2": "kimik2",
   tongyi: "alibaba",
-  qwen: "alibaba",
+  qwen: "qwencloud",
+  "qwen cloud": "qwencloud",
+  "qwen-cloud": "qwencloud",
+  "notion ai": "notion",
+  "notion-ai": "notion",
+  notionai: "notion",
   qianwen: "alibaba",
   "alibaba token plan": "alibabatokenplan",
   "alibaba-token-plan": "alibabatokenplan",
@@ -196,21 +270,44 @@ const ALIASES: Record<string, string> = {
   manicode: "codebuff",
   "deep seek": "deepseek",
   "deep-seek": "deepseek",
+  "deep infra": "deepinfra",
+    "deep-infra": "deepinfra",
+    di: "deepinfra",
+    "fireworks-ai": "fireworks",
+    fw: "fireworks",
+  "ai&": "aiand",
+  "ai-and": "aiand",
+  "ai and": "aiand",
+  "zen-mux": "zenmux",
+  "cline-pass": "clinepass",
+  "long-cat": "longcat",
+  lc: "longcat",
+  "neural-watt": "neuralwatt",
+  nw: "neuralwatt",
+  "zoom-mate": "zoommate",
+  "zoom mate": "zoommate",
   codeium: "windsurf",
   "xiaomi mimo": "mimo",
   xiaomimimo: "mimo",
   "command code": "commandcode",
   "command-code": "commandcode",
+  "cross model": "crossmodel",
+  "cross-model": "crossmodel",
+  "sakana ai": "sakana",
+  "sakana-ai": "sakana",
   "step fun": "stepfun",
   "step-fun": "stepfun",
+  "sub-2-api": "sub2api",
+  "sub 2 api": "sub2api",
   "openai api": "openaiapi",
   "openai-api": "openaiapi",
   "azure openai": "azureopenai",
   "azure-openai": "azureopenai",
   "t3 chat": "t3chat",
   "t3-chat": "t3chat",
-  xai: "grok",
-  "x.ai": "grok",
+  // xai is its own Management API provider (not an alias of consumer Grok).
+  "x.ai": "xai",
+  "x-ai": "xai",
   supergrok: "grok",
   "super-grok": "grok",
   "eleven labs": "elevenlabs",
@@ -222,6 +319,18 @@ const ALIASES: Record<string, string> = {
   "groq-cloud": "groq",
   "llm proxy": "llmproxy",
   "llm-proxy": "llmproxy",
+  "chutes ai": "chutes",
+  "chutes-ai": "chutes",
+  "lite llm": "litellm",
+  "lite-llm": "litellm",
+  "zed ai": "zed",
+  "zed-ai": "zed",
+  metaspark: "meta",
+  "meta-spark": "meta",
+  musespark: "meta",
+  "muse-spark": "meta",
+  "muse spark": "meta",
+  "meta muse spark": "meta",
 };
 
 function normalize(id: string): string {

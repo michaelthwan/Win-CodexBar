@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 pub enum ZaiLimitType {
     /// Token-based limit
     TokensLimit,
+    /// Credit-based limit (credit Coding Plans, upstream 0.49.0 #2724)
+    CreditLimit,
     /// Time-based limit
     TimeLimit,
 }
@@ -21,6 +23,7 @@ impl ZaiLimitType {
     pub fn from_string(s: &str) -> Option<Self> {
         match s {
             "TOKENS_LIMIT" => Some(ZaiLimitType::TokensLimit),
+            "CREDIT_LIMIT" => Some(ZaiLimitType::CreditLimit),
             "TIME_LIMIT" => Some(ZaiLimitType::TimeLimit),
             _ => None,
         }
@@ -75,7 +78,9 @@ impl ZaiUsageDetail {
 
     /// Format usage as human-readable string
     pub fn format_usage(&self) -> String {
-        if self.usage >= 1_000_000 {
+        if self.usage >= 1_000_000_000 {
+            format!("{:.1}B tokens", self.usage as f64 / 1_000_000_000.0)
+        } else if self.usage >= 1_000_000 {
             format!("{:.1}M tokens", self.usage as f64 / 1_000_000.0)
         } else if self.usage >= 1_000 {
             format!("{:.1}K tokens", self.usage as f64 / 1_000.0)
@@ -330,6 +335,11 @@ impl ZaiLimitRaw {
 
         let next_reset = self.next_reset_time.map(|ms| {
             let secs = ms / 1000;
+            // ms % 1000 is at most 999, so nanoseconds stay below u32::MAX.
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "remainder < 1000 keeps nanoseconds within u32"
+            )]
             let nsecs = ((ms % 1000) * 1_000_000) as u32;
             DateTime::from_timestamp(secs, nsecs).unwrap_or_else(Utc::now)
         });
@@ -386,6 +396,10 @@ mod tests {
 
     #[test]
     fn test_usage_detail_format() {
+        let detail = ZaiUsageDetail::new("glm-5", 1_500_000_000);
+        assert_eq!(detail.usage, 1_500_000_000);
+        assert_eq!(detail.format_usage(), "1.5B tokens");
+
         let detail = ZaiUsageDetail::new("claude-3-opus", 1_500_000);
         assert_eq!(detail.format_usage(), "1.5M tokens");
 

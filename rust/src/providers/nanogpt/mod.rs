@@ -29,7 +29,8 @@ struct UsageResponse {
     period: BillingPeriod,
     #[serde(default)]
     daily: Option<UsageMetric>,
-    monthly: UsageMetric,
+    #[serde(default)]
+    monthly: Option<UsageMetric>,
     state: String,
     grace_until: Option<String>,
 }
@@ -39,6 +40,7 @@ struct UsageResponse {
 struct UsageLimits {
     #[serde(default)]
     daily: Option<f64>,
+    #[serde(default)]
     monthly: f64,
 }
 
@@ -72,6 +74,7 @@ impl NanoGPTProvider {
                 is_primary: false,
                 dashboard_url: Some("https://nano-gpt.com/usage"),
                 status_page_url: None,
+                tertiary_label_key: None,
             },
         }
     }
@@ -111,10 +114,12 @@ impl NanoGPTProvider {
             return Err(ProviderError::AuthRequired);
         }
 
-        // NanoGPT documents these as usage units, not tokens or dollars. Some
-        // live responses omit the daily block entirely, so monthly usage must
-        // be able to stand alone instead of failing deserialization.
-        let monthly_window = Self::window_from_metric(&usage.monthly, usage.limits.monthly);
+        // NanoGPT documents these as usage units, not tokens or dollars. Live
+        // responses may omit either usage block, so use whichever one exists.
+        let monthly_window = usage
+            .monthly
+            .as_ref()
+            .map(|monthly| Self::window_from_metric(monthly, usage.limits.monthly));
         let daily_window = usage
             .daily
             .as_ref()
@@ -130,10 +135,17 @@ impl NanoGPTProvider {
             usage.state
         };
 
-        let usage = if let Some(daily_window) = daily_window {
-            UsageSnapshot::new(daily_window).with_secondary(monthly_window)
-        } else {
-            UsageSnapshot::new(monthly_window)
+        let usage = match (daily_window, monthly_window) {
+            (Some(daily_window), Some(monthly_window)) => {
+                UsageSnapshot::new(daily_window).with_secondary(monthly_window)
+            }
+            (Some(daily_window), None) => UsageSnapshot::new(daily_window),
+            (None, Some(monthly_window)) => UsageSnapshot::new(monthly_window),
+            (None, None) => {
+                return Err(ProviderError::Parse(
+                    "NanoGPT response did not include daily or monthly usage".to_string(),
+                ));
+            }
         };
 
         Ok(usage.with_login_method(period_note))
@@ -159,7 +171,7 @@ impl NanoGPTProvider {
     async fn fetch_usage_api(&self, ctx: &FetchContext) -> Result<UsageSnapshot, ProviderError> {
         let api_key = Self::get_api_token(ctx.api_key.as_deref())?;
 
-        let client = reqwest::Client::builder()
+        let client = crate::core::credentialed_http_client_builder()
             .timeout(std::time::Duration::from_secs(ctx.web_timeout))
             .build()
             .map_err(|e| ProviderError::Other(e.to_string()))?;
@@ -333,6 +345,42 @@ mod tests {
         assert_eq!(
             usage.login_method.as_deref(),
             Some("active until 2025-02-13T23:59:59.000Z")
+        );
+    }
+
+    #[test]
+    fn parses_daily_usage_when_monthly_is_missing() {
+        let response: UsageResponse = serde_json::from_value(serde_json::json!({
+            "active": true,
+            "limits": {
+                "daily": 5000.0
+            },
+            "enforceDailyLimit": true,
+            "daily": {
+                "used": 125.0,
+                "remaining": 4875.0,
+                "percentUsed": 0.025,
+                "resetAt": 1738540800000_i64
+            },
+            "period": {
+                "currentPeriodEnd": "2025-02-13T23:59:59.000Z"
+            },
+            "state": "active",
+            "graceUntil": null
+        }))
+        .expect("daily-only response should deserialize");
+
+        let usage = NanoGPTProvider::usage_snapshot_from_response(response)
+            .expect("daily-only response should parse");
+
+        assert!((usage.primary.used_percent - 2.5).abs() < 0.0001);
+        assert_eq!(
+            usage.primary.reset_description.as_deref(),
+            Some("125/5000 units")
+        );
+        assert!(
+            usage.secondary.is_none(),
+            "monthly usage should not be synthesized when the API omits it"
         );
     }
 

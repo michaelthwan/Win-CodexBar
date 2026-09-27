@@ -1,4 +1,5 @@
-import { render, screen } from "@testing-library/react";
+import { useState } from "react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LocaleProvider } from "../../../i18n/LocaleProvider";
 import { buildBundle } from "../../../test/localeHarness";
@@ -40,6 +41,8 @@ describe("ProvidersSidebar", () => {
     tauriMocks.getLocaleStrings.mockResolvedValue(buildBundle({
       ProviderSidebarSearch: "Search",
       ProviderSidebarNoMatches: "No matching providers",
+      ProviderSidebarMoveUp: "Move up",
+      ProviderSidebarMoveDown: "Move down",
     }));
     eventMocks.listen.mockResolvedValue(() => {});
   });
@@ -59,7 +62,7 @@ describe("ProvidersSidebar", () => {
       </LocaleProvider>,
     );
 
-    expect(await screen.findByRole("listbox", { name: "Providers" })).toBeInTheDocument();
+    expect(await screen.findByRole("listbox", { name: "ProvidersAriaLabel" })).toBeInTheDocument();
     expect(screen.getAllByRole("option")).toHaveLength(TEST_PROVIDER_CATALOG.length);
     const names = Array.from(
       container.querySelectorAll(".providers-sidebar__name"),
@@ -85,5 +88,70 @@ describe("ProvidersSidebar", () => {
 
     expect(await screen.findByRole("searchbox", { name: "Search" })).toBeInTheDocument();
     expect(screen.getByText("No matching providers")).toBeInTheDocument();
+  });
+
+  it("reorders providers through explicit move buttons", async () => {
+    const onReorder = vi.fn();
+    const initial = rows();
+    function Harness() {
+      const [providers, setProviders] = useState(initial);
+      return (
+        <LocaleProvider>
+          <ProvidersSidebar
+            providers={providers}
+            selectedId="codex"
+            searchText=""
+            onSearchTextChange={vi.fn()}
+            onSelect={vi.fn()}
+            onReorder={(orderedIds) => {
+              onReorder(orderedIds);
+              setProviders((prev) => {
+                const byId = new Map(prev.map((p) => [p.id, p]));
+                return orderedIds
+                  .map((id) => byId.get(id))
+                  .filter((p): p is ProviderSidebarRow => Boolean(p));
+              });
+            }}
+            onToggleEnabled={vi.fn()}
+          />
+        </LocaleProvider>
+      );
+    }
+    const { container } = render(<Harness />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Move down Codex" }));
+
+    await waitFor(() => {
+      expect(onReorder).toHaveBeenCalledWith([
+        "claude",
+        "codex",
+        ...TEST_PROVIDER_CATALOG.slice(2).map(([id]) => id),
+      ]);
+    });
+    await waitFor(() => {
+      const names = Array.from(
+        container.querySelectorAll(".providers-sidebar__name"),
+        (node) => node.textContent,
+      );
+      expect(names.slice(0, 3)).toEqual(["Claude", "Codex", "Pi"]);
+    });
+  });
+
+  it("does not let the first provider move up", async () => {
+    render(
+      <LocaleProvider>
+        <ProvidersSidebar
+          providers={rows()}
+          selectedId="codex"
+          searchText=""
+          onSearchTextChange={vi.fn()}
+          onSelect={vi.fn()}
+          onReorder={vi.fn()}
+          onToggleEnabled={vi.fn()}
+        />
+      </LocaleProvider>,
+    );
+
+    expect(await screen.findByRole("button", { name: "Move up Codex" })).toBeDisabled();
   });
 });

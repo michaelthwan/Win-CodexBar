@@ -1,23 +1,26 @@
-import { useCallback, useEffect, useState } from "react";
+import { type CSSProperties, useCallback, useEffect, useState } from "react";
 import type {
-  DailyCostPoint,
-  PaceSnapshot,
+  CostSummaryDisplayStyle,
   ProviderChartData,
-  ProviderLocalUsageSummary,
   ProviderUsageSnapshot,
-  RateWindowSnapshot,
 } from "../types/bridge";
 import { getProviderChartData } from "../lib/tauri";
 import { useLocale } from "../hooks/useLocale";
-import { useFormattedResetTime } from "../hooks/useFormattedResetTime";
+import { formatRelativeUpdated } from "../lib/relativeTime";
 import type { LocaleKey } from "../i18n/keys";
-import { paceCategory } from "../surfaces/tray/paceCategory";
-import { SimpleBarChart, StackedBarChart } from "./MiniBarChart";
-import { DEMO_ENABLED } from "../lib/demoProviders";
 import { providerSupportsChartData } from "../lib/providerCharts";
+import MenuCardDetails, { describeCard, type MetricEntry } from "./MenuCardDetails";
+import CodexAccountsMenu from "./CodexAccountsMenu";
+import ClaudeAccountsMenu from "./ClaudeAccountsMenu";
+import GrokAccountsMenu from "./GrokAccountsMenu";
+import { DEEPSEEK_PRICING_EVENT } from "../hooks/useDeepSeekPricingStatus";
+import { getDeepSeekPricingStatus } from "../lib/tauri";
+import type { DeepSeekPricingStatus } from "../types/bridge";
+import { isUsageItemVisible } from "../lib/usageItemVisibility";
 
 /** Small copy-to-clipboard button matching macOS CopyIconButton (doc.on.doc → checkmark). */
 function CopyIconButton({ text }: { text: string }) {
+  const { t } = useLocale();
   const [copied, setCopied] = useState(false);
   const handleCopy = useCallback(() => {
     navigator.clipboard.writeText(text).catch(() => {});
@@ -29,8 +32,8 @@ function CopyIconButton({ text }: { text: string }) {
       type="button"
       className="menu-card__copy-btn"
       onClick={handleCopy}
-      aria-label={copied ? "Copied" : "Copy error"}
-      title={copied ? "Copied" : "Copy error"}
+      aria-label={copied ? t("PanelCopied") : t("ActionCopyError")}
+      title={copied ? t("PanelCopied") : t("ActionCopyError")}
     >
       {copied ? "✓" : (
         <svg width="12" height="12" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -42,257 +45,76 @@ function CopyIconButton({ text }: { text: string }) {
   );
 }
 
-interface MenuCardProps {
-  provider: ProviderUsageSnapshot;
+export interface MenuCardDisplayOptions {
   hideEmail: boolean;
   resetTimeRelative: boolean;
+  showResetWhenExhausted?: boolean;
+  showPace?: boolean;
   showAsUsed?: boolean;
-  compactMetrics?: boolean;
+  /**
+   * Compact Overview layout: slice to the first two quota rows and omit
+   * supplemental content (wayfinder, cost, charts, extra texts).
+   */
+  compactOverview?: boolean;
+  costSummaryDisplayStyle?: CostSummaryDisplayStyle;
+}
+
+interface MenuCardProps {
+  provider: ProviderUsageSnapshot;
+  display: MenuCardDisplayOptions;
+  isRefreshing?: boolean;
+  /** Per-provider accent color override (hex); applied as CSS --provider-accent. */
+  accentColor?: string;
   onLayoutChange?: () => void;
 }
 
-function maskEmail(email: string): string {
+
+export function maskEmail(email: string): string {
   const at = email.indexOf("@");
   if (at <= 1) return "••••@••••";
   return email[0] + "•".repeat(at - 1) + email.slice(at);
 }
 
-function formatCurrency(amount: number, code: string): string {
-  try {
-    return new Intl.NumberFormat("en-US", {
-      style: "currency",
-      currency: code,
-    }).format(amount);
-  } catch {
-    return `${code} ${amount.toFixed(2)}`;
+/** Localize raw provider window labels using the active locale. */
+function localizeWindowLabel(
+  raw: string | undefined,
+  t: (key: LocaleKey) => string,
+  language?: string,
+  windowMinutes?: number | null,
+  windowId?: string,
+): string {
+  const normalized = raw?.trim().toLowerCase();
+  if (windowId?.startsWith("claude-weekly-scoped-")) {
+    const modelName = raw?.trim().replace(/\s+only\s*$/i, "").trim();
+    const template = t("ClaudeScopedWeeklyLabel");
+    return modelName ? template.replace("{}", modelName) : template.replace("{}", "");
   }
+  // Upstream 0.55.0 #3070: quota windows in Simplified Chinese use their
+  // actual duration instead of the conversational Session wording.
+  if (language === "chinese" && normalized === "session" && windowMinutes != null) {
+    if (windowMinutes === 7 * 24 * 60) return t("ProviderWeeklyLabel");
+    if (windowMinutes >= 60 && windowMinutes <= 12 * 60 && windowMinutes % 60 === 0) {
+      return `${windowMinutes / 60} 小时`;
+    }
+  }
+  if (normalized === "weekly") {
+    return t("ProviderWeeklyLabel");
+  }
+  // F5 (upstream 0.48.0): monthly (30-day) window label.
+  if (normalized === "monthly") {
+    return t("ProviderMonthly");
+  }
+  return raw ?? "";
 }
 
-const DEMO_COST_BARS = [
-  0.58, 0.73, 0.66, 0.62, 0.26, 0.86, 0.17, 0.10, 0.21, 0.19,
-  0.23, 0.38, 0.09, 0.34, 0.24, 1.0, 0.42, 0.51, 0.14, 0.08,
-  0.20, 0.15, 0.22, 0.11, 0.18, 0.41, 0.55, 0.16, 0.44, 0.31,
-];
-
-const DEMO_LOCAL_USAGE: Record<string, ProviderLocalUsageSummary> = {
-  codex: {
-    todayCost: 75.24,
-    thirtyDayCost: 3442.16,
-    thirtyDayTokens: 4_700_000_000,
-    latestTokens: 115_000_000,
-    topModel: "gpt-5.5",
-    estimateNote: "Estimated from local logs; may differ from your bill",
-  },
-  claude: {
-    todayCost: null,
-    thirtyDayCost: null,
-    thirtyDayTokens: 584_000,
-    latestTokens: 352_000,
-    topModel: "glm-4.6",
-    estimateNote:
-      "Estimated from local Claude logs at API rates; token totals may differ from your bill",
-  },
-};
-
-function formatCompactCount(value: number | null): string {
-  if (value == null || value <= 0) return "—";
-  return new Intl.NumberFormat("en-US", {
-    notation: "compact",
-    maximumFractionDigits: value >= 1_000_000 ? 1 : 0,
-  }).format(value);
-}
-
-function localUsageForDemo(providerId: string): ProviderLocalUsageSummary | null {
-  return DEMO_ENABLED ? DEMO_LOCAL_USAGE[providerId] ?? null : null;
-}
-
-function costBarsForDemo(): DailyCostPoint[] {
-  return DEMO_COST_BARS.map((value, index) => ({
-    date: String(index),
-    value,
-  }));
-}
-
-function LocalUsageBlock({
-  providerId,
-  summary,
-  costHistory,
-}: {
-  providerId: string;
-  summary: ProviderLocalUsageSummary;
-  costHistory: DailyCostPoint[];
-}) {
-  const isCodex = providerId === "codex";
-  const visibleHistory = costHistory
-    .slice(-30)
-    .filter((point) => point.value > 0);
-  const maxCost = Math.max(...visibleHistory.map((point) => point.value), 0);
-
-  return (
-    <section className="menu-card__group menu-card__local-usage">
-      <div className="menu-card__local-grid">
-        <div>
-          <span className="menu-card__local-label">Today</span>
-          <strong>
-            {summary.todayCost != null
-              ? formatCurrency(summary.todayCost, "USD")
-              : "—"}
-          </strong>
-        </div>
-        <div>
-          <span className="menu-card__local-label">30d cost</span>
-          <strong>
-            {summary.thirtyDayCost != null
-              ? formatCurrency(summary.thirtyDayCost, "USD")
-              : "—"}
-          </strong>
-        </div>
-        <div>
-          <span className="menu-card__local-label">30d tokens</span>
-          <strong>{formatCompactCount(summary.thirtyDayTokens)}</strong>
-        </div>
-        <div>
-          <span className="menu-card__local-label">Latest tokens</span>
-          <strong>{formatCompactCount(summary.latestTokens)}</strong>
-        </div>
-      </div>
-
-      {isCodex && visibleHistory.length > 0 && (
-        <div className="menu-card__local-chart" aria-label="30 day cost histogram">
-          {visibleHistory.map((point, index) => (
-            <span
-              key={`${point.date}-${index}`}
-              style={{
-                height: `${Math.max(4, Math.round((point.value / maxCost) * 64))}px`,
-              }}
-              title={`${point.date}: ${formatCurrency(point.value, "USD")}`}
-            />
-          ))}
-        </div>
-      )}
-
-      <div className="menu-card__local-note">
-        {summary.topModel && <strong>Top model: {summary.topModel}</strong>}
-        <span>{summary.estimateNote}</span>
-      </div>
-    </section>
-  );
-}
-
-/**
- * Format a backend `updatedAt` timestamp as a short relative string
- * ("just now", "2m ago", "3h ago", "5d ago"). If the value isn't a parseable
- * ISO datetime, return it unchanged so manual / preformatted strings still
- * render verbatim.
- */
-function formatRelative(updatedAt: string): string {
-  const ts = Date.parse(updatedAt);
-  if (Number.isNaN(ts)) return updatedAt;
-  const diffSec = Math.max(0, Math.round((Date.now() - ts) / 1000));
-  if (diffSec < 60) return "just now";
-  const diffMin = Math.round(diffSec / 60);
-  if (diffMin < 60) return `${diffMin}m ago`;
-  const diffHr = Math.round(diffMin / 60);
-  if (diffHr < 24) return `${diffHr}h ago`;
-  const diffDay = Math.round(diffHr / 24);
-  return `${diffDay}d ago`;
-}
-
-function displayPlanName(planName: string | null): string | null {
+function displayPlanName(
+  planName: string | null,
+  t: (key: LocaleKey) => string,
+): string | null {
   if (!planName) return null;
   const normalized = planName.trim().toLowerCase();
-  if (normalized === "default_claude_ai") return "Claude AI";
+  if (normalized === "default_claude_ai") return t("ProviderPlanClaudeAi");
   return planName;
-}
-
-function paceStageKey(stage: PaceSnapshot["stage"]): LocaleKey {
-  switch (stage) {
-    case "on_track":
-      return "DetailPaceOnTrack";
-    case "slightly_ahead":
-      return "DetailPaceSlightlyAhead";
-    case "ahead":
-      return "DetailPaceAhead";
-    case "far_ahead":
-      return "DetailPaceFarAhead";
-    case "slightly_behind":
-      return "DetailPaceSlightlyBehind";
-    case "behind":
-      return "DetailPaceBehind";
-    case "far_behind":
-      return "DetailPaceFarBehind";
-    default:
-      return "DetailPaceOnTrack";
-  }
-}
-
-type UsageLevel = "normal" | "high" | "critical" | "exhausted";
-function levelOf(remainPct: number, exhausted: boolean): UsageLevel {
-  if (exhausted) return "exhausted";
-  if (remainPct <= 5) return "critical";
-  if (remainPct <= 25) return "high";
-  return "normal";
-}
-
-interface MetricEntry {
-  label: string;
-  snap: RateWindowSnapshot;
-}
-
-/**
- * Single metric row inside the card — mirrors upstream `MetricRow`:
- *   • title (body / medium)
- *   • UsageProgressBar (capsule, 6pt)
- *   • HStack: "N% used"  ··  reset countdown (right-aligned, secondary)
- */
-function MetricRow({
-  title,
-  snap,
-  exhaustedLabel,
-  resetTimeRelative,
-  showAsUsed,
-}: {
-  title: string;
-  snap: RateWindowSnapshot;
-  exhaustedLabel: string;
-  resetTimeRelative: boolean;
-  showAsUsed: boolean;
-}) {
-  const pct = Math.min(100, Math.max(0, snap.usedPercent));
-  const remain = 100 - pct;
-  const displayPct = showAsUsed ? pct : remain;
-  const displayLabel = showAsUsed ? "used" : "left";
-  const level = levelOf(remain, snap.isExhausted);
-  const resetText = useFormattedResetTime(
-    snap.resetsAt,
-    snap.resetDescription,
-    resetTimeRelative,
-  );
-  return (
-    <div className="menu-metric">
-      <span className="menu-metric__title">{title}</span>
-      <div className="menu-metric__bar">
-        <div className="menu-metric__bar-fill" data-level={level} style={{ width: `${displayPct}%` }} />
-      </div>
-      <div className="menu-metric__row">
-        <span className="menu-metric__pct">{Math.round(displayPct)}% {displayLabel}</span>
-        {resetText && (
-          <span className="menu-metric__reset">{resetText}</span>
-        )}
-      </div>
-      {snap.isExhausted && (
-        <div className="menu-metric__exhausted">{exhaustedLabel}</div>
-      )}
-      {snap.reservePercent != null && (
-        <div className="menu-metric__row menu-metric__reserve">
-          <span className="menu-metric__pct">{Math.round(snap.reservePercent)}% in reserve</span>
-          {snap.reserveDescription && (
-            <span className="menu-metric__reset">{snap.reserveDescription}</span>
-          )}
-        </div>
-      )}
-    </div>
-  );
 }
 
 /**
@@ -314,22 +136,35 @@ function MetricRow({
  */
 export default function MenuCard({
   provider,
-  hideEmail,
-  resetTimeRelative,
-  showAsUsed = false,
-  compactMetrics = false,
+  display,
+  isRefreshing = false,
+  accentColor,
   onLayoutChange,
 }: MenuCardProps) {
-  const { t } = useLocale();
-  const [chartData, setChartData] = useState<ProviderChartData | null>(null);
-  const formattedCostReset = useFormattedResetTime(
-    provider.cost?.resetsAt ?? null,
-    null,
+  const {
+    hideEmail,
     resetTimeRelative,
-  );
+    showResetWhenExhausted = false,
+    showPace = true,
+    showAsUsed = false,
+    compactOverview = false,
+    costSummaryDisplayStyle,
+  } = display;
+  const { t, language } = useLocale();
+  const [chartData, setChartData] = useState<ProviderChartData | null>(null);
+  const [pricingStatus, setPricingStatus] = useState<DeepSeekPricingStatus | null>(null);
 
   useEffect(() => {
-    if (DEMO_ENABLED || !providerSupportsChartData(provider.providerId)) {
+    if (provider.providerId !== "deepseek") return;
+    const onPricing = (event: Event) =>
+      setPricingStatus((event as CustomEvent<DeepSeekPricingStatus>).detail);
+    window.addEventListener(DEEPSEEK_PRICING_EVENT, onPricing);
+    void getDeepSeekPricingStatus().then(setPricingStatus).catch(() => {});
+    return () => window.removeEventListener(DEEPSEEK_PRICING_EVENT, onPricing);
+  }, [provider.providerId]);
+
+  useEffect(() => {
+    if (!providerSupportsChartData(provider.providerId)) {
       setChartData(null);
       return;
     }
@@ -353,57 +188,84 @@ export default function MenuCard({
     };
   }, [provider.providerId, provider.accountEmail, onLayoutChange]);
 
-  const email = provider.accountEmail
+  const isWayfinder = provider.providerId === "wayfinder";
+  const email = !isWayfinder && provider.accountEmail
     ? hideEmail
       ? maskEmail(provider.accountEmail)
       : provider.accountEmail
     : null;
-  const planName = displayPlanName(provider.planName);
+  const planName = !isWayfinder ? displayPlanName(provider.planName, t) : null;
 
   const metrics: MetricEntry[] = [
-    { label: provider.primaryLabel ?? t("DetailWindowPrimary"), snap: provider.primary },
+    ...(isWayfinder
+      ? []
+      : [
+          {
+            id: "primary",
+            label: localizeWindowLabel(provider.primaryLabel, t, language, provider.primary.windowMinutes) || t("DetailWindowPrimary"),
+            snap: provider.primary,
+          },
+        ]),
   ];
   if (provider.secondary)
-    metrics.push({ label: provider.secondaryLabel ?? t("DetailWindowSecondary"), snap: provider.secondary });
+    metrics.push({
+      id: "secondary",
+      label: localizeWindowLabel(provider.secondaryLabel, t) || t("DetailWindowSecondary"),
+      snap: provider.secondary,
+      sessionEquivalentForecast: provider.sessionEquivalentForecast,
+    });
   if (provider.modelSpecific)
     metrics.push({
+      id: "model-specific",
       label: t("DetailWindowModelSpecific"),
       snap: provider.modelSpecific,
     });
   if (provider.tertiary)
-    metrics.push({ label: t("DetailWindowTertiary"), snap: provider.tertiary });
+    metrics.push({
+      id: "tertiary",
+      // F5 (upstream 0.48.0): use the cadence-based label (e.g. "Monthly") instead
+      // of the generic "DetailWindowTertiary" slot key when tertiaryLabel is set.
+      label: localizeWindowLabel(provider.tertiaryLabel, t) || t("DetailWindowTertiary"),
+      snap: provider.tertiary,
+    });
   for (const extra of provider.extraRateWindows ?? []) {
-    metrics.push({ label: extra.title, snap: extra.window });
+    metrics.push({
+      id: `extra-${extra.id}`,
+      label:
+        localizeWindowLabel(extra.title, t, language, extra.window.windowMinutes, extra.id) ||
+        extra.title,
+      snap: extra.window,
+      resetFormatMode: extra.id === "reset-credits" ? "expires" : "reset",
+    });
   }
-  const visibleMetrics = compactMetrics ? metrics.slice(0, 2) : metrics;
+  const visibleMetrics = metrics
+    .filter((metric) => isUsageItemVisible(provider.hiddenUsageItemIds, metric.id))
+    .slice(0, compactOverview ? 2 : metrics.length);
 
-  const hasCostHistory =
-    chartData !== null && chartData.costHistory.some((point) => point.value > 0);
-  const hasCreditsHistory =
-    chartData !== null && chartData.creditsHistory.length > 0;
-  const hasUsageBreakdown =
-    chartData !== null && chartData.usageBreakdown.length > 0;
-  const hasCharts = hasCostHistory || hasCreditsHistory || hasUsageBreakdown;
-  const demoLocalUsage = localUsageForDemo(provider.providerId);
-  const localUsage = provider.error ? null : chartData?.localUsage ?? demoLocalUsage;
-  const localCostHistory = DEMO_ENABLED
-    ? costBarsForDemo()
-    : chartData?.costHistory ?? [];
-  const hasMetrics = visibleMetrics.length > 0;
-  const hasCost = !!provider.cost;
-  const hasPace = !!provider.pace;
-  const hasDetails =
-    !provider.error && (hasMetrics || hasCost || hasPace || hasCharts || !!localUsage);
+  const presence = describeCard(
+    provider,
+    chartData,
+    visibleMetrics,
+    costSummaryDisplayStyle,
+    showPace,
+    compactOverview,
+  );
+  const { hasDetails } = presence;
   const cardClassName = [
     "menu-card",
     provider.error ? "menu-card--error" : null,
+    isRefreshing ? "menu-card--refreshing" : null,
     hasDetails ? "menu-card--with-details" : "menu-card--header-only",
   ]
     .filter(Boolean)
     .join(" ");
 
   return (
-    <article className={cardClassName}>
+    <article
+      className={cardClassName}
+      aria-busy={isRefreshing}
+      style={accentColor ? ({ "--provider-accent": accentColor } as CSSProperties) : undefined}
+    >
       <header className="menu-card__header">
         <div className="menu-card__title-row">
           <div className="menu-card__name-group">
@@ -419,7 +281,9 @@ export default function MenuCard({
         ) : (
           <div className="menu-card__subtitle-row">
             <span className="menu-card__subtitle">
-              {t("DetailUpdatedPrefix")} {formatRelative(provider.updatedAt)}
+              {Number.isNaN(Date.parse(provider.updatedAt))
+                ? provider.updatedAt
+                : formatRelativeUpdated(Date.parse(provider.updatedAt), t)}
             </span>
             {planName && (
               <span className="menu-card__plan-badge">{planName}</span>
@@ -428,146 +292,71 @@ export default function MenuCard({
         )}
       </header>
 
+      {provider.providerId === "codex" && (
+        <CodexAccountsMenu
+          hideEmail={hideEmail}
+          resetTimeRelative={resetTimeRelative}
+          onLayoutChange={onLayoutChange}
+        />
+      )}
+      {provider.providerId === "claude" && (
+        <ClaudeAccountsMenu hideEmail={hideEmail} onLayoutChange={onLayoutChange} />
+      )}
+      {provider.providerId === "grok" && (
+        <GrokAccountsMenu
+          hideEmail={hideEmail}
+          resetTimeRelative={resetTimeRelative}
+          onLayoutChange={onLayoutChange}
+        />
+      )}
+
       {hasDetails && <div className="menu-card__divider" />}
 
       {hasDetails && (
-        <div className="menu-card__content">
-          {!provider.error && hasMetrics && (
-            <section className="menu-card__group menu-card__metrics">
-              {visibleMetrics.map((m) => (
-                <MetricRow
-                  key={m.label}
-                  title={m.label}
-                  snap={m.snap}
-                  exhaustedLabel={t("DetailWindowExhausted")}
-                  resetTimeRelative={resetTimeRelative}
-                  showAsUsed={showAsUsed}
-                />
-              ))}
-            </section>
-          )}
-
-          {localUsage && (
-            <LocalUsageBlock
-              providerId={provider.providerId}
-              summary={localUsage}
-              costHistory={localCostHistory}
-            />
-          )}
-
-          {hasMetrics && hasCost && <div className="menu-card__divider" />}
-
-          {provider.cost && (
-            <section className="menu-card__group menu-card__cost">
-              <div className="menu-card__group-title">
-                {t("DetailCostTitle")} — {provider.cost.period}
-              </div>
-              <div className="menu-card__cost-line">
-                {t("DetailCostUsed")}:{" "}
-                {provider.cost.formattedUsed ||
-                  formatCurrency(provider.cost.used, provider.cost.currencyCode)}
-                {provider.cost.limit != null && (
-                  <>
-                    {" / "}
-                    {provider.cost.formattedLimit ||
-                      formatCurrency(provider.cost.limit, provider.cost.currencyCode)}
-                  </>
-                )}
-              </div>
-              {provider.cost.remaining != null && (
-                <div className="menu-card__cost-line menu-card__cost-line--muted">
-                  {t("DetailCostRemaining")}:{" "}
-                  {formatCurrency(provider.cost.remaining, provider.cost.currencyCode)}
-                </div>
-              )}
-              {formattedCostReset && (
-                <div className="menu-card__cost-line menu-card__cost-line--muted">
-                  {t("DetailCostResets")}: {formattedCostReset}
-                </div>
-              )}
-            </section>
-          )}
-
-          {(hasMetrics || hasCost) && hasPace && <div className="menu-card__divider" />}
-
-          {provider.pace && (
-            <section className="menu-card__group menu-card__pace">
-              <div className="menu-card__pace-header">
-                <span className="menu-card__group-title">{t("DetailPaceTitle")}</span>
-                <span
-                  className="menu-card__pace-label"
-                  data-pace={paceCategory(provider.pace.stage)}
-                >
-                  {t(paceStageKey(provider.pace.stage))} (
-                  {provider.pace.deltaPercent >= 0 ? "+" : ""}
-                  {provider.pace.deltaPercent.toFixed(1)}%)
-                </span>
-              </div>
-              <div className="menu-card__pace-bars">
-                <div className="menu-card__pace-track" title="Expected">
-                  <div
-                    className="menu-card__pace-fill menu-card__pace-fill--expected"
-                    style={{ width: `${provider.pace.expectedUsedPercent.toFixed(1)}%` }}
-                  />
-                </div>
-                <div className="menu-card__pace-track" title="Actual">
-                  <div
-                    className="menu-card__pace-fill"
-                    data-pace={paceCategory(provider.pace.stage)}
-                    style={{ width: `${provider.pace.actualUsedPercent.toFixed(1)}%` }}
-                  />
-                </div>
-              </div>
-              {provider.pace.etaSeconds != null && !provider.pace.willLastToReset && (
-                <div className="menu-card__pace-eta">
-                  ⚠{" "}
-                  {t("DetailPaceRunsOutIn").replace(
-                    "{}",
-                    String(Math.round(provider.pace.etaSeconds / 3600)),
-                  )}
-                </div>
-              )}
-              {provider.pace.willLastToReset && (
-                <div className="menu-card__pace-ok">
-                  ✓ {t("DetailPaceWillLastToReset")}
-                </div>
-              )}
-            </section>
-          )}
-
-          {(hasMetrics || hasCost || hasPace) && hasCharts && (
-            <div className="menu-card__divider" />
-          )}
-
-          {hasCharts && (
-            <section className="menu-card__group menu-card__charts">
-              {hasCostHistory && (
-                <SimpleBarChart
-                  points={chartData!.costHistory}
-                  label={t("DetailChartCost")}
-                  color="var(--accent)"
-                  formatValue={(v) => `$${v.toFixed(2)}`}
-                />
-              )}
-              {hasCreditsHistory && (
-                <SimpleBarChart
-                  points={chartData!.creditsHistory}
-                  label={t("DetailChartCredits")}
-                  color="var(--provider-status-ok)"
-                  formatValue={(v) => v.toFixed(1)}
-                />
-              )}
-              {hasUsageBreakdown && (
-                <StackedBarChart
-                  points={chartData!.usageBreakdown}
-                  label={t("DetailChartUsageBreakdown")}
-                  height={56}
-                />
-              )}
-            </section>
-          )}
-        </div>
+        <MenuCardDetails
+          provider={provider}
+          display={{
+            resetTimeRelative,
+            showResetWhenExhausted,
+            showPace,
+            showAsUsed,
+            compactOverview,
+            costSummaryDisplayStyle,
+          }}
+          metrics={visibleMetrics}
+          chartData={chartData}
+          presence={presence}
+          onLayoutChange={onLayoutChange}
+        />
       )}
+
+      {provider.providerId === "deepseek" && pricingStatus && (
+        <section
+          className="menu-card__pricing-status"
+          aria-label={t("DeepSeekPricingTitle")}
+        >
+          <strong>
+            {t("DeepSeekPricingTitle")}: {t(
+              pricingStatus.period === "peak"
+                ? "DeepSeekPricingPeak"
+                : pricingStatus.period === "offPeak"
+                  ? "DeepSeekPricingOffPeak"
+                  : "DeepSeekPricingStandard",
+            )}
+          </strong>
+          <span>
+            {t("DeepSeekPricingCurrent")} {pricingStatus.currentLocalTime}
+          </span>
+          <span>
+            {t("DeepSeekPricingNext")} {pricingStatus.nextTransitionLocalTime ?? "—"}
+          </span>
+          <span>
+            {t("DeepSeekPricingEffective")} {pricingStatus.effectiveLocalTime}
+          </span>
+          <small>{t("DeepSeekPricingAdvice")}</small>
+        </section>
+      )}
+
     </article>
   );
 }

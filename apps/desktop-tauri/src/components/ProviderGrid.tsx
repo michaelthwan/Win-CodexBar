@@ -2,6 +2,8 @@ import { useMemo, useState, type CSSProperties } from "react";
 import type { ProviderUsageSnapshot } from "../types/bridge";
 import { ProviderIcon } from "./providers/ProviderIcon";
 import { getProviderIcon } from "./providers/providerIcons";
+import { useLocale } from "../hooks/useLocale";
+import { prioritizeProviders } from "./providerGridUtils";
 
 export default function ProviderGrid({
   providers,
@@ -11,6 +13,9 @@ export default function ProviderGrid({
   expanded,
   onExpandedChange,
   onSelect,
+  onReorder,
+  onGestureStart,
+  onGestureEnd,
 }: {
   providers: ProviderUsageSnapshot[];
   selectedProviderId: string | null;
@@ -19,8 +24,34 @@ export default function ProviderGrid({
   expanded?: boolean;
   onExpandedChange?: (expanded: boolean) => void;
   onSelect: (providerId: string | null) => void;
+  /** Persist a new provider order (list of provider IDs) after a drag-reorder. */
+  onReorder?: (orderedIds: string[]) => void;
+  /** Called on mousedown of a draggable item, before a possible HTML5 drag starts. */
+  onGestureStart?: () => void;
+  /** Called on mouseup or dragend of a draggable item (drag finished or canceled). */
+  onGestureEnd?: () => void;
 }) {
+  const { t } = useLocale();
   const [uncontrolledExpanded, setUncontrolledExpanded] = useState(false);
+  const [dragId, setDragId] = useState<string | null>(null);
+  const [overId, setOverId] = useState<string | null>(null);
+  const canReorder = typeof onReorder === "function";
+
+  const applyReorder = (targetId: string) => {
+    if (!onReorder || !dragId || dragId === targetId) return;
+    const ids = providers.map((provider) => provider.providerId);
+    const from = ids.indexOf(dragId);
+    const to = ids.indexOf(targetId);
+    if (from < 0 || to < 0) return;
+    const next = ids.slice();
+    next.splice(from, 1);
+    next.splice(to, 0, dragId);
+    onReorder(next);
+  };
+  const endDrag = () => {
+    setDragId(null);
+    setOverId(null);
+  };
   const isExpanded = expanded ?? uncontrolledExpanded;
   const setExpanded = (next: boolean) => {
     if (expanded === undefined) setUncontrolledExpanded(next);
@@ -63,18 +94,56 @@ export default function ProviderGrid({
         type="button"
         className={`provider-grid__item${selectedProviderId === null ? " provider-grid__item--active" : ""}`}
         onClick={() => onSelect(null)}
-        aria-label="All providers"
+        aria-label={t("PanelAllProviders")}
       >
         {showProviderIcons && <span className="provider-grid__icon-overview">⊞</span>}
-        <span className="provider-grid__label">All</span>
+        <span className="provider-grid__label">{t("PanelAllProvidersShort")}</span>
       </button>
       {visibleProviders.map((p) => (
         <button
           key={p.providerId}
           type="button"
-          className={`provider-grid__item${p.providerId === selectedProviderId ? " provider-grid__item--active" : ""}`}
+          className={`provider-grid__item${p.providerId === selectedProviderId ? " provider-grid__item--active" : ""}${dragId === p.providerId ? " provider-grid__item--dragging" : ""}${canReorder && overId === p.providerId && dragId && dragId !== p.providerId ? " provider-grid__item--drop-target" : ""}`}
           onClick={() => onSelect(p.providerId)}
           aria-label={p.displayName}
+          draggable={canReorder}
+          onMouseDown={canReorder ? () => onGestureStart?.() : undefined}
+          onMouseUp={canReorder ? () => onGestureEnd?.() : undefined}
+          onDragStart={
+            canReorder
+              ? (e) => {
+                  setDragId(p.providerId);
+                  e.dataTransfer.effectAllowed = "move";
+                }
+              : undefined
+          }
+          onDragOver={
+            canReorder
+              ? (e) => {
+                  if (!dragId) return;
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = "move";
+                  if (overId !== p.providerId) setOverId(p.providerId);
+                }
+              : undefined
+          }
+          onDrop={
+            canReorder
+              ? (e) => {
+                  e.preventDefault();
+                  applyReorder(p.providerId);
+                  endDrag();
+                }
+              : undefined
+          }
+          onDragEnd={
+            canReorder
+              ? () => {
+                  onGestureEnd?.();
+                  endDrag();
+                }
+              : undefined
+          }
         >
           {showProviderIcons && <ProviderIcon providerId={p.providerId} size={16} />}
           <span className="provider-grid__label">{labelFor(p.displayName)}</span>
@@ -94,7 +163,7 @@ export default function ProviderGrid({
           type="button"
           className="provider-grid__item provider-grid__item--more"
           onClick={() => setExpanded(!isExpanded)}
-          aria-label={isExpanded ? "Show fewer providers" : "Show all providers"}
+          aria-label={isExpanded ? t("PanelShowFewerProviders") : t("PanelShowAllProviders")}
           aria-expanded={isExpanded}
         >
           {showProviderIcons && (
@@ -103,23 +172,12 @@ export default function ProviderGrid({
             </span>
           )}
           <span className="provider-grid__label">
-            {isExpanded ? "Less" : `+${hiddenCount}`}
+            {isExpanded ? t("PanelShowFewerProviders") : `+${hiddenCount}`}
           </span>
         </button>
       )}
     </div>
   );
-}
-
-export function prioritizeProviders(
-  providers: ProviderUsageSnapshot[],
-  selectedProviderId: string | null,
-): ProviderUsageSnapshot[] {
-  if (!selectedProviderId) return providers;
-  const selectedIndex = providers.findIndex((provider) => provider.providerId === selectedProviderId);
-  if (selectedIndex < 0 || selectedIndex < 18) return providers;
-  const selected = providers[selectedIndex];
-  return [selected, ...providers.slice(0, selectedIndex), ...providers.slice(selectedIndex + 1)];
 }
 
 function compactGridLabel(displayName: string): string {

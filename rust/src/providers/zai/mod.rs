@@ -3,15 +3,26 @@
 //! Fetches usage data from z.ai's quota API
 //! Uses API token stored in Windows Credential Manager
 
+mod balance;
 pub mod mcp_details;
+pub mod region;
+mod reset_plausibility;
+pub mod settings;
 
 // Re-exports for MCP details menu
-#[allow(unused_imports)]
+#[allow(
+    unused_imports,
+    reason = "imports needed for future ZAI provider wiring"
+)]
 pub use mcp_details::{
     McpDetailsMenu, ZaiLimitEntry, ZaiLimitType, ZaiLimitUnit, ZaiUsageDetail, ZaiUsageSnapshot,
 };
+pub use region::ZaiRegion;
+pub use settings::ZaiSettingsError;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use reqwest::Url;
 use serde::Deserialize;
 
 use crate::core::{
@@ -19,8 +30,12 @@ use crate::core::{
     RateWindow, SourceMode, UsageSnapshot,
 };
 
-/// z.ai API endpoint for quota/usage
-const ZAI_API_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
+use reset_plausibility::is_plausible_five_hour_reset;
+use settings::ZaiSettingsReader;
+
+const ZAI_USAGE_SCOPE_ENV: &str = "Z_AI_USAGE_SCOPE";
+const ZAI_BIGMODEL_ORG_ENV: &str = "Z_AI_BIGMODEL_ORGANIZATION";
+const ZAI_BIGMODEL_PROJECT_ENV: &str = "Z_AI_BIGMODEL_PROJECT";
 
 /// Windows Credential Manager target for z.ai API token
 const ZAI_CREDENTIAL_TARGET: &str = "codexbar-zai";
@@ -30,6 +45,8 @@ const ZAI_CREDENTIAL_TARGET: &str = "codexbar-zai";
 struct ZaiQuotaResponse {
     #[serde(default)]
     code: Option<i32>,
+    #[serde(default)]
+    message: Option<String>,
     #[serde(default)]
     data: Option<ZaiQuotaData>,
     /// Legacy flat limits array (backwards compat)
@@ -43,6 +60,15 @@ struct ZaiQuotaData {
     limits: Vec<ZaiLimit>,
     #[serde(rename = "planName")]
     plan_name: Option<String>,
+    /// Upstream plan-name fallbacks (`level` added in 0.48.0).
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    plan_type: Option<String>,
+    #[serde(default, rename = "packageName")]
+    package_name: Option<String>,
+    #[serde(default)]
+    level: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,8 +76,10 @@ struct ZaiLimit {
     /// Limit type: "TOKENS_LIMIT" or "TIME_LIMIT" (upstream) or "tokens"/"mcp" (legacy)
     #[serde(rename = "type")]
     limit_type: Option<String>,
-    /// Used amount
+    /// Used amount (legacy response)
     used: Option<f64>,
+    /// Total limit (current response)
+    usage: Option<f64>,
     /// Current value (alternative to used)
     #[serde(rename = "currentValue")]
     current_value: Option<f64>,
@@ -59,6 +87,8 @@ struct ZaiLimit {
     limit: Option<f64>,
     /// Remaining amount
     remaining: Option<f64>,
+    /// Used percentage (current response)
+    percentage: Option<f64>,
     /// Time unit enum: 1=days, 3=hours, 5=minutes, 6=weeks
     unit: Option<i32>,
     /// Number of time units in the window
@@ -66,11 +96,20 @@ struct ZaiLimit {
     /// Reset time (ISO 8601)
     #[serde(rename = "resetAt")]
     reset_at: Option<String>,
+    /// Reset time as Unix epoch milliseconds (current response)
+    #[serde(rename = "nextResetTime")]
+    next_reset_time: Option<i64>,
 }
 
 /// z.ai provider
 pub struct ZaiProvider {
     metadata: ProviderMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ZaiTeamContext {
+    organization_id: String,
+    project_id: String,
 }
 
 impl ZaiProvider {
@@ -85,60 +124,144 @@ impl ZaiProvider {
                 supports_credits: true,
                 default_enabled: false,
                 is_primary: false,
-                dashboard_url: Some("https://z.ai/dashboard"),
+                dashboard_url: Some("https://z.ai/manage-apikey/coding-plan/personal/my-plan"),
                 status_page_url: None,
+                tertiary_label_key: None,
             },
         }
     }
 
-    /// Get API token from ctx, Windows Credential Manager, or env
-    fn get_api_token(api_key: Option<&str>) -> Result<String, ProviderError> {
+    /// Effective API region (upstream 0.48.0): an explicit settings value
+    /// wins; otherwise the region is inferred from canonical endpoint
+    /// overrides (`inferredRegion`).
+    fn effective_region(ctx: &FetchContext, env: &settings::EnvMap) -> ZaiRegion {
+        match ctx
+            .api_region
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+        {
+            Some(raw) => ZaiRegion::from_settings_value(Some(raw)),
+            None => ZaiSettingsReader::inferred_region(env),
+        }
+    }
+
+    /// Get API token from ctx, Windows Credential Manager, or region-bound env.
+    fn get_api_token(
+        api_key: Option<&str>,
+        region: ZaiRegion,
+        env: &settings::EnvMap,
+    ) -> Result<String, ProviderError> {
         // Check ctx.api_key first (from settings)
         if let Some(key) = api_key
-            && !key.is_empty()
+            && let Some(cleaned) = settings::cleaned(key)
         {
-            return Ok(key.to_string());
+            return Ok(cleaned);
         }
 
         // Try Windows Credential Manager
-        match keyring::Entry::new(ZAI_CREDENTIAL_TARGET, "api_token") {
-            Ok(entry) => match entry.get_password() {
-                Ok(token) => Ok(token),
-                Err(_) => {
-                    // Try environment variable as fallback
-                    std::env::var("ZAI_API_TOKEN").map_err(|_| {
-                        ProviderError::NotInstalled(
-                            "z.ai API token not found. Set in Preferences → Providers or ZAI_API_TOKEN environment variable.".to_string()
-                        )
-                    })
-                }
-            },
-            Err(_) => {
-                // Try environment variable as fallback
-                std::env::var("ZAI_API_TOKEN").map_err(|_| {
-                    ProviderError::NotInstalled(
-                        "z.ai API token not found. Set in Preferences → Providers or ZAI_API_TOKEN environment variable.".to_string()
-                    )
-                })
-            }
+        if let Ok(entry) = keyring::Entry::new(ZAI_CREDENTIAL_TARGET, "api_token")
+            && let Ok(token) = entry.get_password()
+        {
+            return Ok(token);
         }
+
+        let home = dirs::home_dir().unwrap_or_default();
+        ZaiSettingsReader::api_token(env, &home, region).ok_or_else(|| {
+            ProviderError::NotInstalled(match region {
+                ZaiRegion::BigModelCn => "z.ai (BigModel CN) API token not found. Set in Preferences → Providers, Z_AI_API_KEY, BIGMODEL_API_KEY, ZHIPU_API_KEY, ZHIPUAI_API_KEY, or GLM_API_KEY.".to_string(),
+                ZaiRegion::Global => "z.ai API token not found. Set in Preferences → Providers or Z_AI_API_KEY.".to_string(),
+            })
+        })
+    }
+
+    /// Validate endpoint overrides against the region *before* any bearer
+    /// request (upstream #2621/#2623: canonical cross-region overrides are
+    /// rejected pre-auth; custom relay hosts stay legal).
+    fn validate_endpoint_overrides(
+        env: &settings::EnvMap,
+        region: ZaiRegion,
+    ) -> Result<(), ProviderError> {
+        ZaiSettingsReader::validate_endpoint_overrides(env, region)
+            .map_err(|err| ProviderError::Other(err.to_string()))
+    }
+
+    /// Quota URL: `Z_AI_QUOTA_URL` full override → `Z_AI_API_HOST` host
+    /// override → the selected region's canonical endpoint.
+    fn quota_url(env: &settings::EnvMap, region: ZaiRegion) -> Result<Url, ProviderError> {
+        let provider_err = |err: ZaiSettingsError| ProviderError::Other(err.to_string());
+        let env_get = |key: &str| env.get(key).and_then(|raw| settings::cleaned(raw));
+        if env_get(settings::ZAI_QUOTA_URL_ENV).is_some() {
+            let url = ZaiSettingsReader::quota_url_override(env)
+                .map_err(provider_err)?
+                .expect("override present");
+            return Ok(url);
+        }
+        if let Some(url) = ZaiSettingsReader::quota_url_from_api_host(env).map_err(provider_err)? {
+            return Ok(url);
+        }
+        Ok(region.quota_limit_url())
+    }
+
+    fn request_url(
+        env: &settings::EnvMap,
+        region: ZaiRegion,
+        team_context: Option<&ZaiTeamContext>,
+    ) -> Result<Url, ProviderError> {
+        let mut url = Self::quota_url(env, region)?;
+        if team_context.is_some() {
+            url.query_pairs_mut().append_pair("type", "2");
+        }
+        Ok(url)
+    }
+
+    fn team_context(ctx: &FetchContext) -> Result<Option<ZaiTeamContext>, ProviderError> {
+        let explicit_scope = std::env::var(ZAI_USAGE_SCOPE_ENV)
+            .ok()
+            .and_then(|value| settings::cleaned(&value))
+            .is_some_and(|value| value.eq_ignore_ascii_case("team"));
+        let context = ctx
+            .workspace_id
+            .as_deref()
+            .and_then(parse_team_context_pair)
+            .or_else(ZaiTeamContext::from_env);
+
+        if explicit_scope && context.is_none() {
+            return Err(ProviderError::Other(
+                "z.ai team usage requires Z_AI_BIGMODEL_ORGANIZATION and Z_AI_BIGMODEL_PROJECT, or workspace_id as organization|project."
+                    .to_string(),
+            ));
+        }
+        Ok(context)
     }
 
     /// Fetch usage from z.ai API
     async fn fetch_usage_api(&self, ctx: &FetchContext) -> Result<UsageSnapshot, ProviderError> {
-        let api_token = Self::get_api_token(ctx.api_key.as_deref())?;
+        let env = settings::process_env();
+        let region = Self::effective_region(ctx, &env);
+        // Canonical cross-region overrides are rejected before any bearer
+        // token is sent (upstream #2621/#2623).
+        Self::validate_endpoint_overrides(&env, region)?;
+        let api_token = Self::get_api_token(ctx.api_key.as_deref(), region, &env)?;
 
-        let client = reqwest::Client::builder()
+        let client = crate::core::credentialed_http_client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| ProviderError::Other(e.to_string()))?;
 
-        let resp = client
-            .get(ZAI_API_URL)
-            .header("Authorization", format!("Bearer {}", api_token))
-            .header("Accept", "application/json")
-            .send()
-            .await?;
+        let team_context = Self::team_context(ctx)?;
+        let request_url = Self::request_url(&env, region, team_context.as_ref())?;
+        let authorization = authorization_header(&api_token);
+        let mut request = client
+            .get(request_url)
+            .header("Authorization", authorization.as_str())
+            .header("Accept", "application/json");
+        if let Some(team) = &team_context {
+            request = request
+                .header("Bigmodel-Organization", team.organization_id.as_str())
+                .header("Bigmodel-Project", team.project_id.as_str());
+        }
+        let resp = request.send().await?;
 
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err(ProviderError::AuthRequired);
@@ -166,46 +289,94 @@ impl ZaiProvider {
         let quota: ZaiQuotaResponse =
             serde_json::from_slice(&resp_bytes).map_err(|e| ProviderError::Parse(e.to_string()))?;
 
-        self.parse_quota_response(&quota)
+        let mut usage = self.parse_quota_response(&quota)?;
+        if region == ZaiRegion::BigModelCn
+            && let Some(balance) = balance::fetch_cn_balance(&client, &authorization).await
+        {
+            let mut row = RateWindow::informational(format!("¥{balance:.2}"));
+            row.reset_description = Some(format!("¥{balance:.2} available"));
+            usage = usage.with_extra_rate_window("zai-account-balance", "Account balance", row);
+        }
+        Ok(usage)
     }
 
     fn parse_quota_response(
         &self,
         quota: &ZaiQuotaResponse,
     ) -> Result<UsageSnapshot, ProviderError> {
+        if quota.code.is_some_and(|code| code != 0 && code != 200) {
+            return Err(ProviderError::Other(
+                quota
+                    .message
+                    .as_deref()
+                    .filter(|message| !message.trim().is_empty())
+                    .unwrap_or("z.ai API returned an error")
+                    .to_string(),
+            ));
+        }
+
         // Get limits from data.limits (upstream) or flat limits (legacy)
         let limits = if let Some(data) = &quota.data {
             &data.limits
         } else {
             &quota.limits
         };
+        // Upstream 0.48.0 plan-name fallbacks: planName, plan, plan_type,
+        // packageName, level — first non-empty trimmed wins.
         let plan_name = quota
             .data
             .as_ref()
-            .and_then(|d| d.plan_name.as_deref())
+            .and_then(|data| {
+                [
+                    data.plan_name.as_deref(),
+                    data.plan.as_deref(),
+                    data.plan_type.as_deref(),
+                    data.package_name.as_deref(),
+                    data.level.as_deref(),
+                ]
+                .into_iter()
+                .filter_map(|raw| raw.map(str::trim))
+                .find(|raw| !raw.is_empty())
+            })
             .unwrap_or("z.ai");
 
-        // Collect TOKENS_LIMIT entries (upstream uses "TOKENS_LIMIT", legacy uses "tokens")
-        let mut token_limits: Vec<&ZaiLimit> = limits
-            .iter()
-            .filter(|l| {
-                matches!(
-                    l.limit_type.as_deref(),
-                    Some("TOKENS_LIMIT") | Some("tokens")
-                )
-            })
-            .collect();
+        // Collect token/credit limit entries (upstream 0.49.0 #2724: credit
+        // Coding Plans report `CREDIT_LIMIT` rows with the same shape as
+        // `TOKENS_LIMIT`; upstream uses "TOKENS_LIMIT", legacy uses "tokens").
+        let is_tokens = |l: &&ZaiLimit| {
+            matches!(
+                l.limit_type.as_deref(),
+                Some("TOKENS_LIMIT") | Some("CREDIT_LIMIT") | Some("tokens")
+            )
+        };
+        let is_time =
+            |l: &&ZaiLimit| matches!(l.limit_type.as_deref(), Some("TIME_LIMIT") | Some("mcp"));
+        let mut token_limits: Vec<&ZaiLimit> = limits.iter().filter(is_tokens).collect();
+        // Upstream ordering: ascending window minutes, unknown windows last.
+        token_limits.sort_by_key(|l| Self::window_minutes(l).unwrap_or(u32::MAX));
+        let time_limit = limits.iter().find(is_time);
 
-        // Find TIME_LIMIT entry (or legacy "mcp")
-        let time_limit = limits
-            .iter()
-            .find(|l| matches!(l.limit_type.as_deref(), Some("TIME_LIMIT") | Some("mcp")));
-
-        // Sort token limits by window_minutes: shortest first
-        token_limits.sort_by_key(|l| Self::window_minutes(l));
-
-        // Compute used percent for a limit entry
+        // Compute used percent for a limit entry (upstream 0.49.0 `parseLimit`):
+        // when the response carries a positive `usage` total, the absolute
+        // used signal (`usage - remaining`, or `currentValue`) wins over the
+        // API's own `percentage`; otherwise `percentage` is trusted, and
+        // legacy `limit`/`used` responses fall back to the old math.
         fn compute_percent(l: &ZaiLimit) -> f64 {
+            if let Some(usage) = l.usage.filter(|&usage| usage > 0.0) {
+                let used = if let Some(remaining) = l.remaining {
+                    let from_remaining = usage - remaining;
+                    let baseline = l.current_value.unwrap_or(from_remaining);
+                    from_remaining.max(baseline)
+                } else {
+                    l.current_value.unwrap_or(0.0)
+                };
+                let clamped = used.clamp(0.0, usage);
+                return (clamped / usage * 100.0).clamp(0.0, 100.0);
+            }
+            if let Some(percentage) = l.percentage {
+                return percentage.clamp(0.0, 100.0);
+            }
+
             let limit = l.limit.unwrap_or(0.0);
             if limit <= 0.0 {
                 return if l.used.unwrap_or(0.0) > 0.0 || l.current_value.unwrap_or(0.0) > 0.0 {
@@ -225,52 +396,79 @@ impl ZaiProvider {
             ((used / limit) * 100.0).clamp(0.0, 100.0)
         }
 
-        fn make_window(l: &ZaiLimit, window_mins: Option<u32>) -> RateWindow {
-            RateWindow::with_details(compute_percent(l), window_mins, None, l.reset_at.clone())
-        }
-
-        // Build windows based on upstream layout:
-        // If 2+ TOKENS_LIMIT: shortest → session (5-hour), longest → weekly (primary)
-        // TIME_LIMIT → secondary
-        let (primary, secondary, tertiary) = match token_limits.len() {
-            0 => {
-                // No token limits; use time_limit as primary if available
-                let p = time_limit
-                    .map(|l| make_window(l, Self::window_minutes(l)))
-                    .unwrap_or_else(|| RateWindow::new(0.0));
-                (p, None, None)
-            }
-            1 => {
-                let p = make_window(token_limits[0], Self::window_minutes(token_limits[0]));
-                let s = time_limit.map(|l| make_window(l, Self::window_minutes(l)));
-                (p, s, None)
-            }
-            _ => {
-                // 2+ token limits: longest → primary (weekly), shortest → tertiary (5-hour)
-                let weekly = token_limits.last().unwrap();
-                let session = token_limits.first().unwrap();
-                let p = make_window(weekly, Self::window_minutes(weekly));
-                let s = time_limit.map(|l| make_window(l, Self::window_minutes(l)));
-                let t = Some(make_window(session, Self::window_minutes(session)));
-                (p, s, t)
-            }
+        // Upstream 0.48.0 `rateWindow`/`resetDescription`: only token-type
+        // windows keep duration minutes; TIME_LIMIT (MCP) carries the "MCP"
+        // label and no window duration; 5-hour token windows are labeled
+        // "5-hour"; otherwise the explicit window label is used.
+        let now = Utc::now();
+        let make_window = |l: &ZaiLimit| -> RateWindow {
+            let is_tokens = matches!(
+                l.limit_type.as_deref(),
+                Some("TOKENS_LIMIT") | Some("CREDIT_LIMIT") | Some("tokens")
+            );
+            let window_mins = if is_tokens {
+                ZaiProvider::window_minutes(l)
+            } else {
+                None
+            };
+            let resets_at = l
+                .next_reset_time
+                .and_then(DateTime::<Utc>::from_timestamp_millis)
+                .or_else(|| {
+                    l.reset_at
+                        .as_deref()
+                        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                        .map(|timestamp| timestamp.with_timezone(&Utc))
+                });
+            let resets_at =
+                resets_at.filter(|reset| is_plausible_five_hour_reset(window_mins, *reset, now));
+            RateWindow::with_details(
+                compute_percent(l),
+                window_mins,
+                resets_at,
+                rate_window_reset_description(l, window_mins),
+            )
         };
 
+        // Upstream 0.48.0 bucket split: with 2+ token limits, the shortest
+        // window → session (5-hour GLM Coding Plan window) and the longest →
+        // weekly token quota; with one token limit it stands alone; with none
+        // the MCP (time) limit is the primary.
+        let (token_limit, session_token_limit) = match token_limits.as_slice() {
+            [] => (None, None),
+            [single] => (Some(*single), None),
+            _ => (token_limits.last().copied(), token_limits.first().copied()),
+        };
+        let primary_limit = session_token_limit.or(token_limit).or(time_limit);
+        let secondary_limit = if session_token_limit.is_some() {
+            token_limit
+        } else {
+            None
+        };
+
+        let primary = primary_limit
+            .map(make_window)
+            .unwrap_or_else(|| RateWindow::new(0.0));
         let mut usage = UsageSnapshot::new(primary).with_login_method(plan_name);
-        if let Some(sec) = secondary {
-            usage = usage.with_secondary(sec);
+        if let Some(secondary) = secondary_limit {
+            usage = usage.with_secondary(make_window(secondary));
         }
-        if let Some(ter) = tertiary {
-            usage = usage.with_model_specific(ter);
+        // MCP usage is a separate named window whenever a coding-limit
+        // primary exists; with no token limits it already owns the primary.
+        if (token_limit.is_some() || session_token_limit.is_some())
+            && let Some(mcp) = time_limit
+        {
+            usage = usage.with_extra_rate_window("zai-mcp", "MCP", make_window(mcp));
         }
 
         Ok(usage)
     }
 
-    /// Compute window_minutes from a limit's unit + number fields
+    /// Compute window_minutes from a limit's unit + number fields.
+    /// Returns `None` when number ≤ 0 or unit is unknown (upstream windowMinutes).
     fn window_minutes(l: &ZaiLimit) -> Option<u32> {
+        let number = l.number.filter(|&n| n > 0)? as u32;
         let unit = l.unit?;
-        let number = l.number.unwrap_or(1) as u32;
         let minutes_per_unit = match unit {
             1 => 1440,  // days
             3 => 60,    // hours
@@ -282,6 +480,94 @@ impl ZaiProvider {
     }
 }
 
+/// Upstream 0.48.0 `resetDescription`: MCP (TIME_LIMIT) → "MCP"; 5-hour
+/// token window → "5-hour"; else the explicit window label, if any.
+fn rate_window_reset_description(l: &ZaiLimit, window_mins: Option<u32>) -> Option<String> {
+    if matches!(l.limit_type.as_deref(), Some("TIME_LIMIT") | Some("mcp")) {
+        return Some("MCP".to_string());
+    }
+    if matches!(
+        l.limit_type.as_deref(),
+        Some("TOKENS_LIMIT") | Some("CREDIT_LIMIT") | Some("tokens")
+    ) && window_mins == Some(300)
+    {
+        return Some("5-hour".to_string());
+    }
+    window_label(l)
+}
+
+fn window_label(l: &ZaiLimit) -> Option<String> {
+    let number = l.number.filter(|&n| n > 0)?;
+    let unit = l.unit?;
+    let unit_label = match unit {
+        1 => {
+            if number == 1 {
+                "day"
+            } else {
+                "days"
+            }
+        }
+        3 => {
+            if number == 1 {
+                "hour"
+            } else {
+                "hours"
+            }
+        }
+        5 => {
+            if number == 1 {
+                "minute"
+            } else {
+                "minutes"
+            }
+        }
+        6 => {
+            if number == 1 {
+                "week"
+            } else {
+                "weeks"
+            }
+        }
+        _ => return None,
+    };
+    Some(format!("{number} {unit_label} window"))
+}
+
+impl ZaiTeamContext {
+    fn from_env() -> Option<Self> {
+        let organization_id = std::env::var(ZAI_BIGMODEL_ORG_ENV)
+            .ok()
+            .and_then(|value| settings::cleaned(&value))?;
+        let project_id = std::env::var(ZAI_BIGMODEL_PROJECT_ENV)
+            .ok()
+            .and_then(|value| settings::cleaned(&value))?;
+        Some(Self {
+            organization_id,
+            project_id,
+        })
+    }
+}
+
+fn parse_team_context_pair(raw: &str) -> Option<ZaiTeamContext> {
+    let (organization_id, project_id) = raw
+        .split_once('|')
+        .or_else(|| raw.split_once(','))
+        .or_else(|| raw.split_once(';'))?;
+    Some(ZaiTeamContext {
+        organization_id: settings::cleaned(organization_id)?,
+        project_id: settings::cleaned(project_id)?,
+    })
+}
+
+fn authorization_header(token: &str) -> String {
+    let trimmed = token.trim();
+    if trimmed.to_ascii_lowercase().starts_with("bearer ") {
+        trimmed.to_string()
+    } else {
+        format!("Bearer {trimmed}")
+    }
+}
+
 impl Default for ZaiProvider {
     fn default() -> Self {
         Self::new()
@@ -290,6 +576,10 @@ impl Default for ZaiProvider {
 
 #[async_trait]
 impl Provider for ZaiProvider {
+    fn automatic_metric_prioritizes_exhausted_window(&self) -> bool {
+        false
+    }
+
     fn id(&self) -> ProviderId {
         ProviderId::Zai
     }
@@ -326,3 +616,6 @@ impl Provider for ZaiProvider {
         false
     }
 }
+
+#[cfg(test)]
+mod tests;

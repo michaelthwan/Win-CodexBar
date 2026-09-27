@@ -4,6 +4,8 @@
 //! stored by the Codex CLI in ~/.codex/auth.json
 
 mod api;
+mod pat;
+mod weekly_reset;
 
 use async_trait::async_trait;
 #[cfg(windows)]
@@ -36,9 +38,56 @@ impl CodexProvider {
                 is_primary: true,
                 dashboard_url: Some("https://chatgpt.com/codex/settings/usage"),
                 status_page_url: Some("https://status.openai.com"),
+                tertiary_label_key: None,
             },
             api: CodexApi::new(),
         }
+    }
+}
+
+fn fetch_result(
+    usage: crate::core::UsageSnapshot,
+    cost: Option<crate::core::CostSnapshot>,
+    source: &str,
+    account_identity: Option<String>,
+) -> ProviderFetchResult {
+    let account_email = usage.account_email.clone();
+    let mut result = ProviderFetchResult::new(usage, source);
+    if let Some(cost) = cost.map(|cost| {
+        if cost.account_id.is_none()
+            && let Some(account) = account_email.as_deref()
+        {
+            cost.with_account_id(account)
+        } else {
+            cost
+        }
+    }) {
+        result = result.with_cost(cost);
+    }
+    if let Some(account_identity) = account_identity {
+        result = result.with_account_identity(account_identity);
+    }
+    result
+}
+
+fn pat_allows_auto_fallback(error: &ProviderError) -> bool {
+    matches!(
+        error,
+        ProviderError::AuthRequired | ProviderError::NotInstalled(_)
+    )
+}
+
+async fn authenticated_http_error(response: reqwest::Response, endpoint: &str) -> ProviderError {
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return ProviderError::AuthRequired;
+    }
+
+    let body = response.text().await.unwrap_or_default();
+    if body.is_empty() {
+        ProviderError::Other(format!("{endpoint} returned {status}"))
+    } else {
+        ProviderError::Other(format!("{endpoint} returned {status}: {body}"))
     }
 }
 
@@ -50,6 +99,10 @@ impl Default for CodexProvider {
 
 #[async_trait]
 impl Provider for CodexProvider {
+    fn automatic_metric_prioritizes_exhausted_window(&self) -> bool {
+        false
+    }
+
     fn id(&self) -> ProviderId {
         ProviderId::Codex
     }
@@ -58,20 +111,37 @@ impl Provider for CodexProvider {
         &self.metadata
     }
 
-    async fn fetch_usage(&self, _ctx: &FetchContext) -> Result<ProviderFetchResult, ProviderError> {
-        tracing::debug!("Fetching Codex usage via OAuth API");
+    fn retains_last_good_on_transport_failure(&self) -> bool {
+        true
+    }
+
+    async fn fetch_usage(&self, ctx: &FetchContext) -> Result<ProviderFetchResult, ProviderError> {
+        tracing::debug!("Fetching Codex usage");
+
+        if ctx.source_mode == SourceMode::Web {
+            return Err(ProviderError::UnsupportedSource(SourceMode::Web));
+        }
+
+        if ctx.source_mode == SourceMode::Auto && self.api.has_pat_credentials() {
+            let version = detect_codex_version();
+            match self.api.fetch_usage_pat(version.as_deref()).await {
+                Ok((usage, cost, account_identity)) => {
+                    return Ok(fetch_result(usage, cost, "pat", account_identity));
+                }
+                Err(error) if pat_allows_auto_fallback(&error) => {
+                    tracing::debug!("Codex PAT unavailable in Auto; trying OAuth: {error}");
+                }
+                Err(error) => return Err(error),
+            }
+        }
 
         match self.api.fetch_usage().await {
-            Ok((usage, cost)) => {
-                let mut result = ProviderFetchResult::new(usage, "oauth");
-                if let Some(c) = cost {
-                    result = result.with_cost(c);
-                }
-                Ok(result)
+            Ok((usage, cost, account_identity)) => {
+                Ok(fetch_result(usage, cost, "oauth", account_identity))
             }
-            Err(e) => {
-                tracing::warn!("Codex API fetch failed: {}", e);
-                Err(e)
+            Err(error) => {
+                tracing::warn!("Codex API fetch failed: {error}");
+                Err(error)
             }
         }
     }
@@ -93,24 +163,9 @@ impl Provider for CodexProvider {
     }
 }
 
-/// Try to find the codex CLI binary
-fn which_codex() -> Option<std::path::PathBuf> {
-    // Check common locations on Windows
-    let possible_paths = [
-        // In PATH
-        which::which("codex").ok(),
-        // npm global install
-        dirs::data_dir().map(|p| p.join("npm").join("codex.cmd")),
-        // AppData locations
-        dirs::data_local_dir().map(|p| p.join("Programs").join("codex").join("codex.exe")),
-    ];
-
-    possible_paths.into_iter().flatten().find(|p| p.exists())
-}
-
 /// Detect the version of the codex CLI
 fn detect_codex_version() -> Option<String> {
-    let codex_path = which_codex()?;
+    let codex_path = crate::codex_cli::locate_codex_binary()?;
 
     #[cfg(windows)]
     const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -124,14 +179,41 @@ fn detect_codex_version() -> Option<String> {
 
     if output.status.success() {
         let version_str = String::from_utf8_lossy(&output.stdout);
-        extract_version(&version_str)
+        super::extract_semver(&version_str)
     } else {
         None
     }
 }
 
-/// Extract version number from a string like "codex 1.2.3"
-fn extract_version(s: &str) -> Option<String> {
-    let re = regex_lite::Regex::new(r"(\d+(?:\.\d+)+)").ok()?;
-    re.find(s).map(|m| m.as_str().to_string())
+#[cfg(test)]
+mod pat_strategy_tests {
+    use super::*;
+    use crate::core::LastGoodFailurePolicy;
+
+    #[test]
+    fn pat_auto_fallback_is_narrow() {
+        assert!(pat_allows_auto_fallback(&ProviderError::AuthRequired));
+        assert!(pat_allows_auto_fallback(&ProviderError::NotInstalled(
+            "missing".into()
+        )));
+        assert!(!pat_allows_auto_fallback(&ProviderError::Parse(
+            "bad".into()
+        )));
+        assert!(!pat_allows_auto_fallback(&ProviderError::Other(
+            "server".into()
+        )));
+    }
+
+    #[test]
+    fn transport_failures_retain_but_authentication_failures_replace() {
+        let provider = CodexProvider::new();
+        assert_eq!(
+            provider.last_good_failure_policy_for_error(&ProviderError::Timeout),
+            LastGoodFailurePolicy::Preserve
+        );
+        assert_eq!(
+            provider.last_good_failure_policy_for_error(&ProviderError::AuthRequired),
+            LastGoodFailurePolicy::Replace
+        );
+    }
 }

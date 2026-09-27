@@ -16,13 +16,23 @@ use super::*;
 pub(super) struct RawSettings {
     enabled_providers: HashSet<String>,
     refresh_interval_secs: u64,
+    #[serde(default)]
+    adaptive_refresh: bool,
+    refresh_all_providers_on_menu_open: bool,
+    #[serde(default)]
+    low_power_mode: bool,
+    #[serde(default)]
+    low_power_mode_preference: Option<LowPowerModePreference>,
+
     start_minimized: bool,
     start_at_login: bool,
     show_notifications: bool,
     sound_enabled: bool,
-    sound_volume: u8,
+    notification_sound_paths: NotificationSoundPaths,
+    notification_sound_theme: NotificationSoundTheme,
     high_usage_threshold: f64,
     critical_usage_threshold: f64,
+    provider_usage_thresholds: HashMap<String, UsageThresholdOverride>,
     merge_tray_icons: bool,
     tray_icon_mode: TrayIconMode,
     #[serde(default = "default_true")]
@@ -30,11 +40,15 @@ pub(super) struct RawSettings {
     menu_bar_shows_highest_usage: bool,
     menu_bar_shows_percent: bool,
     show_as_used: bool,
-    surprise_animations: bool,
     enable_animations: bool,
     reset_time_relative: bool,
+    show_reset_when_exhausted: bool,
+    predictive_pace_warning_enabled: bool,
+    #[serde(default = "default_true")]
+    show_pace: bool,
     menu_bar_display_mode: String,
-    show_credits_extra_usage: bool,
+    #[serde(default = "default_overview_layout")]
+    overview_layout: String,
     show_all_token_accounts_in_menu: bool,
 
     // ── New unified per-provider map ─────────────────────────────────
@@ -98,7 +112,6 @@ pub(super) struct RawSettings {
     #[serde(default)]
     claude_avoid_keychain_prompts: Option<bool>,
 
-    show_debug_settings: bool,
     disable_keychain_access: bool,
     hide_personal_info: bool,
     update_channel: UpdateChannel,
@@ -106,23 +119,70 @@ pub(super) struct RawSettings {
     provider_order: Vec<String>,
     #[serde(default = "default_global_shortcut")]
     global_shortcut: String,
+    codex_custom_sessions_dirs: Vec<String>,
+    agent_sessions_enabled: bool,
+    agent_session_ssh_hosts: Vec<String>,
+    #[serde(default)]
+    hooks_enabled: bool,
+    #[serde(default)]
+    http_proxy_enabled: bool,
+    #[serde(default)]
+    http_proxy_url: String,
+    #[serde(default)]
+    http_proxy_username: String,
+    #[serde(default)]
+    http_proxy_password: String,
     auto_download_updates: bool,
     install_updates_on_quit: bool,
     ui_language: Language,
     theme: ThemePreference,
+    #[serde(default = "default_window_scale_percent")]
+    window_scale_percent: u16,
+    #[serde(default = "default_tray_scale_percent")]
+    tray_scale_percent: u16,
+    #[serde(default)]
+    tray_panel_always_on_top: bool,
+    #[serde(default)]
+    powertoys_status_pipe_enabled: bool,
 
     #[serde(default)]
     float_bar_enabled: bool,
     #[serde(default = "default_float_bar_opacity")]
     float_bar_opacity: u8,
+    #[serde(default = "default_float_bar_scale")]
+    float_bar_scale: u8,
     #[serde(default = "default_float_bar_orientation")]
     float_bar_orientation: String,
+    #[serde(default = "default_float_bar_style")]
+    float_bar_style: String,
     #[serde(default)]
     float_bar_click_through: bool,
     #[serde(default)]
     float_bar_provider_ids: Vec<String>,
     #[serde(default)]
     float_bar_dark_text: bool,
+    #[serde(default)]
+    float_bar_show_reset_inline: bool,
+    #[serde(default)]
+    float_bar_show_cost: bool,
+    #[serde(default = "default_true")]
+    promote_tray_icon: bool,
+    #[serde(default = "default_true")]
+    claude_daily_routines_usage_visible: bool,
+    #[serde(default)]
+    claude_allow_reading_claude_code_credentials: bool,
+    #[serde(default)]
+    weekly_progress_work_days: Option<u8>,
+    #[serde(default = "default_alibaba_token_plan_region")]
+    alibaba_token_plan_region: String,
+    #[serde(default)]
+    codex_external_oauth_sources_allowed: bool,
+    #[serde(default)]
+    cost_summary_display_style: CostSummaryDisplayStyle,
+    #[serde(default)]
+    open_codex_usage_logs_enabled: bool,
+    #[serde(default)]
+    hide_native_codex_cost_when_open_codex_present: bool,
 }
 
 impl Default for RawSettings {
@@ -131,24 +191,32 @@ impl Default for RawSettings {
         Self {
             enabled_providers: s.enabled_providers,
             refresh_interval_secs: s.refresh_interval_secs,
+            adaptive_refresh: s.adaptive_refresh,
+            refresh_all_providers_on_menu_open: s.refresh_all_providers_on_menu_open,
+            low_power_mode: s.low_power_mode_preference == LowPowerModePreference::On,
+            low_power_mode_preference: Some(s.low_power_mode_preference),
             start_minimized: s.start_minimized,
             start_at_login: s.start_at_login,
             show_notifications: s.show_notifications,
             sound_enabled: s.sound_enabled,
-            sound_volume: s.sound_volume,
+            notification_sound_paths: s.notification_sound_paths,
+            notification_sound_theme: s.notification_sound_theme,
             high_usage_threshold: s.high_usage_threshold,
             critical_usage_threshold: s.critical_usage_threshold,
+            provider_usage_thresholds: HashMap::new(),
             merge_tray_icons: s.merge_tray_icons,
             tray_icon_mode: s.tray_icon_mode,
             switcher_shows_icons: s.switcher_shows_icons,
             menu_bar_shows_highest_usage: s.menu_bar_shows_highest_usage,
             menu_bar_shows_percent: s.menu_bar_shows_percent,
             show_as_used: s.show_as_used,
-            surprise_animations: s.surprise_animations,
             enable_animations: s.enable_animations,
             reset_time_relative: s.reset_time_relative,
+            show_reset_when_exhausted: s.show_reset_when_exhausted,
+            predictive_pace_warning_enabled: s.predictive_pace_warning_enabled,
+            show_pace: s.show_pace,
             menu_bar_display_mode: s.menu_bar_display_mode,
-            show_credits_extra_usage: s.show_credits_extra_usage,
+            overview_layout: s.overview_layout,
             show_all_token_accounts_in_menu: s.show_all_token_accounts_in_menu,
             provider_configs: s.provider_configs,
             claude_usage_source: None,
@@ -179,23 +247,49 @@ impl Default for RawSettings {
             minimax_api_token: None,
             minimax_api_region: None,
             claude_avoid_keychain_prompts: None,
-            show_debug_settings: s.show_debug_settings,
             disable_keychain_access: s.disable_keychain_access,
             hide_personal_info: s.hide_personal_info,
             update_channel: s.update_channel,
             provider_metrics: s.provider_metrics,
             provider_order: s.provider_order,
             global_shortcut: s.global_shortcut,
+            codex_custom_sessions_dirs: s.codex_custom_sessions_dirs,
+            agent_sessions_enabled: s.agent_sessions_enabled,
+            agent_session_ssh_hosts: s.agent_session_ssh_hosts,
+            hooks_enabled: s.hooks_enabled,
+            http_proxy_enabled: s.http_proxy_enabled,
+            http_proxy_url: s.http_proxy_url,
+            http_proxy_username: s.http_proxy_username,
+            http_proxy_password: s.http_proxy_password,
             auto_download_updates: s.auto_download_updates,
             install_updates_on_quit: s.install_updates_on_quit,
             ui_language: s.ui_language,
             theme: s.theme,
+            window_scale_percent: s.window_scale_percent,
+            tray_scale_percent: s.tray_scale_percent,
+            tray_panel_always_on_top: s.tray_panel_always_on_top,
+            powertoys_status_pipe_enabled: s.powertoys_status_pipe_enabled,
             float_bar_enabled: s.float_bar_enabled,
             float_bar_opacity: s.float_bar_opacity,
+            float_bar_scale: s.float_bar_scale,
             float_bar_orientation: s.float_bar_orientation,
+            float_bar_style: s.float_bar_style,
             float_bar_click_through: s.float_bar_click_through,
             float_bar_provider_ids: s.float_bar_provider_ids,
             float_bar_dark_text: s.float_bar_dark_text,
+            float_bar_show_reset_inline: s.float_bar_show_reset_inline,
+            float_bar_show_cost: s.float_bar_show_cost,
+            promote_tray_icon: s.promote_tray_icon,
+            claude_daily_routines_usage_visible: s.claude_daily_routines_usage_visible,
+            claude_allow_reading_claude_code_credentials: s
+                .claude_allow_reading_claude_code_credentials,
+            weekly_progress_work_days: s.weekly_progress_work_days,
+            alibaba_token_plan_region: s.alibaba_token_plan_region,
+            codex_external_oauth_sources_allowed: s.codex_external_oauth_sources_allowed,
+            cost_summary_display_style: s.cost_summary_display_style,
+            open_codex_usage_logs_enabled: s.open_codex_usage_logs_enabled,
+            hide_native_codex_cost_when_open_codex_present: s
+                .hide_native_codex_cost_when_open_codex_present,
         }
     }
 }
@@ -333,6 +427,11 @@ impl From<RawSettings> for Settings {
             ProviderId::MiniMax,
             raw.minimax_api_region,
         );
+        set_region(
+            &mut provider_configs,
+            ProviderId::AlibabaTokenPlan,
+            Some(raw.alibaba_token_plan_region.clone()).filter(|v| !v.trim().is_empty()),
+        );
 
         set_header(
             &mut provider_configs,
@@ -406,46 +505,101 @@ impl From<RawSettings> for Settings {
                 .avoid_keychain_prompts = true;
         }
 
+        let low_power_mode_preference = match raw.low_power_mode_preference {
+            // A legacy writer may know only the boolean and leave the new field
+            // at its serialized default. Preserve the previously enabled state.
+            Some(LowPowerModePreference::Off) if raw.low_power_mode => LowPowerModePreference::On,
+            Some(preference) => preference,
+            None if raw.low_power_mode => LowPowerModePreference::On,
+            None => LowPowerModePreference::Off,
+        };
+
         Settings {
             enabled_providers: raw.enabled_providers,
             refresh_interval_secs: raw.refresh_interval_secs,
+            adaptive_refresh: raw.adaptive_refresh,
+            refresh_all_providers_on_menu_open: raw.refresh_all_providers_on_menu_open,
+            low_power_mode_preference,
             start_minimized: raw.start_minimized,
             start_at_login: raw.start_at_login,
             show_notifications: raw.show_notifications,
             sound_enabled: raw.sound_enabled,
-            sound_volume: raw.sound_volume,
+            notification_sound_paths: raw.notification_sound_paths,
+            notification_sound_theme: raw.notification_sound_theme,
             high_usage_threshold: raw.high_usage_threshold,
             critical_usage_threshold: raw.critical_usage_threshold,
+            provider_usage_thresholds: normalize_usage_threshold_overrides(
+                raw.provider_usage_thresholds,
+            ),
             merge_tray_icons: raw.merge_tray_icons,
             tray_icon_mode: raw.tray_icon_mode,
             switcher_shows_icons: raw.switcher_shows_icons,
             menu_bar_shows_highest_usage: raw.menu_bar_shows_highest_usage,
             menu_bar_shows_percent: raw.menu_bar_shows_percent,
             show_as_used: raw.show_as_used,
-            surprise_animations: raw.surprise_animations,
             enable_animations: raw.enable_animations,
             reset_time_relative: raw.reset_time_relative,
+            show_reset_when_exhausted: raw.show_reset_when_exhausted,
+            predictive_pace_warning_enabled: raw.predictive_pace_warning_enabled,
+            show_pace: raw.show_pace,
             menu_bar_display_mode: raw.menu_bar_display_mode,
-            show_credits_extra_usage: raw.show_credits_extra_usage,
+            overview_layout: normalize_overview_layout(&raw.overview_layout),
             show_all_token_accounts_in_menu: raw.show_all_token_accounts_in_menu,
             provider_configs,
-            show_debug_settings: raw.show_debug_settings,
             disable_keychain_access: raw.disable_keychain_access,
             hide_personal_info: raw.hide_personal_info,
             update_channel: raw.update_channel,
             provider_metrics: raw.provider_metrics,
-            provider_order: raw.provider_order,
+            provider_order: if raw.provider_order.is_empty() {
+                Vec::new()
+            } else {
+                normalize_provider_order(&raw.provider_order)
+            },
             global_shortcut: raw.global_shortcut,
+            codex_custom_sessions_dirs: raw.codex_custom_sessions_dirs,
+            agent_sessions_enabled: raw.agent_sessions_enabled,
+            agent_session_ssh_hosts: raw.agent_session_ssh_hosts,
+            hooks_enabled: raw.hooks_enabled,
+            http_proxy_enabled: raw.http_proxy_enabled,
+            http_proxy_url: raw.http_proxy_url,
+            http_proxy_username: raw.http_proxy_username,
+            http_proxy_password: raw.http_proxy_password,
             auto_download_updates: raw.auto_download_updates,
             install_updates_on_quit: raw.install_updates_on_quit,
             ui_language: raw.ui_language,
             theme: raw.theme,
+            window_scale_percent: clamp_window_scale_percent(raw.window_scale_percent),
+            tray_scale_percent: clamp_tray_scale_percent(raw.tray_scale_percent),
+            tray_panel_always_on_top: raw.tray_panel_always_on_top,
+            powertoys_status_pipe_enabled: raw.powertoys_status_pipe_enabled,
             float_bar_enabled: raw.float_bar_enabled,
             float_bar_opacity: clamp_float_bar_opacity(raw.float_bar_opacity),
+            float_bar_scale: clamp_float_bar_scale(raw.float_bar_scale),
             float_bar_orientation: normalize_float_bar_orientation(&raw.float_bar_orientation),
+            float_bar_style: normalize_float_bar_style(&raw.float_bar_style),
             float_bar_click_through: raw.float_bar_click_through,
             float_bar_provider_ids: raw.float_bar_provider_ids,
             float_bar_dark_text: raw.float_bar_dark_text,
+            float_bar_show_reset_inline: raw.float_bar_show_reset_inline,
+            float_bar_show_cost: raw.float_bar_show_cost,
+            promote_tray_icon: raw.promote_tray_icon,
+            claude_daily_routines_usage_visible: raw.claude_daily_routines_usage_visible,
+            claude_allow_reading_claude_code_credentials: raw
+                .claude_allow_reading_claude_code_credentials,
+            weekly_progress_work_days: raw.weekly_progress_work_days,
+            alibaba_token_plan_region: {
+                let trimmed = raw.alibaba_token_plan_region.trim();
+                if trimmed.is_empty() {
+                    "cn".to_string()
+                } else {
+                    trimmed.to_string()
+                }
+            },
+            cost_summary_display_style: raw.cost_summary_display_style,
+            open_codex_usage_logs_enabled: raw.open_codex_usage_logs_enabled,
+            hide_native_codex_cost_when_open_codex_present: raw
+                .hide_native_codex_cost_when_open_codex_present,
+            codex_external_oauth_sources_allowed: raw.codex_external_oauth_sources_allowed,
         }
     }
 }

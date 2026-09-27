@@ -1,23 +1,23 @@
 # Win-CodexBar
 
-[Simplified Chinese](./README.zh-CN.md)
+[English](./README.md) | [简体中文](./README.zh-CN.md) | [繁體中文（臺灣）](./README.zh-TW.md) | [日本語](./README.ja-JP.md) | [한국어](./README.ko-KR.md) | [Español mexicano](./README.es-MX.md) | [Türkçe](./README.tr-TR.md)
 
 Win-CodexBar is a Windows system-tray app for keeping AI coding-tool usage visible without opening a dozen dashboards. It ports the spirit of [CodexBar](https://github.com/steipete/CodexBar) to a Tauri + React desktop shell backed by shared Rust provider logic.
 
 <table>
   <tr>
     <td width="36%" align="center">
-      <img src="extra-docs/images/tray-panel.png" alt="Win-CodexBar tray panel showing provider usage cards"/>
+      <img src="docs/images/tray-panel.png" alt="Win-CodexBar tray panel showing provider usage cards"/>
     </td>
     <td width="64%" align="center">
-      <img src="extra-docs/images/settings-providers.png" alt="Win-CodexBar Providers settings page"/>
+      <img src="docs/images/settings-providers.png" alt="Win-CodexBar Providers settings page"/>
     </td>
   </tr>
 </table>
 
 ## Highlights
 
-- **49 providers** including Codex, Claude, Copilot, OpenRouter, Cursor, Gemini, DeepSeek, MiniMax, Kiro, Antigravity, Groq, and more.
+- **56 providers** including Codex, Claude, Copilot, OpenRouter, Cursor, Gemini, DeepSeek, MiniMax, Kiro, Antigravity, Groq, Qoder, Sakana AI, CrossModel, and more.
 - **Tray-first workflow** with a compact provider grid, usage cards, refresh action, settings shortcut, and quit control.
 - **Provider settings** for source selection, credentials, cookie import, token accounts, API keys, regions, and tray-display preferences.
 - **Windows credential protection** for app-managed API keys, manual cookies, and token accounts, using user-scoped DPAPI where available.
@@ -33,13 +33,18 @@ Install with Windows Package Manager:
 winget install Finesssee.Win-CodexBar
 ```
 
-Or download the latest installer/portable build from [GitHub Releases](https://github.com/Finesssee/Win-CodexBar/releases).
+Or download the latest installer/portable build from [GitHub Releases](https://github.com/nesszer/Win-CodexBar/releases).
 
 - Installer: `CodexBar-<version>-Setup.exe`
 - Portable: `CodexBar-<version>-portable.exe`
 - Checksums: each release includes `.sha256` files
 
 Winget distribution is approved through [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs/tree/master/manifests/f/Finesssee/Win-CodexBar). New versions can take a little time to appear because every Winget update is pinned to a specific release URL and installer hash.
+
+## Code signing
+
+> **Code signing:** SignPath.io is wired into the GitHub Actions release path, but production signing remains fail-closed until the Release certificate 2026 is issued and the `release-signing` policy becomes valid. See [docs/CODE_SIGNING.md](docs/CODE_SIGNING.md) for the signing policy.
+> The v0.60.3 release is immutable and unsigned; verify its SHA-256 files. The first signed release will be the next normal version after SignPath onboarding.
 
 ## First Run
 
@@ -53,7 +58,7 @@ For Claude, browser cookies/sessionKey are preferred because they match Claude's
 
 ## Latest Release
 
-**v0.32.9** fixes tray display settings so changes apply immediately, restores the provider-icon toggle, and shortens native tray tooltip reset text so Windows no longer trims useful status lines.
+**v0.33.2** fixes tray-panel dismissal so the popover closes on focus loss or Escape, without immediately reopening from the same tray click.
 
 See the full history in [CHANGELOG.md](CHANGELOG.md).
 
@@ -75,6 +80,7 @@ See the full history in [CHANGELOG.md](CHANGELOG.md).
 | MiniMax | API / Cookies | Usage, Billing Summary |
 | Kiro | Cookies / CLI | Monthly Credits, Overage |
 | Vertex AI | gcloud OAuth | Cost |
+| v0 | API Key | Billing quota, API rate limits, on-demand balance |
 | Augment | Cookies | Credits |
 | OpenCode | Local Config | Usage |
 | Kimi | Cookies | 5h Rate, Weekly |
@@ -84,6 +90,7 @@ See the full history in [CHANGELOG.md](CHANGELOG.md).
 | Ollama | Cookies / API Key | Usage, Cloud Models, Pace windows |
 | Azure OpenAI | API Key | Deployment |
 | T3 Chat | Cookies / cURL | Base, Overage |
+| TypeSafe | Browser cookies / manual Cookie header | Billing-cycle spend, balance, expiring credits |
 | OpenRouter | API Key | Credits |
 | JetBrains AI | Local Config | Usage |
 | Alibaba | Cookies | Usage |
@@ -107,6 +114,8 @@ See the full history in [CHANGELOG.md](CHANGELOG.md).
 | Venice | API Key | USD / DIEM Balance |
 | OpenAI | Admin API / API Key | Usage, Requests, Project-scoped cost, Credit Balance |
 | Grok | Cookies / auth.json | Billing |
+| Helmcode (also NaN Builders) | Browser cookies / manual Cookie header | Per-model token quotas, reset windows, Helmcode prepaid balance |
+| Replicate | Cookies / token accounts | Monthly spend, credit balance |
 | ElevenLabs | API Key | Subscription Credits, Voice Slots |
 | Deepgram | API Key | Project Usage |
 | Groq | API Key | Enterprise Metrics |
@@ -114,40 +123,52 @@ See the full history in [CHANGELOG.md](CHANGELOG.md).
 
 </details>
 
+## Supported Languages
+
+The UI and contributor reporting currently support:
+
+- English
+- 简体中文
+- 繁體中文（臺灣）
+- 日本語
+- 한국어
+- Español mexicano
+- Türkçe
+
 ## Build From Source
 
 ```powershell
 # Prerequisites: Node.js + pnpm. Rust and MinGW are installed by the script when needed.
-git clone https://github.com/Finesssee/Win-CodexBar.git
+git clone https://github.com/nesszer/Win-CodexBar.git
 cd Win-CodexBar
-.\dev.ps1
+.\scripts\dev.ps1
 ```
 
 Useful dev flags:
 
 ```powershell
-.\dev.ps1 -Release      # optimized build
-.\dev.ps1 -SkipBuild    # relaunch the last build
+.\scripts\dev.ps1 -Release      # optimized build
+.\scripts\dev.ps1 -SkipBuild    # relaunch the last build
 ```
 
 CLI examples:
 
 ```bash
-codexbar --help
-codexbar diagnose --pretty
-codexbar usage -p claude
-codexbar usage -p all
-codexbar cost -p codex
+codexbar-cli --help
+codexbar-cli diagnose --pretty
+codexbar-cli usage -p claude
+codexbar-cli usage -p all
+codexbar-cli cost -p codex
 ```
 
-Installer builds include `codexbar.exe` as the console CLI and `codexbar-desktop.exe` as the tray app. Start Menu shortcuts launch the desktop app; terminal commands use `codexbar.exe`.
+Installer builds include `codexbar.exe` as the tray app and `codexbar-cli.exe` as the console CLI. Start Menu shortcuts launch the desktop app; terminal commands use `codexbar-cli.exe`. `codexbar-desktop.exe` is still installed as a compatibility alias for older shortcuts and autostart entries.
 
 ## Release Builds
 
 For local Windows release builds, use the cached release builder:
 
 ```powershell
-.\scripts\windows-release-build.ps1 -Ref v0.32.9 -SmokeInstall
+.\scripts\windows-release-build.ps1 -Ref v0.33.2 -SmokeInstall
 ```
 
 The script builds the real Tauri release binary plus the console CLI, verifies signed installer dependencies, packages with Inno Setup, writes installer/portable assets, writes SHA-256 sidecars, and can run a silent install/uninstall smoke test.
@@ -166,9 +187,14 @@ More release automation notes live in [docs/release/ci-cd.md](docs/release/ci-cd
 
 | Topic | Link |
 |---|---|
-| Building from source | [extra-docs/BUILDING.md](extra-docs/BUILDING.md) |
-| WSL setup and auth tips | [extra-docs/WSL.md](extra-docs/WSL.md) |
-| Browser cookie details | [extra-docs/COOKIES.md](extra-docs/COOKIES.md) |
+| Building from source | [docs/BUILDING.md](docs/BUILDING.md) |
+| WSL setup and auth tips | [docs/WSL.md](docs/WSL.md) |
+| Browser cookie details | [docs/COOKIES.md](docs/COOKIES.md) |
+
+## Local integrations
+
+- [AI Usage Limits](https://github.com/lenadweb/stream-deck-ai-limits) — Elgato Stream Deck integration that can consume the local `codexbar serve` dashboard/API to show provider, account, quota, or payload metrics.
+- [AI Monitor](https://github.com/tobymarks/esp32-ai-monitor) — ESP32 desk display (Cheap Yellow Display) with a Windows companion app (beta) that calls the installed CLI (`codexbar-cli usage -p <provider> --json`) and streams Claude, Codex, Copilot, Cursor, Gemini, or Antigravity limits to the display over USB serial.
 
 ## Credits
 

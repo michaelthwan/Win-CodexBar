@@ -4,12 +4,16 @@ use codexbar::core::ProviderId;
 
 use crate::surface::SurfaceMode;
 
+// Must mirror the frontend `SettingsTabId` union
+// (apps/desktop-tauri/src/types/bridge.ts) and `TAB_META` in
+// apps/desktop-tauri/src/surfaces/Settings.tsx.
 const SETTINGS_TAB_IDS: &[&str] = &[
     "general",
     "providers",
-    "display",
-    "apiKeys",
-    "cookies",
+    "notifications",
+    "menuBar",
+    "menu",
+    "usageSpend",
     "advanced",
     "about",
 ];
@@ -30,7 +34,10 @@ pub enum SurfaceTarget {
 }
 
 impl SurfaceTarget {
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "surface target type reserved for future window management integration"
+    )]
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "summary" => Some(Self::Summary),
@@ -171,8 +178,9 @@ mod tests {
 
     #[test]
     fn supported_settings_tabs_match_shell_tabs() {
-        assert!(is_supported_settings_tab("apiKeys"));
+        assert!(is_supported_settings_tab("menuBar"));
         assert!(is_supported_settings_tab("about"));
+        assert!(!is_supported_settings_tab("apiKeys"));
         assert!(!is_supported_settings_tab("security"));
     }
 }

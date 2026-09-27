@@ -131,16 +131,6 @@ pub struct WorkAreaRect {
 }
 
 #[tauri::command]
-pub fn is_remote_session() -> Result<bool, String> {
-    Ok(codexbar::host::session::is_ssh_session() || codexbar::host::session::is_remote_session())
-}
-
-#[tauri::command]
-pub fn get_launch_block_reason() -> Result<Option<String>, String> {
-    Ok(codexbar::host::session::current_launch_block_reason().map(|s| s.to_string()))
-}
-
-#[tauri::command]
 pub fn get_work_area_rect(app: tauri::AppHandle) -> Result<WorkAreaRect, String> {
     use tauri::Manager;
 
@@ -181,90 +171,36 @@ pub fn get_work_area_rect(app: tauri::AppHandle) -> Result<WorkAreaRect, String>
 // ── Misc UX ────────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn play_notification_sound() -> Result<(), String> {
-    // Use the shared sound helper, honouring the user's `sound_enabled` flag.
+pub fn play_notification_sound(
+    event: codexbar::sound::NotificationSoundEvent,
+) -> Result<(), String> {
+    // Preview through the same settings resolution path used by real notifications.
     let settings = Settings::load();
-    codexbar::sound::play_alert(codexbar::sound::AlertSound::Success, &settings);
-    Ok(())
+    codexbar::sound::play_alert(event, &settings).map_err(|error| error.to_string())
 }
 
-/// Reposition the tray panel so its bottom-right corner stays anchored to
+/// Reposition the flyout window so its bottom-right corner stays anchored to
 /// the system-tray area. Called from the frontend after dynamic resize.
+///
+/// Retargeted from `main` to the dedicated `flyout` window — the flyout is no
+/// longer a state of `main`'s surface-mode machine, so `reanchor_tray_panel`
+/// (still exported under its historical name — the frontend command name is
+/// unchanged) now anchors the flyout window directly. The anchor math itself
+/// lives in `shell::flyout_window::reanchor`, which this delegates to.
 #[tauri::command]
 pub fn reanchor_tray_panel(app: tauri::AppHandle) -> Result<(), String> {
-    use crate::window_positioner::{PanelSize, Rect};
-    use tauri::Manager;
-
-    let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| "main window unavailable".to_string())?;
-    let scale = window.scale_factor().unwrap_or(1.0).max(1.0);
-
-    // Use the window's current logical size (after JS resize).
-    let outer = window.outer_size().map_err(|e| e.to_string())?;
-    let panel_size = PanelSize {
-        width: (outer.width as f64 / scale).round() as u32,
-        height: (outer.height as f64 / scale).round() as u32,
-    };
-
-    // Prefer the saved tray anchor from a real click; fall back to
-    // bottom-right of the primary work area.
-    let monitor = window
-        .primary_monitor()
-        .ok()
-        .flatten()
-        .or_else(|| window.current_monitor().ok().flatten())
-        .ok_or_else(|| "no monitor".to_string())?;
-
-    let work_area = Rect {
-        x: monitor.work_area().position.x,
-        y: monitor.work_area().position.y,
-        width: monitor.work_area().size.width,
-        height: monitor.work_area().size.height,
-    };
-
-    let (x, y) = {
-        let st = app.try_state::<std::sync::Mutex<crate::state::AppState>>();
-        let anchor = st.and_then(|s| s.lock().ok()?.tray_anchor);
-        if let Some(a) = anchor {
-            crate::window_positioner::calculate_panel_position(
-                &Rect {
-                    x: a.x,
-                    y: a.y,
-                    width: a.width,
-                    height: a.height,
-                },
-                &work_area,
-                &panel_size,
-                scale,
-            )
-        } else {
-            // Bottom-right fallback
-            crate::window_positioner::calculate_popout_position(
-                None,
-                &work_area,
-                &panel_size,
-                scale,
-            )
-        }
-    };
-
-    // Pass physical coordinates directly — tao converts PhysicalPosition
-    // to OS logical internally by dividing by the window's scale factor.
-    let pos = tauri::PhysicalPosition::new(x, y);
-    tracing::debug!(
-        "reanchor_tray_panel: panel={}x{} => ({},{})",
-        panel_size.width,
-        panel_size.height,
-        pos.x,
-        pos.y
-    );
-    let _ = window.set_position(pos);
-    Ok(())
+    crate::shell::flyout_window::reanchor(&app)
 }
 
 #[tauri::command]
 pub fn quit_app(app: tauri::AppHandle) {
+    let settings = Settings::load();
+    if settings.install_updates_on_quit
+        && let Some(state) = app.try_state::<std::sync::Mutex<crate::state::AppState>>()
+        && let Err(error) = super::updater::apply_ready_update(&state)
+    {
+        tracing::debug!("install-on-quit skipped: {error}");
+    }
     app.exit(0);
 }
 
@@ -276,6 +212,16 @@ fn dashboard_url_for_provider(provider_id: &str) -> Option<String> {
                 settings.api_region(ProviderId::MiniMax),
             )),
         );
+    }
+
+    // OpenRouter's Usage Dashboard is the Activity page. Resolve it from the
+    // provider metadata before the legacy API-key catalog entry, which still
+    // points at the credits settings page.
+    if provider_id == ProviderId::OpenRouter.cli_name() {
+        return instantiate_provider(ProviderId::OpenRouter)
+            .metadata()
+            .dashboard_url
+            .map(|s| s.to_string());
     }
 
     if let Some(url) = codexbar::settings::get_api_key_providers()
@@ -325,16 +271,51 @@ pub async fn trigger_provider_login(
         return run_copilot_device_login(&app).await;
     }
 
-    // TODO(6b): replace fallthrough once LoginPhase events land. The login
-    // runners live in `codexbar::login` but are async-oriented and tightly
-    // coupled to the egui UI's phase callbacks. For the Tauri shell we
-    // currently surface the dashboard URL.
+    if id == ProviderId::Kiro {
+        return run_cli_provider_login(&app, &provider_id, "kiro", 120).await;
+    }
+
+    // For other providers, surface the dashboard URL as the login flow
+    // is not yet wired through the Tauri shell.
     if let Some(url) = dashboard_url_for_provider(&provider_id) {
         return open_url_in_browser(&url);
     }
     Err(format!(
         "Login flow for '{provider_id}' is not yet wired through the Tauri shell"
     ))
+}
+
+/// Run a CLI-based provider login (e.g. Kiro) and emit phase events.
+async fn run_cli_provider_login(
+    app: &tauri::AppHandle,
+    provider_id: &str,
+    display_name: &str,
+    timeout_secs: u64,
+) -> Result<(), String> {
+    let app_handle = app.clone();
+    let provider_id_owned = provider_id.to_string();
+    let result = login::run_kiro_login(timeout_secs, move |phase| {
+        let phase_str = match phase {
+            LoginPhase::Idle => "idle",
+            LoginPhase::Requesting => "requesting",
+            LoginPhase::WaitingBrowser => "waiting-browser",
+            LoginPhase::Complete => "complete",
+        };
+        events::emit_login_phase(&app_handle, &provider_id_owned, phase_str, None);
+    })
+    .await;
+
+    match result.outcome {
+        LoginOutcome::Success => Ok(()),
+        LoginOutcome::MissingBinary => Err(format!(
+            "{display_name} CLI not found. Install it and ensure it is on your PATH."
+        )),
+        LoginOutcome::LaunchFailed(e) => Err(format!("Failed to launch {display_name} login: {e}")),
+        LoginOutcome::TimedOut => Err(format!("{display_name} login timed out")),
+        LoginOutcome::Failed { status } => Err(format!(
+            "{display_name} login failed with exit code {status}"
+        )),
+    }
 }
 
 async fn run_copilot_device_login(app: &tauri::AppHandle) -> Result<(), String> {
@@ -354,7 +335,7 @@ async fn run_copilot_device_login(app: &tauri::AppHandle) -> Result<(), String> 
     let api = CopilotApi::new();
     let identity = api.fetch_identity_with_token(&token, None).await.ok();
     let plan = api
-        .fetch_usage_with_token(&token, None)
+        .fetch_usage_with_token(&token, None, None)
         .await
         .ok()
         .and_then(|usage| usage.login_method);
@@ -371,18 +352,18 @@ async fn run_copilot_device_login(app: &tauri::AppHandle) -> Result<(), String> 
     let mut data = store
         .load_provider(ProviderId::Copilot)
         .map_err(|e| e.to_string())?;
-    let existing_index = login.as_deref().and_then(|login| {
-        data.accounts.iter().position(|account| {
-            account.label == login || account.label.starts_with(&format!("{login} ("))
-        })
-    });
+    let identity_id = identity.as_ref().and_then(|identity| identity.id);
+    let existing_index =
+        find_existing_copilot_account(&api, &data.accounts, identity_id, login.as_deref()).await;
 
     if let Some(index) = existing_index {
         data.accounts[index].token = token;
         data.accounts[index].label = label;
+        data.accounts[index].external_identifier = identity_id.map(copilot_external_identifier);
         data.set_active(index);
     } else {
         let mut account = TokenAccount::new(label, token);
+        account.external_identifier = identity_id.map(copilot_external_identifier);
         account.mark_used();
         data.add_account(account);
         data.set_active(data.accounts.len().saturating_sub(1));
@@ -399,6 +380,59 @@ async fn run_copilot_device_login(app: &tauri::AppHandle) -> Result<(), String> 
     Ok(())
 }
 
+async fn find_existing_copilot_account(
+    api: &CopilotApi,
+    accounts: &[TokenAccount],
+    identity_id: Option<u64>,
+    login: Option<&str>,
+) -> Option<usize> {
+    if let Some(identity_id) = identity_id
+        && let Some(index) = find_copilot_account_by_identity(accounts, identity_id)
+    {
+        return Some(index);
+    }
+
+    let mut label_fallback = None;
+    for (index, account) in accounts
+        .iter()
+        .enumerate()
+        .filter(|(_, account)| account.external_identifier.is_none())
+    {
+        if let Some(identity_id) = identity_id {
+            match api.fetch_identity_with_token(&account.token, None).await {
+                Ok(resolved_identity) if resolved_identity.id == Some(identity_id) => {
+                    return Some(index);
+                }
+                Ok(resolved_identity) if resolved_identity.id.is_some() => continue,
+                _ => {}
+            }
+        }
+
+        if label_fallback.is_none() && copilot_label_matches_login(account, login) {
+            label_fallback = Some(index);
+        }
+    }
+
+    label_fallback
+}
+
+fn find_copilot_account_by_identity(accounts: &[TokenAccount], identity_id: u64) -> Option<usize> {
+    let external_identifier = copilot_external_identifier(identity_id);
+    accounts.iter().position(|account| {
+        account.external_identifier.as_deref() == Some(external_identifier.as_str())
+    })
+}
+
+fn copilot_external_identifier(identity_id: u64) -> String {
+    format!("github:user:{identity_id}")
+}
+
+fn copilot_label_matches_login(account: &TokenAccount, login: Option<&str>) -> bool {
+    login.is_some_and(|login| {
+        account.label == login || account.label.starts_with(&format!("{login} ("))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,5 +443,24 @@ mod tests {
             dashboard_url_for_provider("codex").as_deref(),
             Some("https://chatgpt.com/codex/settings/usage")
         );
+    }
+
+    #[test]
+    fn dashboard_url_resolves_openrouter_activity() {
+        assert_eq!(
+            dashboard_url_for_provider("openrouter").as_deref(),
+            Some("https://openrouter.ai/activity")
+        );
+    }
+
+    #[test]
+    fn copilot_stored_identity_precedes_legacy_label_match() {
+        let legacy = TokenAccount::new("octocat (Pro)", "old-token");
+        let mut identified = TokenAccount::new("Renamed account", "known-token");
+        identified.external_identifier = Some(copilot_external_identifier(123));
+
+        let accounts = vec![legacy.clone(), identified];
+        assert_eq!(find_copilot_account_by_identity(&accounts, 123), Some(1));
+        assert!(copilot_label_matches_login(&legacy, Some("octocat")));
     }
 }

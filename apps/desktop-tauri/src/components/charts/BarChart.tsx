@@ -1,5 +1,12 @@
 import { useMemo, useRef, useState } from "react";
 import { useChartAnimation } from "./useChartAnimation";
+import {
+  WIDTH,
+  getBarCenter,
+  getBarWidth,
+  getBarX,
+  shouldRenderCenterMax,
+} from "./chartGeometry";
 
 /**
  * BarChart — dependency-free SVG bar chart with entrance animation,
@@ -11,12 +18,11 @@ import { useChartAnimation } from "./useChartAnimation";
  *     `animations` prop and `prefers-reduced-motion`)
  *   - absolute-positioned hover tooltip
  *   - peak cap rendered as a separate rect filled with `--chart-peak`
- *   - optional "surprise" class for the easter-egg jitter
  */
 
 export interface BarChartPoint {
   label: string;
-  value: number;
+  value: number | null;
 }
 
 export interface BarChartProps {
@@ -27,15 +33,11 @@ export interface BarChartProps {
   ariaLabel: string;
   /** When false, bars render at their final size immediately. */
   animations?: boolean;
-  /** Enables the surprise-me easter-egg (jitter + rainbow peak cap). */
-  surprise?: boolean;
   /** Optional empty-state message rendered when `data.length === 0`. */
   emptyMessage?: string;
 }
 
 const DEFAULT_COLOR = "var(--chart-cost)";
-const BAR_GAP = 2;
-const SVG_WIDTH = 280;
 const CAP_HEIGHT = 5;
 
 export function BarChart({
@@ -45,7 +47,6 @@ export function BarChart({
   valueFormatter,
   ariaLabel,
   animations = true,
-  surprise = false,
   emptyMessage,
 }: BarChartProps) {
   const fmt = valueFormatter ?? ((v: number) => v.toFixed(2));
@@ -63,7 +64,7 @@ export function BarChart({
     let p = -1;
     for (let i = 0; i < data.length; i++) {
       const v = data[i].value;
-      if (v > m) {
+      if (v != null && v > m) {
         m = v;
         p = i;
       }
@@ -79,11 +80,7 @@ export function BarChart({
     );
   }
 
-  const barWidth = Math.max(
-    1,
-    Math.floor((SVG_WIDTH - (data.length - 1) * BAR_GAP) / data.length),
-  );
-  const actualWidth = data.length * barWidth + (data.length - 1) * BAR_GAP;
+  const barWidth = getBarWidth(data.length);
   const plotHeight = Math.max(1, height - 4);
 
   const onMove = (e: React.MouseEvent<SVGRectElement>, i: number) => {
@@ -95,23 +92,20 @@ export function BarChart({
   const onLeave = () => setHover(null);
 
   return (
-    <div
-      className={`chart chart--bar${surprise ? " chart--surprise" : ""}`}
-      ref={containerRef}
-    >
+    <div className="chart chart--bar" ref={containerRef}>
       <svg
-        width={actualWidth}
+        width={WIDTH}
         height={height}
-        viewBox={`0 0 ${actualWidth} ${height}`}
+        viewBox={`0 0 ${WIDTH} ${height}`}
         className="chart__svg"
         role="img"
         aria-label={ariaLabel}
       >
         {data.map((p, i) => {
-          const base = p.value === 0 ? 1 : Math.max(3, (p.value / max) * plotHeight);
+          const base = p.value == null ? 1 : p.value === 0 ? 1 : Math.max(3, (p.value / max) * plotHeight);
           const eased = anim.barProgress(i);
           const barH = base * eased;
-          const x = i * (barWidth + BAR_GAP);
+          const x = getBarX(i, data.length);
           const y = height - barH;
           const isPeak = i === peakIndex && barH > CAP_HEIGHT;
           const bodyH = isPeak ? Math.max(0, barH - CAP_HEIGHT) : barH;
@@ -126,14 +120,14 @@ export function BarChart({
                 width={barWidth}
                 height={bodyH}
                 fill={color}
-                opacity={p.value === 0 ? 0.25 : isHovered ? 1 : 0.9}
+                opacity={p.value == null ? 0 : p.value === 0 ? 0.25 : isHovered ? 1 : 0.9}
                 rx={1}
                 className="chart__bar"
-                onMouseMove={(e) => onMove(e, i)}
+                onMouseMove={p.value == null ? undefined : (e) => onMove(e, i)}
                 onMouseLeave={onLeave}
               >
                 <title>
-                  {p.label}: {fmt(p.value)}
+                  {p.value == null ? p.label : `${p.label}: ${fmt(p.value)}`}
                 </title>
               </rect>
               {isPeak && (
@@ -153,9 +147,15 @@ export function BarChart({
         })}
       </svg>
       <div className="chart__axis">
-        <span>{data[0].label.slice(-5)}</span>
-        <span className="chart__axis-max">{fmt(max)}</span>
-        <span>{data[data.length - 1].label.slice(-5)}</span>
+        <span className="chart__axis-start" style={{ left: `${getBarCenter(0, data.length)}px` }}>
+          {data[0].label}
+        </span>
+        {shouldRenderCenterMax(data.length) && (
+          <span className="chart__axis-max" style={{ left: `${WIDTH / 2}px` }}>{fmt(max)}</span>
+        )}
+        <span className="chart__axis-end" style={{ left: `${getBarCenter(data.length - 1, data.length)}px` }}>
+          {data[data.length - 1].label}
+        </span>
       </div>
       {hover && !anim.running && (
         <div
@@ -164,7 +164,7 @@ export function BarChart({
           role="tooltip"
         >
           <span className="chart__tooltip-label">{data[hover.i].label}</span>
-          <strong>{fmt(data[hover.i].value)}</strong>
+          <strong>{fmt(data[hover.i].value ?? 0)}</strong>
         </div>
       )}
     </div>

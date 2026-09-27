@@ -1,19 +1,24 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  ClaudeAccount,
+  ClaudeReconciliationSnapshot,
+  GrokAccount,
+  GrokAccountUsage,
+  ClaudeSwapAccountsState,
   ApiKeyInfoBridge,
   ApiKeyProviderInfoBridge,
   AppInfoBridge,
   BootstrapState,
   CurrentSurfaceState,
-  ProofCommand,
-  ProofStatePayload,
   CookieInfoBridge,
   DetectedBrowserBridge,
   Language,
   LocaleStrings,
+  NotificationSoundEvent,
   ProviderCatalogEntry,
   ProviderChartData,
   ProviderDetail,
+  ProviderLocalUsageSummary,
   ProviderSummary,
   ProviderUsageSnapshot,
   ProviderTokenAccountsBridge,
@@ -26,10 +31,45 @@ import type {
   UpdateStatePayload,
   CookieSourceOption,
   RegionOption,
-  SafeDiagnostics,
   CredentialStorageStatus,
   WorkAreaRect,
+  AgentSession,
+  AgentSessionDiscoveryResult,
+  SessionFocusResult,
+  TrayVisibilityStatusDto,
+  UsageSpendSummary,
+  SpendContract,
+  CodexLocalProjectUsageSnapshot,
+  CodexAccount,
+  CodexAccountUsageSnapshot,
+  CodexAccountsStateBridge,
+  CodexSwitchResult,
+  DeepSeekPricingStatus,
 } from "../types/bridge";
+
+export const claudeAccountsList = () => invoke<ClaudeAccount[]>("claude_accounts_list");
+export const claudeReconciliationState = () =>
+  invoke<ClaudeReconciliationSnapshot | null>("claude_reconciliation_state");
+export const claudeAccountAdd = () => invoke<void>("claude_account_add");
+export const claudeAccountCancelLogin = () => invoke<void>("claude_account_cancel_login");
+export const claudeAccountSaveCurrent = () => invoke<void>("claude_account_save_current");
+export const claudeAccountRemove = (id: string) => invoke<void>("claude_account_remove", { id });
+export const claudeAccountSwitch = (id: string) =>
+  invoke<ClaudeReconciliationSnapshot>("claude_account_switch", { id });
+export const grokAccountsList = () => invoke<GrokAccount[]>("grok_accounts_list");
+export const grokAccountAdd = () => invoke<void>("grok_account_add");
+export const grokAccountCancelLogin = () => invoke<void>("grok_account_cancel_login");
+export const grokAccountSaveCurrent = () => invoke<void>("grok_account_save_current");
+export const grokAccountRemove = (id: string) => invoke<void>("grok_account_remove", { id });
+export const grokAccountSwitch = (id: string) => invoke<void>("grok_account_switch", { id });
+export const grokAccountFetch = (id: string) =>
+  invoke<GrokAccountUsage>("grok_account_fetch", { id });
+export const claudeSwapAccountsList = () =>
+  invoke<ClaudeSwapAccountsState>("claude_swap_accounts_list");
+export const claudeSwapAccountSwitch = (slot: number) =>
+  invoke<ClaudeReconciliationSnapshot>("claude_swap_account_switch", { slot });
+export const claudeSwapAccountReauthenticate = (slot: number) =>
+  invoke<ClaudeReconciliationSnapshot>("claude_swap_account_reauthenticate", { slot });
 
 export function getBootstrapState(): Promise<BootstrapState> {
   return invoke<BootstrapState>("get_bootstrap_state");
@@ -53,6 +93,20 @@ export function updateSettings(
   return invoke<SettingsSnapshot>("update_settings", { patch });
 }
 
+export function getTrayVisibilityStatus(): Promise<TrayVisibilityStatusDto> {
+  return invoke<TrayVisibilityStatusDto>("tray_visibility_status");
+}
+
+export function listAgentSessions(): Promise<AgentSessionDiscoveryResult> {
+  return invoke<AgentSessionDiscoveryResult>("list_agent_sessions");
+}
+
+export function focusAgentSession(
+  session: AgentSession,
+): Promise<SessionFocusResult> {
+  return invoke<SessionFocusResult>("focus_agent_session", { session });
+}
+
 export function setSurfaceMode<M extends VisibleSurfaceMode>(
   mode: M,
   target: SurfaceTargetForMode<M>,
@@ -60,28 +114,33 @@ export function setSurfaceMode<M extends VisibleSurfaceMode>(
   return invoke<SurfaceMode>("set_surface_mode", { mode, target });
 }
 
+export function dismissTrayPanel(): Promise<void> {
+  return invoke<void>("dismiss_tray_panel");
+}
+
+/** Suppress flyout blur-dismiss while a resize/drag gesture is in flight. */
+export function beginFlyoutGesture(): Promise<void> {
+  return invoke<void>("begin_flyout_gesture");
+}
+export function endFlyoutGesture(): Promise<void> {
+  return invoke<void>("end_flyout_gesture");
+}
+
 export function openSettingsWindow(tab: string): Promise<void> {
   return invoke<void>("open_settings_window", { tab });
+}
+
+/** Open (or focus) the detached flyout ("Pop Out Dashboard") window. */
+export function openFlyoutWindow(): Promise<void> {
+  return invoke<void>("open_flyout_window");
 }
 
 export function closeSettingsWindow(): Promise<void> {
   return invoke<void>("close_settings_window");
 }
 
-export function getCurrentSurfaceMode(): Promise<SurfaceMode> {
-  return invoke<SurfaceMode>("get_current_surface_mode");
-}
-
 export function getCurrentSurfaceState(): Promise<CurrentSurfaceState> {
   return invoke<CurrentSurfaceState>("get_current_surface_state");
-}
-
-export function getProofState(): Promise<ProofStatePayload> {
-  return invoke<ProofStatePayload>("get_proof_state");
-}
-
-export function runProofCommand(command: ProofCommand): Promise<ProofStatePayload> {
-  return invoke<ProofStatePayload>("run_proof_command", { command });
 }
 
 export function refreshProviders(): Promise<void> {
@@ -96,8 +155,8 @@ export function getCachedProviders(): Promise<ProviderUsageSnapshot[]> {
   return invoke<ProviderUsageSnapshot[]>("get_cached_providers");
 }
 
-export function getSafeDiagnostics(): Promise<SafeDiagnostics> {
-  return invoke<SafeDiagnostics>("get_safe_diagnostics");
+export function getDeepSeekPricingStatus(): Promise<DeepSeekPricingStatus | null> {
+  return invoke<DeepSeekPricingStatus | null>("get_deepseek_pricing_status");
 }
 
 export function getWorkAreaRect(): Promise<WorkAreaRect> {
@@ -162,6 +221,18 @@ export function removeApiKey(providerId: string): Promise<ApiKeyInfoBridge[]> {
   return invoke<ApiKeyInfoBridge[]>("remove_api_key", { providerId });
 }
 
+export function hasOpenRouterManagementApiKey(): Promise<boolean> {
+  return invoke<boolean>("has_openrouter_management_api_key");
+}
+
+export function setOpenRouterManagementApiKey(apiKey: string): Promise<void> {
+  return invoke<void>("set_openrouter_management_api_key", { apiKey });
+}
+
+export function removeOpenRouterManagementApiKey(): Promise<void> {
+  return invoke<void>("remove_openrouter_management_api_key");
+}
+
 export function getManualCookies(): Promise<CookieInfoBridge[]> {
   return invoke<CookieInfoBridge[]>("get_manual_cookies");
 }
@@ -205,6 +276,44 @@ export function getProviderChartData(
   accountEmail?: string,
 ): Promise<ProviderChartData> {
   return invoke<ProviderChartData>("get_provider_chart_data", { providerId, accountEmail });
+}
+
+export function getProviderLocalUsageSummary(
+  providerId: string,
+): Promise<ProviderLocalUsageSummary | null> {
+  return invoke<ProviderLocalUsageSummary | null>("get_provider_local_usage_summary", { providerId });
+}
+
+export function getUsageSpendSummary(options?: { historyDays?: number; forceRefresh?: boolean }): Promise<UsageSpendSummary> {
+  return invoke<UsageSpendSummary>("get_usage_spend_summary", {
+    historyDays: options?.historyDays ?? null,
+    forceRefresh: options?.forceRefresh ?? null,
+  });
+}
+
+export function writeUsageSpendExport(path: string, payload: string): Promise<void> {
+  return invoke<void>("write_usage_spend_export", { path, payload });
+}
+
+export function getSpendContract(
+  providerId: string,
+  options?: { historyDays?: number; includeOpenCodex?: boolean },
+): Promise<SpendContract> {
+  return invoke<SpendContract>("get_spend_contract", {
+    providerId,
+    historyDays: options?.historyDays ?? null,
+    includeOpenCodex: options?.includeOpenCodex ?? null,
+  });
+}
+
+export function getCodexWorkspacesSnapshot(options?: {
+  forceRefresh?: boolean;
+  historyDays?: number;
+}): Promise<CodexLocalProjectUsageSnapshot> {
+  return invoke<CodexLocalProjectUsageSnapshot>("get_codex_workspaces_snapshot", {
+    forceRefresh: options?.forceRefresh ?? null,
+    historyDays: options?.historyDays ?? null,
+  });
 }
 
 // ── Token account bridge ─────────────────────────────────────────────
@@ -301,6 +410,20 @@ export function getProviderRegionOptions(providerId: string): Promise<RegionOpti
   return invoke<RegionOption[]>("get_provider_region_options", { providerId });
 }
 
+export function setProviderUsageSource(providerId: string, source: string): Promise<void> {
+  return invoke<void>("set_provider_usage_source", { providerId, source });
+}
+
+export function setProviderAutoResumeAfterQuotaReset(
+  providerId: string,
+  enabled: boolean,
+): Promise<void> {
+  return invoke<void>("set_provider_auto_resume_after_quota_reset", {
+    providerId,
+    enabled,
+  });
+}
+
 export function setProviderCookieSource(providerId: string, source: string): Promise<void> {
   return invoke<void>("set_provider_cookie_source", { providerId, source });
 }
@@ -318,6 +441,24 @@ export function setProviderWorkspaceId(
   workspaceId: string,
 ): Promise<void> {
   return invoke<void>("set_provider_workspace_id", { providerId, workspaceId });
+}
+
+export function setProviderGatewayUrl(
+  providerId: string,
+  gatewayUrl: string,
+): Promise<void> {
+  return invoke<void>("set_provider_gateway_url", { providerId, gatewayUrl });
+}
+
+export function getProviderAzureApiVersion(providerId: string): Promise<string | null> {
+  return invoke<string | null>("get_provider_azure_api_version", { providerId });
+}
+
+export function setProviderAzureApiVersion(
+  providerId: string,
+  apiVersion: string,
+): Promise<void> {
+  return invoke<void>("set_provider_azure_api_version", { providerId, apiVersion });
 }
 
 // ── Phase 6d — credential detection ──────────────────────────────────
@@ -364,8 +505,8 @@ export function unregisterGlobalShortcut(): Promise<void> {
   return invoke<void>("unregister_global_shortcut");
 }
 
-export function playNotificationSound(): Promise<void> {
-  return invoke<void>("play_notification_sound");
+export function playNotificationSound(event: NotificationSoundEvent): Promise<void> {
+  return invoke<void>("play_notification_sound", { event });
 }
 
 export function reanchorTrayPanel(): Promise<void> {
@@ -376,6 +517,68 @@ export function revealTrayPanelWindow(): Promise<void> {
   return invoke<void>("reveal_tray_panel_window");
 }
 
+/** Persist the user's manually-chosen flyout (Pop Out Dashboard) size. */
+export function setFlyoutSize(width: number, height: number): Promise<void> {
+  return invoke<void>("set_flyout_size", { width, height });
+}
+
+/** The remembered flyout size ([w, h]) if the user has resized it, else null. */
+export function flyoutStoredSize(): Promise<[number, number] | null> {
+  return invoke<[number, number] | null>("flyout_stored_size");
+}
+
 export function quitApp(): Promise<void> {
   return invoke<void>("quit_app");
+}
+
+// ── Codex multi-account (ADR 0003) ───────────────────────────────────
+
+export function codexAccountsList(): Promise<CodexAccount[]> {
+  return invoke<CodexAccount[]>("codex_accounts_list");
+}
+
+export function codexAccountAdd(): Promise<CodexAccount> {
+  return invoke<CodexAccount>("codex_account_add");
+}
+
+export function codexAccountReauthenticate(): Promise<CodexAccount> {
+  return invoke<CodexAccount>("codex_account_reauthenticate");
+}
+
+export function codexAccountRemove(id: string): Promise<void> {
+  return invoke<void>("codex_account_remove", { id });
+}
+
+export function codexAccountSwitch(id: string): Promise<CodexSwitchResult> {
+  return invoke<CodexSwitchResult>("codex_account_switch", { id });
+}
+
+export function codexAccountFetch(
+  id: string,
+): Promise<CodexAccountUsageSnapshot> {
+  return invoke<CodexAccountUsageSnapshot>("codex_account_fetch", { id });
+}
+
+export function codexAccountSnapshots(): Promise<
+  Record<string, CodexAccountUsageSnapshot>
+> {
+  return invoke<Record<string, CodexAccountUsageSnapshot>>(
+    "codex_account_snapshots",
+  );
+}
+
+export function codexAccountRestartDesktop(
+  switchId: string,
+): Promise<void> {
+  return invoke<void>("codex_account_restart_desktop", {
+    switchId,
+  });
+}
+
+export function getCodexAccountsState(): Promise<CodexAccountsStateBridge> {
+  return invoke<CodexAccountsStateBridge>("get_codex_accounts_state");
+}
+
+export function getSafeDiagnostics(): Promise<string> {
+  return invoke<string>("get_safe_diagnostics");
 }

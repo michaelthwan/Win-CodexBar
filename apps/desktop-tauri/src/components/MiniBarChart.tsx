@@ -1,9 +1,14 @@
-/**
- * MiniBarChart — lightweight SVG bar chart with no external dependencies.
- * Used in ProviderDetail for cost history, credits history, and usage breakdown.
- */
+/** MiniBarChart：不依赖外部库的轻量 SVG 柱状图。 */
 
 import type { DailyCostPoint, DailyUsageBreakdown } from "../types/bridge";
+import type { LocaleKey } from "../i18n/keys";
+import {
+  WIDTH,
+  getBarCenter,
+  getBarWidth,
+  getBarX,
+  shouldRenderCenterMax,
+} from "./charts/chartGeometry";
 
 interface BarChartProps {
   points: DailyCostPoint[];
@@ -11,51 +16,49 @@ interface BarChartProps {
   height?: number;
   label?: string;
   formatValue?: (v: number) => string;
+  t: (key: LocaleKey) => string;
 }
 
-/** Simple bar chart for daily cost or credits history. */
+/** 展示每日成本或积分历史的简单柱状图。 */
 export function SimpleBarChart({
   points,
   color = "#5d87ff",
   height = 48,
   label,
   formatValue,
+  t,
 }: BarChartProps) {
+  const emptyMsg = t("DetailChartEmpty");
   if (points.length === 0) {
     return (
       <div className="mini-chart mini-chart--empty">
         {label && <span className="mini-chart__label">{label}</span>}
-        <span className="mini-chart__empty-msg">No data</span>
+        <span className="mini-chart__empty-msg">{emptyMsg}</span>
       </div>
     );
   }
 
-  const max = Math.max(...points.map((p) => p.value), 0.0001);
-  const BAR_GAP = 2;
+  const knownValues = points.flatMap((p) => (p.value == null ? [] : [p.value]));
+  const max = Math.max(...knownValues, 0.0001);
   const fmt = formatValue ?? ((v: number) => v.toFixed(2));
 
-  // Show at most 30 bars; abbreviate label to last 2 chars of date
+  // 最多显示 30 根柱，并将日期标签缩短为末尾两位
   const visible = points.slice(-30);
-  const svgWidth = 280;
-  const barWidth = Math.max(
-    1,
-    Math.floor((svgWidth - (visible.length - 1) * BAR_GAP) / visible.length),
-  );
-  const actualWidth = visible.length * barWidth + (visible.length - 1) * BAR_GAP;
+  const barWidth = getBarWidth(visible.length);
 
   return (
     <div className="mini-chart">
       {label && <span className="mini-chart__label">{label}</span>}
       <svg
-        width={actualWidth}
+        width={WIDTH}
         height={height}
-        viewBox={`0 0 ${actualWidth} ${height}`}
+        viewBox={`0 0 ${WIDTH} ${height}`}
         className="mini-chart__svg"
-        aria-label={label ?? "bar chart"}
+        aria-label={label ?? t("BarChartAriaLabel")}
       >
         {visible.map((p, i) => {
-          const barH = Math.max(1, (p.value / max) * (height - 4));
-          const x = i * (barWidth + BAR_GAP);
+          const barH = p.value == null ? 1 : Math.max(1, (p.value / max) * (height - 4));
+          const x = getBarX(i, visible.length);
           const y = height - barH;
           return (
             <rect
@@ -65,11 +68,11 @@ export function SimpleBarChart({
               width={barWidth}
               height={barH}
               fill={color}
-              opacity={p.value === 0 ? 0.25 : 0.9}
+              opacity={p.value == null ? 0 : p.value === 0 ? 0.25 : 0.9}
               rx={1}
             >
               <title>
-                {p.date}: {fmt(p.value)}
+                {p.value == null ? p.date : `${p.date}: ${fmt(p.value)}`}
               </title>
             </rect>
           );
@@ -78,9 +81,17 @@ export function SimpleBarChart({
       <div className="mini-chart__axis">
         {visible.length > 0 && (
           <>
-            <span>{visible[0].date.slice(-5)}</span>
-            <span>{fmt(max)}</span>
-            <span>{visible[visible.length - 1].date.slice(-5)}</span>
+            <span className="mini-chart__axis-start" style={{ left: `${getBarCenter(0, visible.length)}px` }}>
+              {visible[0].date}
+            </span>
+            {shouldRenderCenterMax(visible.length) && (
+              <span className="mini-chart__axis-max" style={{ left: `${WIDTH / 2}px` }}>
+                {fmt(max)}
+              </span>
+            )}
+            <span className="mini-chart__axis-end" style={{ left: `${getBarCenter(visible.length - 1, visible.length)}px` }}>
+              {visible[visible.length - 1].date}
+            </span>
           </>
         )}
       </div>
@@ -88,7 +99,7 @@ export function SimpleBarChart({
   );
 }
 
-// Deterministic palette for service names
+// 按服务名称稳定分配颜色
 const SERVICE_COLORS = [
   "#5d87ff",
   "#06d6a0",
@@ -109,19 +120,22 @@ interface StackedBarChartProps {
   points: DailyUsageBreakdown[];
   height?: number;
   label?: string;
+  t: (key: LocaleKey) => string;
 }
 
-/** Stacked bar chart for daily usage breakdown by service. */
+/** 按服务展示每日用量明细的堆叠柱状图。 */
 export function StackedBarChart({
   points,
   height = 64,
   label,
+  t,
 }: StackedBarChartProps) {
+  const emptyMsg = t("DetailChartEmpty");
   if (points.length === 0) {
     return (
       <div className="mini-chart mini-chart--empty">
         {label && <span className="mini-chart__label">{label}</span>}
-        <span className="mini-chart__empty-msg">No data</span>
+        <span className="mini-chart__empty-msg">{emptyMsg}</span>
       </div>
     );
   }
@@ -134,28 +148,22 @@ export function StackedBarChart({
     new Set(visible.flatMap((p) => p.services.map((s) => s.service))),
   ).sort();
 
-  const BAR_GAP = 2;
-  const svgWidth = 280;
-  const barWidth = Math.max(
-    1,
-    Math.floor((svgWidth - (visible.length - 1) * BAR_GAP) / visible.length),
-  );
-  const actualWidth = visible.length * barWidth + (visible.length - 1) * BAR_GAP;
+  const barWidth = getBarWidth(visible.length);
 
   return (
     <div className="mini-chart">
       {label && <span className="mini-chart__label">{label}</span>}
       <svg
-        width={actualWidth}
+        width={WIDTH}
         height={height}
-        viewBox={`0 0 ${actualWidth} ${height}`}
+        viewBox={`0 0 ${WIDTH} ${height}`}
         className="mini-chart__svg"
-        aria-label={label ?? "stacked bar chart"}
+        aria-label={label ?? t("StackedBarChartAriaLabel")}
       >
         {visible.map((p, i) => {
-          const x = i * (barWidth + BAR_GAP);
+          const x = getBarX(i, visible.length);
           const totalH = Math.max(1, (p.totalCreditsUsed / max) * (height - 4));
-          // Sort services to stack predictably
+          // 固定服务排序，确保堆叠顺序可预测
           const sorted = [...p.services].sort((a, b) =>
             a.service.localeCompare(b.service),
           );
@@ -176,7 +184,8 @@ export function StackedBarChart({
                 rx={1}
               >
                 <title>
-                  {p.day} {s.service}: {s.creditsUsed.toFixed(2)} credits
+                  {p.day} {s.service}: {s.creditsUsed.toFixed(2)}{" "}
+                  {t?.("CreditsLabel") ?? "credits"}
                 </title>
               </rect>
             );
@@ -202,9 +211,17 @@ export function StackedBarChart({
       <div className="mini-chart__axis">
         {visible.length > 0 && (
           <>
-            <span>{visible[0].day.slice(-5)}</span>
-            <span>{max.toFixed(1)}</span>
-            <span>{visible[visible.length - 1].day.slice(-5)}</span>
+            <span className="mini-chart__axis-start" style={{ left: `${getBarCenter(0, visible.length)}px` }}>
+              {visible[0].day}
+            </span>
+            {shouldRenderCenterMax(visible.length) && (
+              <span className="mini-chart__axis-max" style={{ left: `${WIDTH / 2}px` }}>
+                {max.toFixed(1)}
+              </span>
+            )}
+            <span className="mini-chart__axis-end" style={{ left: `${getBarCenter(visible.length - 1, visible.length)}px` }}>
+              {visible[visible.length - 1].day}
+            </span>
           </>
         )}
       </div>

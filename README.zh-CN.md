@@ -1,20 +1,20 @@
 # Win-CodexBar
 
-[English README](./README.md)
+[English](./README.md) | [简体中文](./README.zh-CN.md) | [繁體中文（臺灣）](./README.zh-TW.md) | [日本語](./README.ja-JP.md) | [한국어](./README.ko-KR.md) | [Español mexicano](./README.es-MX.md) | [Türkçe](./README.tr-TR.md)
 
 [CodexBar](https://github.com/steipete/CodexBar) 的 Windows 移植版 —— 一个系统托盘应用，让你随时掌握各个 AI 编程工具的用量额度。
 
 > 基于 **Tauri + React** 构建，底层复用共享 **Rust** 后端。原版 CodexBar 是由 [Peter Steinberger](https://github.com/steipete) 开发的 macOS Swift 应用。
 
 <p align="center">
-  <img src="extra-docs/images/tray-panel.png" width="280" alt="托盘面板 — 服务商网格与 Codex 用量"/>
+  <img src="docs/images/tray-panel.png" width="280" alt="托盘面板 — 服务商网格与 Codex 用量"/>
   &nbsp;&nbsp;
-  <img src="extra-docs/images/settings-providers.png" width="480" alt="设置 — 服务商选项卡"/>
+  <img src="docs/images/settings-providers.png" width="480" alt="设置 — 服务商选项卡"/>
 </p>
 
 ## 功能特性
 
-- **49 个 AI 服务商** — Codex、Claude、Cursor、Factory、Gemini、Copilot、Antigravity、z.ai、MiniMax、Kiro、Vertex AI、Augment、OpenCode、Kimi、Kimi K2、Amp、Warp、Ollama、Azure OpenAI、T3 Chat、OpenRouter、Synthetic、JetBrains AI、Alibaba、Alibaba Token Plan、NanoGPT、Infini、Perplexity、Abacus AI、Mistral、OpenCode Go、Kilo、AWS Bedrock、Codebuff、DeepSeek、Windsurf、Manus、小米 MiMo、Doubao、Command Code、Crof、StepFun、Venice、OpenAI、Grok、ElevenLabs、Deepgram、Groq、LLM Proxy
+- **56 个 AI 服务商** — Codex、Claude、Cursor、Factory、Gemini、Copilot、Antigravity、z.ai、MiniMax、Kiro、Vertex AI、Augment、OpenCode、Kimi、Kimi K2、Amp、Warp、Ollama、Azure OpenAI、T3 Chat、OpenRouter、JetBrains AI、Alibaba、Alibaba Token Plan、NanoGPT、Infini、Perplexity、Abacus AI、Mistral、OpenCode Go、Kilo、AWS Bedrock、Codebuff、DeepSeek、Windsurf、Manus、小米 MiMo、Doubao、Command Code、Crof、StepFun、Venice、OpenAI、Grok、ElevenLabs、Deepgram、Groq、LLM Proxy、Chutes、LiteLLM、Poe、Devin、Zed、CrossModel、Qoder、Sakana AI
 - **系统托盘图标** — 动态双条进度显示会话与周用量
 - **Floating Bar** — 可选的置顶透明用量条，支持方向、透明度和点击穿透控制
 - **浏览器 Cookie 导入** — Chrome、Edge、Brave、Firefox（Windows DPAPI 解密）
@@ -23,6 +23,25 @@
 - **Windows 发布打包** — Inno Setup 安装包、独立便携 exe、WebView2 Runtime 引导、VC++ 运行库引导和 SHA-256 校验文件
 - **CLI** — `codexbar usage`、`codexbar cost`、`codexbar config` 和本机回环 `codexbar serve`，便于脚本化、本地集成和 CI
 - **WSL 支持** — CLI 开箱即用，桌面壳层通过 WSLg 运行
+
+## v0.33.2 更新内容
+
+- 修复托盘面板失焦后不会自动关闭的问题，现在表现更接近标准 Windows 托盘弹窗。
+- 支持按 Escape 关闭托盘面板，不会退出应用。
+- 修复点击托盘图标触发失焦关闭后又立刻重新打开的反弹问题。
+
+## v0.33.1 更新内容
+
+- 当 GitHub Copilot 返回超额预算时，现在会显示真实百分比，例如 `115% used`，而不是强行压到 `100%`。
+- 进度条仍然保持满格显示，避免 UI 溢出；托盘、弹出面板、Provider 侧栏和设置详情都会保留真实超额数值。
+
+## v0.33.0 更新内容
+
+- 将上游 CodexBar v0.33.0 的 provider 与成本统计修复移植到 Win-CodexBar。
+- 设置界面新增日语作为可选显示语言。
+- 加固带凭据的 provider HTTP 请求：跨源重定向不会继续沿用 provider 认证上下文。
+- 更新 Claude 本地成本估算，覆盖 Fable 5、Opus 4.6、Sonnet 4.6 与 1 小时 cache write 计价。
+- 修复 Doubao Ark 成功响应里不可靠的 `0 remaining` 请求限制头导致误显示 100% 用尽的问题。
 
 ## v0.32.2 更新内容
 
@@ -94,14 +113,14 @@
 # 前置要求：Node.js + pnpm — Rust 和 MinGW 将自动安装
 git clone https://github.com/Finesssee/Win-CodexBar.git
 cd Win-CodexBar
-.\dev.ps1
+.\scripts\dev.ps1
 ```
 
 脚本会自动安装 Rust/MinGW（如缺失）、构建 Tauri 桌面壳层并启动应用。
 
 ```powershell
-.\dev.ps1 -Release          # 优化构建
-.\dev.ps1 -SkipBuild        # 跳过构建，直接启动
+.\scripts\dev.ps1 -Release          # 优化构建
+.\scripts\dev.ps1 -SkipBuild        # 跳过构建，直接启动
 ```
 
 ## 下载
@@ -135,14 +154,13 @@ Winget 分发已通过 [microsoft/winget-pkgs](https://github.com/microsoft/wing
 常用发布参数：
 
 ```powershell
-.\scripts\windows-release-build.ps1 -Ref v0.32.2 -WarmCacheOnly
-.\scripts\windows-release-build.ps1 -Ref v0.32.2 -WarmCliCache
-.\scripts\windows-release-build.ps1 -Ref v0.32.2 -SmokeInstall
-.\scripts\windows-release-build.ps1 -Ref v0.32.2 -UploadRelease v0.32.2
-.\scripts\release-doctor.ps1 -Version 0.32.2
+.\scripts\windows-release-build.ps1 -Ref vX.Y.Z -WarmCacheOnly
+.\scripts\windows-release-build.ps1 -Ref vX.Y.Z -SmokeInstall
+.\scripts\release-doctor.ps1 -Version X.Y.Z
 ```
 
-GitHub Actions 只作为辅助检查；安装包和便携版资产以 Windows 构建服务器脚本为主发布路径。
+构建脚本不再上传 GitHub Release。发布仅通过需要人工批准的 CircleCI
+Windows 草稿发布流程完成；它会校验 SHA-256，绝不会覆盖已有资产。
 
 ## 首次运行
 
@@ -222,9 +240,9 @@ codexbar cost  -p codex           # 本地成本（JSONL 日志）
 
 | 主题 | 链接 |
 |------|------|
-| 从源码构建 | [extra-docs/BUILDING.md](extra-docs/BUILDING.md) |
-| WSL 设置与认证 | [extra-docs/WSL.md](extra-docs/WSL.md) |
-| 浏览器 Cookie 详解 | [extra-docs/COOKIES.md](extra-docs/COOKIES.md) |
+| 从源码构建 | [docs/BUILDING.md](docs/BUILDING.md) |
+| WSL 设置与认证 | [docs/WSL.md](docs/WSL.md) |
+| 浏览器 Cookie 详解 | [docs/COOKIES.md](docs/COOKIES.md) |
 
 ## 致谢
 

@@ -1,6 +1,508 @@
 # Changelog
 
-## Unreleased
+## [Windows] 0.61.0 - Unreleased
+
+Windows port of upstream CodexBar **0.60.3 → 0.61.0**: new subscription and
+spend providers (Nous Portal, Replicate, CodeRabbit, Muse Code), richer
+allowances and per-model spending, clearer account switching, and steadier
+menu-bar layout.
+
+### Added
+- Cost history: add provider-scoped, display-only Codex and Claude quota-window projection primitives with exact reset boundaries, independent token/cost completeness, and backward-compatible local evidence handling.
+- Provider charts: show recent Codex and Claude quota-window history with explicit account scope and estimated-boundary markers; historical data remains display-only.
+- Grok: Settings and tray **Add account** flow matching Codex/Claude — isolated `grok login --oauth`, save current CLI login, switch, and remove without logging out the active session.
+- Replicate: cookie-authenticated monthly spend and optional prepaid credit balance from the billing page, with user and organization account isolation.
+- DeepSeek: show reported per-model spend in the provider details while preserving the billing currency, reporting period, zero values, and incomplete-total safeguards.
+
+### Fixed
+- Claude: when Hide Personal Info is enabled, keep saved account rows distinguishable with stable localized `Account N` labels and matching redacted tooltips.
+
+---
+
+## [Windows] 0.60.3 - 2026-09-15
+
+Windows port of upstream CodexBar **0.56.8 → 0.60.3**.
+
+### Added
+- Providers: port whitespace-aware Codex rescans, OpenCodex numeric and cache parsing, reserve pricing aliases, Usage & Spend ledger details, and optional tray pace colors ([#488](https://github.com/nesszer/Win-CodexBar/pull/488), [#489](https://github.com/nesszer/Win-CodexBar/pull/489), [#490](https://github.com/nesszer/Win-CodexBar/pull/490), [#492](https://github.com/nesszer/Win-CodexBar/pull/492), [#493](https://github.com/nesszer/Win-CodexBar/pull/493)).
+- Providers: add Vertex OAuth validation and preserve Antigravity structured reports, discrete model pools, Warp add-on pools, Perplexity credit percentages, Abacus details, LiteLLM budgets, LongCat token and expiry data, and Devin organization context ([#494](https://github.com/nesszer/Win-CodexBar/pull/494), [#498](https://github.com/nesszer/Win-CodexBar/pull/498), [#503](https://github.com/nesszer/Win-CodexBar/pull/503)).
+- Accounts: add the Claude-swap multi-account adapter and its historical usage, spend, repair, and account-action behavior ([#482](https://github.com/nesszer/Win-CodexBar/pull/482), [#503](https://github.com/nesszer/Win-CodexBar/pull/503)).
+- Providers: restore Cursor monthly Auto pacing, paid and active-trial Grok Bot allowances, and Antigravity account-source guidance ([#505](https://github.com/nesszer/Win-CodexBar/pull/505)).
+
+### Fixed
+- Providers: harden managed Antigravity CLI fallback, use checked Mistral billing arithmetic, preserve reserved Alibaba/Qwen request characters, and retain partial usage and cost data ([#483](https://github.com/nesszer/Win-CodexBar/pull/483), [#501](https://github.com/nesszer/Win-CodexBar/pull/501), [#503](https://github.com/nesszer/Win-CodexBar/pull/503)).
+- Privacy: keep Codex account labels private and redact login diagnostics ([#491](https://github.com/nesszer/Win-CodexBar/pull/491), [#502](https://github.com/nesszer/Win-CodexBar/pull/502)).
+- Runtime: resume sessions safely after quota reset and keep localized reset countdowns compact ([#499](https://github.com/nesszer/Win-CodexBar/pull/499), [#500](https://github.com/nesszer/Win-CodexBar/pull/500)).
+
+### Changed
+- Claude: disable Remote Control registration during usage probes and keep weekly fallback data out of session warnings while preserving account separation ([#503](https://github.com/nesszer/Win-CodexBar/pull/503), [#505](https://github.com/nesszer/Win-CodexBar/pull/505)).
+- Settings: explain Antigravity automatic account selection and the Windows Local API / agy CLI sources ([#505](https://github.com/nesszer/Win-CodexBar/pull/505)).
+- Reliability: improve Claude Add-account WSL diagnostics, Codex token saturation, dark-theme select popups, ambient account selection, and endpoint/model validation ([#471](https://github.com/nesszer/Win-CodexBar/pull/471), [#472](https://github.com/nesszer/Win-CodexBar/pull/472), [#480](https://github.com/nesszer/Win-CodexBar/pull/480), [#484](https://github.com/nesszer/Win-CodexBar/pull/484), [#485](https://github.com/nesszer/Win-CodexBar/pull/485)).
+- CI: add the curated TypeScript anti-slop gate to hosted validation ([#487](https://github.com/nesszer/Win-CodexBar/pull/487)).
+
+> Release artifacts are unsigned (SignPath onboarding pending); verify them against the attached `.sha256` sidecar files.
+
+---
+
+## [Windows] 0.56.8 - 2026-09-08
+
+Windows release aligned to the reviewed upstream CodexBar **0.56.8** behavior baseline, plus Windows-specific reliability, account-switching, UI, browser-import, and release-pipeline improvements landed since 0.55.0.
+
+### Added
+- Saved Codex and Claude accounts with account switching from Settings and the native tray menu.
+- Antigravity local token-history reporting, improved quota selection, and bounded historical scanning.
+- Expanded Codex usage/cost history, reasoning-token accounting, reset diagnostics, and privacy-aware Usage & Spend reporting.
+- Claude Desktop/session discovery and localized model-specific weekly quota labels.
+
+### Changed
+- Codex account switching now separates credential storage, fetch coordination, and restart orchestration from the HTTP API and Tauri command layers.
+- Tray account actions are isolated behind a dedicated tray-account controller instead of growing the shared tray bridge.
+- Windows typography, Settings layout, and tray/pop-out usage-card layout are split into focused surface styles.
+- pnpm is pinned at 11.25.0 from one canonical package-manager declaration used by the release tooling.
+
+### Fixed
+- Codex preserves authenticated HTTP permission failures instead of misclassifying 403 responses as expired credentials, including PAT paths.
+- Claude refresh can adopt changed fresh Windows Credential Manager credentials when the default file credential is expired.
+- Copilot account reuse is identity-first, preventing legacy labels from replacing a different verified GitHub account.
+- Kiro usage enrichment follows the validated profile ARN region and fails closed for unsupported regions.
+- Codex bundled CLI discovery and desktop restart/account-switch flows are more reliable on Windows.
+- Brave App-Bound Encryption cookie import reports the Windows limitation clearly instead of implying a generic cookie failure.
+- Ollama browser-cookie import tries viable browser sources without letting one failed source hide another valid source.
+- Minimax API-key quota retrieval uses the provider API rather than treating browser cookies as the only usable path.
+
+---
+
+## [Windows] 0.55.0 - 2026-08-25
+
+Windows port of upstream CodexBar **0.54.0 → 0.55.0**, plus the Windows Grok OAuth routing fix from issue #362.
+
+### Added
+- Command Code: individual-pro-v1 Pro tier with the current monthly credit grant.
+- Cursor: Grok Bot usage window and tokscale-compatible local spend import.
+- Antigravity: tokscale-compatible local spend, offline conversation fallback, agy authentication guidance, and retired Flash model aliases.
+- Kiro: overage limits and charges from GetUsageLimits.
+- z.ai: China account balance enrichment.
+- Alibaba Token Plan: Personal/Solo SEC_TOKEN dashboard extraction.
+- Codex: tokscale-compatible cached-token, bare-usage, stale-snapshot, and reasoning accounting parity.
+
+### Changed
+- Usage & Spend refreshes silently when provider data changes and loads independent provider baselines in parallel.
+- OpenCodex bulk pricing reuses one shared models.dev pricing snapshot.
+- OpenRouter management spend uses completed UTC days for the rolling 30-day window.
+- Simplified Chinese session quota labels use explicit whole-hour durations and map weekly-duration windows to the weekly label.
+- Agent session names truncate safely in the desktop UI.
+- Single-meaningful-quota tray icons use the full meter while multi-quota icons keep distinct lanes.
+
+### Fixed
+- Grok preserves unknown-period usage instead of displaying it as zero.
+- Grok Auto/OAuth routing works when browser cookies are disabled (#362).
+- Alibaba retries successful-but-empty usage responses and sends navigation headers on the dashboard request that renders SEC_TOKEN.
+- Gemini shutdown guidance preserves paid/workspace exclusions.
+
+---
+
+## [Windows] 0.54.0 - 2026-08-22
+
+Windows port of upstream CodexBar **0.53.0 → 0.54.0**.
+
+### Added
+- Providers: Codex PAT (Personal Access Token) usage source with user-agent normalization and fallback narrowing (#353).
+- Providers: Grok local session token scanning — reads local session files for Grok usage data (#353).
+- Providers: OpenCode Go usage API — authenticated usage API with rolling/weekly/monthly windows, auto-fallback from local to API (#353).
+- Providers: OpenRouter Activity spend — 30-day spend tracking via management API key, with daily breakdown, dedup, and conflict detection (#353).
+- Providers: Antigravity idle-family filtering — idle window IDs filtered to family-level granularity for the dashboard (#353).
+- Cost: Historical GPT-5.6 Terra/Luna pricing — date-gated rates: requests before 2026-07-30 use pre-cut pricing, after uses current rates (#353).
+- Cost: OpenCodex spend routing — typed `RouteTarget` enum routes entries to the correct subscription (Codex, OpenCode Go, Kimi, DeepSeek) by model prefix first, then provider label (#353).
+- Cost: xAI daily spend breakdown added to xAI spend snapshot (#353).
+- Cost: Management API token — optional secondary management credential for providers that expose one (OpenRouter Activity) (#353).
+- Settings: `show_pace` toggle for pace visualizations and forecast text in provider menu cards (default: on) (#353).
+- Settings: OpenRouter management API key configuration in Settings → Providers (#353).
+
+### Fixed
+- Tray: Auto-fit ResizeObserver feedback loop fix — panel size adjusts correctly on content changes (#352).
+
+### Changed
+- Upstream 0.53.0 → 0.54.0 provider, cost, and CLI behavior ported onto the Windows tray/desktop shell (#353).
+
+---
+
+## [Windows] 0.53.0 - 2026-08-19
+
+Windows port of upstream CodexBar **0.48.0 → 0.53.0**.
+
+### Added
+- Providers: Fireworks provider with 30-day rated billing spend (#337).
+- Providers: Amp monthly renewals + 8PM NY free reset, LongCat token-packs summary, OpenCode pay-as-you-go billing fallback (#338).
+- Providers: Cursor app session preference — reads Cursor's read-only `state.vscdb` for automatic session detection before browser cookies (#339).
+- Providers: Kiro re-authenticate via `run_kiro_login()` wired into `trigger_provider_login` (#341).
+- Providers: Grok source picker — Auto / Grok CLI / SuperGrok OAuth / Browser cookies (#346).
+- Charts: Tokens/Cost chart switch with a **Tokens** tab in Settings, defaulting active for Codex; "Refreshing" marker for incomplete backfill (#339).
+- Charts: Centered x-axis date labels on bar/point centers (#341).
+- Cost: Explicit cost provenance and coverage — `SpendContract` with `CostProvenance` (ListPriceEstimate/VendorMetered/Mixed/Unknown) and `CostCoverageCounts`; partial totals show coverage, nothing unpriced masquerades as a bill (#346).
+- Cost: Token mix, hourly activity heatmap, and conversation totals in UsageSpendTab (#346).
+- Cost: All-time range (365 days) — `selectedDays: 0` maps to 365-day clamp (#346).
+- Cost: Exact-match custom pricing overlays from `custom-pricing.json` — custom rates authoritative over models.dev/built-in (#346).
+- Cost: Opt-in read-only OpenCodex import — reads `usage.jsonl`, deduplicates by `request_id`, aggregates into `ImportedSpendSource` with SQLite cache (#346).
+- Cost: Per-project spend and Projects panel in UsageSpendTab (#344, #346).
+- Cost: OpenCode Go local estimate source labeling (#344).
+- Cost: CLI `codexbar usage --format toon` — TOON v4.1 JSON payload emission (#346).
+- Cost: CLI `codexbar cost --json` aligned with spend provenance, token mix, coverage, and opt-in OpenCodex (#346).
+- Low Power Mode Off/On/Automatic — `LowPowerModePreference` enum; Automatic reads Windows Battery Saver via `SystemStatusFlag` (#346).
+- i18n: Turkish (tr-TR) locale support (#342).
+- Settings: Light theme toggle fix (#343).
+- Sessions: Cost CLI session grouping (#344).
+- Serve: `--identity` now optional; follows `hide_personal_info` setting when absent (#341).
+- z.ai: `CREDIT_LIMIT` coding plans now parse like `TOKENS_LIMIT` — 5-hour credit window drives primary % and reset (#337).
+- Kimi: Official lane names + duplicate suppression — membership pool renamed to "Total usage", duplicate `Code 7-day` row hidden on positive evidence (#337).
+- OpenRouter: Key-quota fast join on a 1-second deadline (was 3s) with explicit degraded-join logging (#337).
+- Proof: Seed provider usage snapshot for deterministic proof runs (#336).
+- FloatBar: Synced with menu bar metric preference (#335).
+- Tray: `OverviewSpendSummary` component showing 30-day total spend across all providers in the tray panel header (#346).
+
+### Fixed
+- Claude: Prefer `limits[]` session over stale `five_hour` after 5h rollover (#334).
+- Claude: Stop rescaling utilization below 1% to 100% (#274).
+- Antigravity: Detect `agy` CLI in Antigravity provider on Windows (#333).
+- Qwen Cloud: Promote weekly window to primary (#284).
+- DeepSeek: Show peak and off-peak pricing (#280).
+- Ollama: Cookie stripping — `strip_curl_cookie_wrapper`, `curl ` prefix + `Cookie:` label stripping in `normalize_cookie_header` (#341).
+- Ollama: Cookie-expiry recovery — invalidate + browser re-import + retry (#338).
+- Claude: Scope session-equivalent forecast history by account (#276).
+- Menu-card: Detail wrapping for long metric reset/pace details — two-line clamp instead of ellipsizing (#337).
+- Provider status: Last-success cache — transport failures never replace the last known status (#339).
+- Codex: Custom-backend guidance — missing `auth.json` + custom backend reports rate limits unavailable instead of telling user to `codex login` (#339).
+- Cursor: Rename locale keys — `weekly_label: "Auto"→"Cursor"`, `plan_period_label` → "Cursor and Third Party" (#341).
+- OpenCode Go: 5h/weekly pace via `pace_json()` in CLI JSON + text output (#341).
+
+### Changed
+- Upstream 0.49.0–0.53.0 provider, cost, and CLI behavior ported onto the Windows tray/desktop shell (#337, #338, #339, #341, #344, #346).
+- UsageSpendTab rebuilt with `SpendContractOverview` (provenance/coverage/conversations/token-mix metric cards), `ContractModelsPanel`, `ProjectsPanel`, and OpenCodex import toggle (#346).
+- GeneralTab: Low-power mode Select dropdown replacing Toggle; legacy `low_power_mode` boolean kept for settings.json migration (#346).
+- CI: GitHub Actions release workflow added as fallback to CircleCI, reusing existing release scripts (preflight, build, manifest, publish).
+- CI: Cargo registry, target, and pnpm store caching added to release pipeline (#329).
+
+---
+
+## [Windows] 0.48.0 - 2026-08-09
+
+Windows port of upstream CodexBar **0.47.0 → 0.48.0**.
+
+### Added
+- Providers: CodeBuddy CN credit usage (#269).
+- Codex: multi-account management — Codex accounts panel in provider settings and tray menu flyout for switching accounts (#255–#260).
+- Serve: modular usage dashboard (coordinator/snapshot structure with provider icons) from upstream 0.48.0 (#271).
+- Sessions: unified Pi-family (pi + OMP) agent sessions with live-process correlation, PID-only rows, and a unified AgentSessions view; `sessions --json-v2` with legacy `--json` fallback negotiated over SSH (#271).
+- Upstream 0.48.0: Copilot AI credits counter, CommandCode rolling windows + GOAT plan, OpenRouter key meter, ZoomMate browser cookie scope, OpenCode Go per-model daily cost breakdown (#271).
+- Regional: Kimi Desktop monthly membership enrichment, GLM Coding Plan 5-hour/weekly windows, z.ai Global vs BigModel CN region routing with cross-region endpoint override rejection (#271).
+
+### Fixed
+- Codex weekly window detection when the 5-hour session window is missing (#268).
+- MiniMax CN Token Plan web fetch via token-plan endpoints (#254, #262).
+- Tray: auto-fit measure scaled by active zoom + proof anchor clamp (#265, #266).
+- Tray: Codex accounts card overflow and weekly-only tray bar (#264).
+- Tray: fractional-DPI flyout resize oscillation via two-state cycle detection (#261, #272).
+- Upstream 0.48.0: bounded serve request heads, bounded Codex JSONL cost cache (oversize persistence refused), Claude OAuth terminal/transient refresh classification, Codex reset backfill (#271).
+
+### Changed
+- Upstream 0.48.0 provider and CLI behavior ported onto the Windows tray/desktop shell (#271).
+- Repo automation: contributor interaction guard relaxed to a 14-day account-age floor and 15 PRs per 7-day window (#263).
+- Docs: SignPath code-signing policy and privacy statement published; code signing is pending SignPath onboarding — release artifacts remain unsigned with SHA-256 sidecars (#270).
+
+---
+
+## [Windows] 0.47.0 - 2026-08-04
+
+Windows port of upstream CodexBar **0.46.0 → 0.47.0**.
+
+### Added
+- Providers: Notion AI and xAI usage surfaces from upstream 0.47.0.
+- CLI: hooks watch mode for live hook event streaming.
+- Low Power Mode to reduce background refresh/work on battery or demand.
+- Cost pace: real-calendar monthly pacing (not rolling 30-day only).
+- Settings: per-notification custom sounds (#251).
+- Russian localization (#248).
+
+### Fixed
+- MiniMax coding-plan web-session auth/status refresh (#250, #246).
+- OpenCode Go rolling 5-hour usage falsely showed 100% "Exhausted" when the real value was 1% (#250, #247).
+- FloatBar DPI-aware sizing on scaled displays (#245).
+- Provider fixes: Cursor, CommandCode, OpenCode Go WAL handling, and ZAI/Kimi/Grok duration windows.
+
+### Changed
+- Upstream 0.47.0 provider and CLI behavior ported onto the Windows tray/desktop shell.
+
+---
+
+## [Windows] 0.46.0 - 2026-07-30
+
+Windows port of upstream CodexBar **0.45.2 → 0.46.0**. macOS-only shell items (WidgetKit, Sparkle, AppKit menu layout, Homebrew, Safari cookie APIs) remain deferred.
+
+### Added
+- Providers: Qwen Cloud (Individual Token Plans with 5-hour and weekly rolling windows) and ZoomMate (credit status with host failover, cURL/cookie auth, bearer mint).
+- Alibaba Token Plan: Personal/Solo variants for mainland (Bailian) and international (Model Studio) accounts via `alibaba_token_plan_region` setting.
+- Claude: prepaid credit balance in cost surfaces from cached/manual web sessions.
+- Claude: setting to hide the Daily Routines row (`claude_daily_routines_usage_visible`, default on).
+- Menu: fractional session-quota estimates on the weekly row ("Estimated: N session quotas left") when session+weekly history qualifies; optional `weekly_progress_work_days`.
+- Codex: local Workspaces indexing foundation — per-project/session/model usage attribution with a local sidecar index; new `codexbar workspaces` CLI and desktop snapshot bridge.
+- CLI: `config dump` redacts stored credentials by default; `--show-secrets` restores raw output.
+
+### Changed
+- Codex local cost scans use the disk cache: unchanged files skipped by mtime/size, grown logs resumed mid-file, 256 KiB line bound — repeat scans are incremental.
+- Automatic tray metric surfaces the highest-used (exhausted) window across providers, preserving per-provider overrides.
+- CLI alias `qwen` now resolves to Qwen Cloud (use `alibaba` for the Coding Plan).
+
+### Fixed
+- Claude: model-scoped weekly rows above Daily Routines; automatic metric prefers account Weekly over exhausted model carve-outs; learned full-session estimate stays visible while the session window is idle.
+- Amp: subscription plans (e.g. Megawatt) parse into Other/Orb percentage windows instead of a misleading cookie error.
+- Grok: explicit cookie refresh with validated session caching for background reuse.
+- Chutes: quota counts render as detail text instead of being misread as reset schedules.
+- LLMProxy: skip already-elapsed reset times when picking the next reset.
+- Ollama: reuse validated browser sessions across refreshes.
+
+---
+
+## [Windows] 0.45.3 - 2026-07-29
+
+### Added
+- Settings: global HTTP proxy for provider traffic (#235, #236).
+- Codex tray: reset-credit **next expiry** on the Reset credits row (count + “Next expires …”; honors Relative reset time) (#241).
+
+### Fixed
+- Tray icon missing from the taskbar after upgrade (#237, #238).
+- Float bar window flipping Settings Auto theme to light (pin WebView2 dark on float bar) (#240).
+
+### Changed
+- Hosted PR check on Blacksmith Windows (fmt, clippy, tests, frontend build); release packaging remains local.
+- Dead-code and helper cleanup (shared SigV4/parse helpers, drop unused CLI args/bridge bindings/icons registry, simplify build scripts).
+
+---
+
+## [Windows] 0.45.2 - 2026-07-21
+
+Windows port of upstream CodexBar **0.43.0 → 0.45.2** (providers, CLI, cost, and settings surfaces).
+macOS-only shell polish (menu-bar layout editor, widgets, full hooks UI chrome) remains deferred.
+
+### Added
+- Providers: ZenMux, ClinePass, LongCat, Neuralwatt, DeepInfra, and ai& (30-day spend from logs).
+- Doubao: `arkcli usage plan` path with Coding / Agent / team plan windows.
+- OpenRouter: multi-key token accounts and CLI `usage --account`.
+- OpenCode Go: local-first Auto from `opencode.db` (web-first when scoped).
+- CLI: `codexbar guard` quota automation gates; `codexbar hooks list|enable|disable|test`.
+- CLI serve: optional `--host`, `--dashboard-token` / `CODEXBAR_DASHBOARD_TOKEN`, and `--allow-plain-http` for LAN binds.
+- Settings: Usage & Spend tab (7d/30d) with sanitized PNG share-card export.
+- Settings: Adaptive refresh cadence (activity/power-aware) with Windows coding-agent process detection.
+- External hooks: opt-in `hooks.json` runner (no shell) with threshold-crossing dispatch.
+- Cost: OMP (`~/.omp`) and pi-compatible (`~/.pi`) agent session logs without double-counting.
+- Cursor: dashboard usage-events token-cost (per-model API-rate windows + metered totals).
+
+### Changed
+- Soft-remove Kimi K2 and CrossModel (deprecated labels; hidden unless already enabled; CLI still resolves).
+- Prefer active OpenRouter token-account keys over stored single API keys.
+
+### Fixed
+- Claude: prefer `weekly_all` over misleading `seven_day.utilization`; last-good CLI usage on parse fail; probe session-id reuse (#210, #216).
+- OpenCode: do not rescale sub-1% computed usage to 100% (#211, #215 / upstream #2331).
+- Cursor: map Cli to web cookie path; clamp plan usage at 100% (#212, #217 / upstream #2255).
+- Cost scanner: process incomplete final JSONL lines for Claude transcripts.
+
+---
+
+## [Windows] 0.43.0 - 2026-07-17
+
+### Added
+- Add the sub2api provider (group-key gateway usage, subscription, and wallet).
+- Add Factory/Droid API-key Auto with web-cookie fallback, dotenv key resolution, and token-rate-limits billing.
+- Reuse fresh Kimi Code CLI OAuth credentials read-only when no API key is configured.
+- Treat Claude web null five-hour session as an informational placeholder (no phantom 0% quota).
+- Promote the tray icon out of the Windows 11 hidden-icons overflow when enabled.
+- Toggle the tray flyout from the global shortcut.
+
+### Changed
+- Scope quota threshold and session-depleted notifications by account identity.
+- Improve cost-scan freshness: unattributed model pricing, 256 KiB JSONL line bounds, and Ultra lineage watermark containment.
+- Port remaining upstream 0.43.0 residuals (Claude passive-probe env, nested Factory usage shapes).
+- Migrate CI workflows to Blacksmith runners.
+- Complete zh-CN / zh-TW / ja-JP localization coverage and wire remaining frontend strings into the locale system.
+
+### Fixed
+- Prevent stale provider publish after enablement changes (refresh generation ownership).
+- Honor Factory cookie-source off (API-only; no browser scrape).
+- Avoid re-arming still-hot notifications from volatile plan/login identity strings.
+- Skip informational primaries in Session and Automatic tray metrics.
+- Fix FloatBar recovery after minimize, monitor disconnect, and taskbar z-order races.
+- Fix weekly toast spam, OpenCode usage parse, Antigravity 2.0 port detection, Z.ai quota parsing, and predicted exhaustion display.
+
+---
+
+## [Windows] 0.42.0 - 2026-07-12
+
+### Added
+- Add the Wayfinder provider.
+- Add opt-in local and SSH Agent Sessions for Codex and Claude.
+- Add predictive pace warnings and provider/window-specific usage thresholds.
+- Add GPT-5.6 Sol, Terra, and Luna pricing and model aliases.
+- Show Claude model-scoped weekly quotas from OAuth, web, and CLI sources.
+
+### Changed
+- Reorganize Settings and restore Providers as a dedicated tab.
+- Keep every Settings tab at the same window size.
+- Improve token-cost pricing coverage, freshness, and refresh coalescing.
+
+### Fixed
+- Keep refresh intervals anchored and provider cards synchronized with completed work.
+- Avoid quota refreshes for visual-only settings and provider reorder changes.
+- Improve Antigravity detection, Gemini paid-tier labels, Ollama authentication, and other provider parsing.
+- Eliminate the duplicate FloatBar cost control and keep local-cost display opt-in.
+
+---
+
+## [Windows] 0.41.3 - 2026-07-11
+
+### Added
+- Add local cost summaries to FloatBar.
+- Add a PowerToys Command Palette status pipe.
+
+### Fixed
+- Keep FloatBar topmost without repeatedly stealing focus.
+- Preserve the OpenCode Go workspace override during authentication.
+- Open Cursor's usage dashboard at the correct URL.
+- Align the popup correctly with a side-mounted Windows taskbar (#159).
+- Correct Codex daily usage reporting (#153, thanks @0reki).
+
+---
+
+## [Windows] 0.41.2 - 2026-07-08
+
+### Added
+- Add Antigravity `agy` CLI alias setup guidance.
+- Add Traditional Chinese (Taiwan) localization.
+
+### Changed
+- Add repository interaction guardrails and switch the tray panel to a masonry card layout.
+
+---
+
+## [Windows] 0.41.1 - 2026-07-08
+
+### Fixed
+- Localize the tray panel and native tray menu for Japanese, Chinese (Simplified), Korean, and Spanish.
+- Add missing `es-MX` UI key translations.
+- Stop baking the UI language into cached provider snapshots so locale changes remain independent of provider data.
+- Localize the native tray menu proof harness.
+
+---
+
+## [Windows] 0.41.0 - 2026-07-07
+
+### Changed
+- Port scoped upstream CodexBar 0.41.0 Rust/provider updates into the Windows/Tauri app.
+
+### Fixed
+- Fix the Windows tray/background launch auto-popup regression from #129 and fix Kimi auth cookie fallback.
+
+---
+
+## [Windows] 0.38.3 - 2026-07-06
+
+### Fixed
+- Fix NanoGPT usage parsing when the API omits the monthly usage block.
+
+---
+
+## [Windows] 0.38.2 - 2026-07-05
+
+### Fixed
+- Fix tray flyout flicker/hide when opened from the Windows tray overflow.
+
+---
+
+## [Windows] 0.38.1 - 2026-07-04
+
+### Changed
+- Bump the Windows/Tauri release version to 0.38.1 after merging the tray flyout, vertical-taskbar placement, Claude OAuth refresh, Claude cost, README language, and repo cleanup fixes.
+
+### Fixed
+- Port upstream 0.38.1 parser hardening for OpenAI API non-finite cost values, OpenCode reset timestamps, and z.ai BigModel CN quota responses without optional messages.
+
+---
+
+## [Windows] 0.38.0 - 2026-07-03
+
+### Added
+- Port upstream v0.38.0 provider support for CrossModel, Qoder, and Sakana AI into the Windows/Tauri app.
+- Add Tauri provider icons, provider catalog metadata, manual cookie support for Qoder/Sakana, and saved API-key settings for CrossModel.
+
+### Fixed
+- Accept current Command Code `commandcode_prod` manual cookie headers.
+
+---
+
+## [Windows] 0.37.6 - 2026-07-02
+
+### Added
+- Add window mode with a taskbar-visible PopOut window, custom title bar controls, maximize/restore behavior, and display scaling.
+- Add Mexican Spanish (`es-MX`) locale support with a centralized backend language catalog.
+
+### Fixed
+- Ship the installed console CLI as `codexbar-cli.exe` and verify it is a real console-subsystem binary with redirected stdout.
+- Keep browser cookie imports scoped to exact provider domains and validate imported cookie header length before saving.
+- Validate provider workspace/base URL extras in Rust before persistence so saved credentials cannot be retargeted to unsafe endpoints.
+- Allow clearing the global shortcut setting without attempting to register an empty shortcut.
+- Mask Unicode API keys without slicing through UTF-8 boundaries.
+- Resolve automatic theme mode from the current OS light/dark preference.
+- Fix the cost scanner token-count regression test so it does not age out of the 30-day scan window.
+
+### Changed
+- Harden CI and release workflows with pinned GitHub Action SHAs, read-only build permissions, and separate release publishing jobs.
+- Package `codexbar.exe` as the desktop app, `codexbar-cli.exe` as the console CLI, and `codexbar-desktop.exe` as a compatibility alias.
+
+---
+## [Windows] 0.37.5 - 2026-06-27
+
+### Fixed
+- Fix Windows desktop startup paths that could leave CodexBar running with only the tiny internal Tauri shell window visible.
+- Reopen the tray panel for normal or blank-argument desktop launches unless **Start Minimized** is enabled.
+- Recover startup tray reveals that remain hidden or stuck at a tiny shell-window size.
+
+---
+
+## [Windows] 0.37.4 - 2026-06-24
+
+### Changed
+- Remove stale release scripts, unused fetch planning code, the fake Synthetic provider, and dead settings toggles.
+
+---
+
+## [Windows] 0.33.2 - 2026-06-12
+
+### Fixed
+- Hide the tray panel when it loses focus, matching normal tray-popover behavior.
+- Allow Escape to dismiss the tray panel without quitting the app.
+- Prevent the tray icon click that caused a blur-dismiss from immediately reopening the panel.
+
+---
+
+## [Windows] 0.33.1 - 2026-06-11
+
+### Fixed
+- Show GitHub Copilot over-budget quota values when GitHub reports negative remaining quota, such as displaying `115% used` instead of clamping to `100%`.
+- Keep Copilot progress bars visually capped at full width while preserving the true overage percentage in tray, pop-out, provider sidebar, and settings details.
+
+---
+
+## [Windows] 0.33.0 - 2026-06-11
+
+### Added
+- Add Japanese as a selectable interface language in the Tauri Settings UI.
+
+### Changed
+- Port upstream CodexBar 0.33.0 provider and cost-accounting fixes into the Windows/Tauri Rust backend.
+- Route provider HTTP clients through a shared same-origin redirect policy so credentialed requests do not follow cross-origin redirects with provider auth context.
+- Update Claude local cost pricing for Fable 5, Opus 4.6, Sonnet 4.6, and 1-hour cache writes.
+
+### Fixed
+- Avoid showing Doubao API keys as falsely exhausted when Ark returns successful zero-remaining request-limit headers that are not reliable quota state.
+- Preserve existing Copilot unlimited-chat and Antigravity untracked-quota behavior from the upstream 0.33.0 cycle.
 
 ---
 
@@ -18,7 +520,7 @@
 ## [Windows] 0.32.8 - 2026-06-09
 
 ### Changed
-- Install `codexbar.exe` as the console CLI and `codexbar-desktop.exe` as the tray app so Start Menu shortcuts launch the desktop UI while terminal diagnostics print real output.
+- Install `codexbar.exe` as the tray app and `codexbar-cli.exe` as the console CLI so Start Menu shortcuts launch the desktop UI while terminal diagnostics print real output.
 - Build the console CLI during every Windows release packaging run.
 
 ### Fixed

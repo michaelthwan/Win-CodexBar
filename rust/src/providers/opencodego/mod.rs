@@ -1,13 +1,23 @@
 //! OpenCode Go provider implementation
 //!
 //! Separate workspace surface that shares the `opencode.ai` cookie domain with
-//! the OpenCode provider. Resolves the workspace ID, then scrapes the `/go`
-//! usage page for rolling/weekly/monthly windows.
+//! the OpenCode provider. Auto prefers local SQLite usage (upstream #2316)
+//! unless a workspace override scopes the fetch to web first; Web is cookie
+//! scrape only; Cli is local-only.
+
+mod console;
+mod legacy;
+pub(crate) mod local;
+mod transport;
+mod usage_api;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use reqwest::Client;
-use uuid::Uuid;
+use std::sync::Arc;
+use std::time::Duration;
+
+use transport::{HttpWebTransport, WebTransport};
 
 use crate::core::{
     CostSnapshot, FetchContext, Provider, ProviderError, ProviderFetchResult, ProviderId,
@@ -15,14 +25,91 @@ use crate::core::{
 };
 
 const BASE_URL: &str = "https://opencode.ai";
-const SERVER_URL: &str = "https://opencode.ai/_server";
-const WORKSPACES_SERVER_ID: &str =
-    "def39973159c7f0483d8793a822b8dbb10d067e12c65455fcb4608459ba0234f";
+/// Source label for quota values reconstructed from the device-local SQLite history.
+pub const LOCAL_ESTIMATE_SOURCE_LABEL: &str = "local estimate";
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+// Upstream 0.48.0 #2583 (F15) optional-Zen-balance bounds.
+/// `optionalZenBalanceTimeout`: outer bound of the billing lookup.
+const ZEN_BALANCE_TIMEOUT: Duration = Duration::from_secs(5);
+/// `optionalZenBalanceStartDelay`: the usage page gets a head start.
+const ZEN_BALANCE_START_DELAY: Duration = Duration::from_millis(25);
+/// `optionalZenBalanceJoinGrace`: join bound for background/UI reads.
+const ZEN_BALANCE_JOIN_GRACE: Duration = Duration::from_millis(250);
 
 pub struct OpenCodeGoProvider {
     metadata: ProviderMetadata,
     client: Client,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CookieCapabilities {
+    console: bool,
+    legacy: bool,
+}
+
+#[derive(Clone, Debug)]
+struct WebCookieSession {
+    header: String,
+    capabilities: CookieCapabilities,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum OptionalZenBalance {
+    Resolved(Option<f64>),
+    LegacyBalanceRequired,
+}
+
+impl WebCookieSession {
+    fn new(header: &str) -> Self {
+        let has_cookie = |names: &[&str]| {
+            header.split(';').any(|part| {
+                let Some((name, value)) = part.trim().split_once('=') else {
+                    return false;
+                };
+                names.contains(&name.trim()) && !value.trim().is_empty()
+            })
+        };
+        Self {
+            header: header.to_string(),
+            capabilities: CookieCapabilities {
+                console: has_cookie(&["__Host-console_session"]),
+                legacy: has_cookie(&["auth", "__Host-auth"]),
+            },
+        }
+    }
+
+    fn header(&self) -> &str {
+        &self.header
+    }
+
+    fn can_recover_with_legacy(&self, error: &ProviderError) -> bool {
+        self.capabilities.legacy
+            && (matches!(
+                error,
+                ProviderError::AuthRequired
+                    | ProviderError::Parse(_)
+                    | ProviderError::Other(_)
+                    | ProviderError::Timeout
+            ) || error.is_transport_failure())
+    }
+
+    fn select_legacy_result<T>(
+        &self,
+        console_error: ProviderError,
+        legacy_result: Result<T, ProviderError>,
+    ) -> Result<T, ProviderError> {
+        match legacy_result {
+            Ok(value) => Ok(value),
+            Err(_legacy_error)
+                if self.capabilities.console
+                    && !matches!(console_error, ProviderError::AuthRequired) =>
+            {
+                Err(console_error)
+            }
+            Err(legacy_error) => Err(legacy_error),
+        }
+    }
 }
 
 impl OpenCodeGoProvider {
@@ -31,307 +118,343 @@ impl OpenCodeGoProvider {
             metadata: ProviderMetadata {
                 id: ProviderId::OpenCodeGo,
                 display_name: "OpenCode Go",
-                session_label: "Rolling",
+                session_label: "5-hour",
                 weekly_label: "Weekly",
-                supports_opus: false,
+                supports_opus: true,
                 supports_credits: false,
                 default_enabled: false,
                 is_primary: false,
                 dashboard_url: Some("https://opencode.ai"),
                 status_page_url: None,
+                tertiary_label_key: Some("ProviderMonthly"),
             },
-            client: Client::builder()
+            client: crate::core::credentialed_http_client_builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
         }
     }
 
-    async fn fetch_workspace_id(&self, cookie_header: &str) -> Result<String, ProviderError> {
-        let url = format!("{}?id={}", SERVER_URL, WORKSPACES_SERVER_ID);
-        let response = self
-            .client
-            .get(&url)
-            .header("Cookie", cookie_header)
-            .header("X-Server-Id", WORKSPACES_SERVER_ID)
-            .header("X-Server-Instance", format!("server-fn:{}", Uuid::new_v4()))
-            .header("User-Agent", USER_AGENT)
-            .header("Origin", BASE_URL)
-            .header("Referer", BASE_URL)
-            .header(
-                "Accept",
-                "text/javascript, application/json;q=0.9, */*;q=0.8",
-            )
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            if status.as_u16() == 401 || status.as_u16() == 403 {
-                return Err(ProviderError::AuthRequired);
-            }
-            return Err(ProviderError::Other(format!(
-                "OpenCode workspace API returned {}",
-                status
-            )));
-        }
-
-        let text = response.text().await?;
-        if Self::looks_signed_out(&text) {
-            return Err(ProviderError::AuthRequired);
-        }
-
-        let ids = Self::parse_workspace_ids(&text);
-        ids.into_iter()
-            .next()
-            .ok_or_else(|| ProviderError::Parse("No workspace ID found".to_string()))
+    fn workspace_id_from_context(workspace_id: Option<&str>) -> Option<String> {
+        console::normalize_workspace_id(workspace_id)
     }
 
-    async fn fetch_usage_page(
-        &self,
+    /// Upstream `fetchZenBalance`: the dashboard HTML embeds the balance for
+    /// some page states; the dedicated billing server-fn report (raw 1e-8 USD
+    /// units behind a customerID marker) is the fallback. Optional enrichment
+    /// — every failure degrades to `None`, never to a fetch error.
+    async fn fetch_zen_balance<T: WebTransport>(
+        transport: &T,
         workspace_id: &str,
-        cookie_header: &str,
-    ) -> Result<String, ProviderError> {
-        let url = format!("{}/workspace/{}/go", BASE_URL, workspace_id);
-        let response = self
-            .client
-            .get(&url)
-            .header("Cookie", cookie_header)
-            .header("User-Agent", USER_AGENT)
-            .header("Referer", BASE_URL)
-            .header(
-                "Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            )
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            if status.as_u16() == 401 || status.as_u16() == 403 {
-                return Err(ProviderError::AuthRequired);
-            }
-            return Err(ProviderError::Other(format!(
-                "OpenCode Go usage page returned {}",
-                status
-            )));
-        }
-
-        let text = response.text().await?;
-        if Self::looks_signed_out(&text) {
-            return Err(ProviderError::AuthRequired);
-        }
-        Ok(text)
-    }
-
-    fn parse_usage_text(text: &str) -> Result<UsageSnapshot, ProviderError> {
-        let now = Utc::now();
-
-        let rolling = Self::extract_window(text, &["rollingUsage", "rolling_usage", "rolling"])
-            .ok_or_else(|| ProviderError::Parse("Missing rolling usage window".to_string()))?;
-        let weekly = Self::extract_window(text, &["weeklyUsage", "weekly_usage", "weekly"]);
-        let monthly = Self::extract_window(text, &["monthlyUsage", "monthly_usage", "monthly"]);
-
-        let primary = RateWindow::with_details(
-            rolling.0,
-            Some(300),
-            Some(now + chrono::Duration::seconds(rolling.1)),
-            None,
-        );
-        let mut snap = UsageSnapshot::new(primary).with_login_method("OpenCode Go");
-
-        if let Some((pct, reset)) = weekly {
-            snap = snap.with_secondary(RateWindow::with_details(
-                pct,
-                Some(10080),
-                Some(now + chrono::Duration::seconds(reset)),
-                None,
-            ));
-        }
-
-        if let Some((pct, reset)) = monthly {
-            snap = snap.with_tertiary(RateWindow::with_details(
-                pct,
-                Some(43200),
-                Some(now + chrono::Duration::seconds(reset)),
-                None,
-            ));
-        }
-
-        if let Some(renews_at) = Self::extract_renewal(text) {
-            snap = snap.with_extra_rate_window(
-                "renewal",
-                "Renews",
-                RateWindow::with_details(0.0, None, Some(renews_at), None),
-            );
-        }
-
-        Ok(snap)
-    }
-
-    /// Extract `(percent, resetInSec)` for a usage block by name.
-    fn extract_window(text: &str, names: &[&str]) -> Option<(f64, i64)> {
-        for name in names {
-            let percent_pattern = format!(
-                r#"{}[^}}]*?(?:usagePercent|usedPercent|percentUsed|percent)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)"#,
-                name
-            );
-            let reset_pattern = format!(
-                r#"{}[^}}]*?(?:resetInSec|resetInSeconds|resetSeconds|resetSec)\s*[:=]\s*([0-9]+)"#,
-                name
-            );
-
-            let percent = Self::extract_number(&percent_pattern, text);
-            if let Some(p) = percent {
-                let reset = Self::extract_number(&reset_pattern, text)
-                    .map(|n| n as i64)
-                    .unwrap_or(0);
-                let p = if p <= 1.0 { p * 100.0 } else { p };
-                return Some((p.clamp(0.0, 100.0), reset.max(0)));
-            }
-        }
-        None
-    }
-
-    fn extract_number(pattern: &str, text: &str) -> Option<f64> {
-        let re = regex_lite::Regex::new(pattern).ok()?;
-        re.captures(text)?.get(1)?.as_str().parse().ok()
-    }
-
-    fn extract_renewal(text: &str) -> Option<DateTime<Utc>> {
-        let re = regex_lite::Regex::new(
-            r#"(?:"renewAt"|"renew_at"|renewAt|renew_at)\s*[:=]\s*"?([^",}\s]+)"?"#,
-        )
-        .ok()?;
-        let raw = re.captures(text)?.get(1)?.as_str();
-        Self::date_from_text(raw)
-    }
-
-    fn date_from_text(raw: &str) -> Option<DateTime<Utc>> {
-        let text = raw.trim();
-        if text.is_empty() {
-            return None;
-        }
-        if let Ok(number) = text.parse::<f64>() {
-            return Self::date_from_timestamp(number);
-        }
-        DateTime::parse_from_rfc3339(text)
-            .ok()
-            .map(|dt| dt.with_timezone(&Utc))
-    }
-
-    fn date_from_timestamp(number: f64) -> Option<DateTime<Utc>> {
-        if !number.is_finite() || number <= 0.0 {
-            return None;
-        }
-        let seconds = if number > 10_000_000_000.0 {
-            number / 1000.0
-        } else {
-            number
-        };
-        DateTime::<Utc>::from_timestamp(seconds as i64, 0)
-    }
-
-    fn parse_workspace_ids(text: &str) -> Vec<String> {
-        let pattern = r#"(wrk_[A-Za-z0-9_-]+)"#;
-        let re = match regex_lite::Regex::new(pattern) {
-            Ok(r) => r,
-            Err(_) => return vec![],
-        };
-        let mut seen = Vec::new();
-        for caps in re.captures_iter(text) {
-            if let Some(m) = caps.get(1) {
-                let s = m.as_str().to_string();
-                if !seen.contains(&s) {
-                    seen.push(s);
-                }
-            }
-        }
-        seen
-    }
-
-    fn looks_signed_out(text: &str) -> bool {
-        let lower = text.to_lowercase();
-        lower.contains("auth/authorize")
-            || lower.contains("\"signin\"")
-            || lower.contains("please sign in")
-    }
-
-    fn parse_zen_balance(text: &str) -> Option<f64> {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(text)
-            && let Some(value) = Self::find_balance_value(&json)
+        cookies: &WebCookieSession,
+        timeout: Duration,
+    ) -> OptionalZenBalance {
+        let request_timeout = timeout.min(ZEN_BALANCE_TIMEOUT);
+        match transport
+            .fetch_console_balance(workspace_id, cookies.header(), request_timeout)
+            .await
         {
-            return Some(value);
+            Ok(balance) => OptionalZenBalance::Resolved(balance),
+            Err(error) if cookies.can_recover_with_legacy(&error) => {
+                OptionalZenBalance::LegacyBalanceRequired
+            }
+            Err(_) => OptionalZenBalance::Resolved(None),
         }
-        let patterns = [
-            r#"(?i)(?:current\s+balance|zen\s+balance|現在の残高)[^$]{0,80}\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)"#,
-            r#"(?i)(?:balance|残高)[\s\S]{0,120}?\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)"#,
-        ];
-        patterns.iter().find_map(|pattern| {
-            let re = regex_lite::Regex::new(pattern).ok()?;
-            let raw = re.captures(text)?.get(1)?.as_str().replace(',', "");
-            raw.parse::<f64>().ok()
-        })
     }
 
-    fn find_balance_value(value: &serde_json::Value) -> Option<f64> {
-        match value {
-            serde_json::Value::Object(map) => {
-                for (key, value) in map {
-                    let normalized: String = key
-                        .to_lowercase()
-                        .chars()
-                        .filter(|c| c.is_ascii_alphanumeric())
-                        .collect();
-                    if matches!(
-                        normalized.as_str(),
-                        "zenbalance"
-                            | "zencurrentbalance"
-                            | "currentbalance"
-                            | "currentbalanceusd"
-                            | "balanceusd"
-                            | "usdbalance"
-                    ) {
-                        if let Some(number) = value.as_f64() {
-                            return Some(number);
-                        }
-                        if let Some(text) = value.as_str()
-                            && let Ok(number) = text.trim().replace(',', "").parse()
-                        {
-                            return Some(number);
-                        }
+    /// Spawn the optional Zen balance task (25 ms start delay so the usage
+    /// fetch gets the head start, per upstream). Resolves the workspace id
+    /// inside the task when no override is pinned.
+    fn spawn_zen_balance_task<T: WebTransport>(
+        transport: Arc<T>,
+        cookies: &WebCookieSession,
+        workspace_id_override: Option<&str>,
+        web_timeout: u64,
+    ) -> (
+        tokio::task::JoinHandle<OptionalZenBalance>,
+        std::time::Instant,
+    ) {
+        let cookies = cookies.clone();
+        let workspace_id_override = workspace_id_override.map(str::to_string);
+        let timeout = Duration::from_secs(web_timeout.max(1));
+        let started_at = std::time::Instant::now();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(ZEN_BALANCE_START_DELAY).await;
+            let workspace_id = match workspace_id_override {
+                Some(id) => id,
+                None => match transport
+                    .fetch_workspace_id(cookies.header(), Duration::from_secs(30))
+                    .await
+                {
+                    Ok(id) => id,
+                    Err(error) if cookies.can_recover_with_legacy(&error) => {
+                        return OptionalZenBalance::LegacyBalanceRequired;
                     }
-                    if let Some(found) = Self::find_balance_value(value) {
-                        return Some(found);
-                    }
-                }
+                    Err(_) => return OptionalZenBalance::Resolved(None),
+                },
+            };
+            Self::fetch_zen_balance(transport.as_ref(), &workspace_id, &cookies, timeout).await
+        });
+        (task, started_at)
+    }
+
+    fn spawn_legacy_balance_task<T: WebTransport>(
+        transport: Arc<T>,
+        session: T::LegacySession,
+        web_timeout: u64,
+    ) -> (
+        tokio::task::JoinHandle<OptionalZenBalance>,
+        std::time::Instant,
+    ) {
+        let timeout = Duration::from_secs(web_timeout.max(1)).min(ZEN_BALANCE_TIMEOUT);
+        let started_at = std::time::Instant::now();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(ZEN_BALANCE_START_DELAY).await;
+            OptionalZenBalance::Resolved(
+                transport
+                    .fetch_legacy_balance(&session, timeout)
+                    .await
+                    .unwrap_or(None),
+            )
+        });
+        (task, started_at)
+    }
+
+    /// Join the optional Zen balance task within the policy budget. A budget
+    /// expiry cancels the in-flight HTTP work instead of leaking it.
+    async fn join_zen_balance(
+        mut task: tokio::task::JoinHandle<OptionalZenBalance>,
+        started_at: std::time::Instant,
+        requires_optional_usage_completeness: bool,
+    ) -> Option<OptionalZenBalance> {
+        let budget = zen_balance_join_budget(started_at, requires_optional_usage_completeness);
+        match tokio::time::timeout(budget, &mut task).await {
+            Ok(Ok(balance)) => Some(balance),
+            Ok(Err(_)) | Err(_) => {
+                task.abort();
                 None
             }
-            serde_json::Value::Array(items) => items.iter().find_map(Self::find_balance_value),
-            _ => None,
+        }
+    }
+
+    async fn resolve_legacy_balance<T: WebTransport>(
+        transport: Arc<T>,
+        cookies: &WebCookieSession,
+        started_at: std::time::Instant,
+        requires_optional_usage_completeness: bool,
+    ) -> Option<f64> {
+        let budget = zen_balance_join_budget(started_at, requires_optional_usage_completeness);
+        if budget.is_zero() {
+            return None;
+        }
+        tokio::time::timeout(budget, async {
+            let session = transport.resolve_legacy_session(cookies).await.ok()?;
+            transport
+                .fetch_legacy_balance(&session, budget.min(ZEN_BALANCE_TIMEOUT))
+                .await
+                .unwrap_or(None)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn finish_zen_balance<T: WebTransport>(
+        transport: Arc<T>,
+        cookies: &WebCookieSession,
+        task: tokio::task::JoinHandle<OptionalZenBalance>,
+        started_at: std::time::Instant,
+        requires_optional_usage_completeness: bool,
+    ) -> Option<f64> {
+        match Self::join_zen_balance(task, started_at, requires_optional_usage_completeness).await?
+        {
+            OptionalZenBalance::Resolved(balance) => balance,
+            OptionalZenBalance::LegacyBalanceRequired => {
+                Self::resolve_legacy_balance(
+                    transport,
+                    cookies,
+                    started_at,
+                    requires_optional_usage_completeness,
+                )
+                .await
+            }
         }
     }
 
     async fn fetch_with_cookies(
         &self,
+        ctx: &FetchContext,
         cookie_header: &str,
     ) -> Result<ProviderFetchResult, ProviderError> {
-        let workspace_id = self.fetch_workspace_id(cookie_header).await?;
-        let page = self.fetch_usage_page(&workspace_id, cookie_header).await?;
-        let mut usage = Self::parse_usage_text(&page)?;
-        let balance = Self::parse_zen_balance(&page);
-        if let Some(balance) = balance {
-            usage = usage.with_extra_rate_window(
-                "zen-balance",
-                "Zen balance",
-                RateWindow::with_details(0.0, None, None, Some(format!("${balance:.2}"))),
-            );
-        }
-        let mut result = ProviderFetchResult::new(usage, "web");
-        if let Some(balance) = balance {
-            result = result.with_cost(CostSnapshot::new(balance, "USD", "Zen balance"));
-        }
-        Ok(result)
+        let transport = Arc::new(HttpWebTransport::new(self.client.clone()));
+        Self::fetch_with_transport(ctx, cookie_header, transport).await
+    }
+
+    async fn fetch_with_transport<T: WebTransport>(
+        ctx: &FetchContext,
+        cookie_header: &str,
+        transport: Arc<T>,
+    ) -> Result<ProviderFetchResult, ProviderError> {
+        let cookies = WebCookieSession::new(cookie_header);
+        let workspace_id = match Self::workspace_id_from_context(ctx.workspace_id.as_deref()) {
+            Some(workspace_id) => workspace_id,
+            None => match transport
+                .fetch_workspace_id(cookies.header(), Duration::from_secs(30))
+                .await
+            {
+                Ok(workspace_id) => workspace_id,
+                Err(console_error) if cookies.can_recover_with_legacy(&console_error) => {
+                    return Self::fetch_legacy_with_cookies(
+                        ctx,
+                        &cookies,
+                        console_error,
+                        transport,
+                    )
+                    .await;
+                }
+                Err(error) => return Err(error),
+            },
+        };
+        // F15 (#2583): start the optional Zen balance fetch in parallel with the
+        // usage page and bound the join from task creation, so a slow balance
+        // still lands in CLI/serve usage reads without stacking a second wait.
+        let (zen_task, zen_started) = Self::spawn_zen_balance_task(
+            Arc::clone(&transport),
+            &cookies,
+            Some(&workspace_id),
+            ctx.web_timeout,
+        );
+        let console_result = transport
+            .fetch_console_usage(
+                &workspace_id,
+                cookies.header(),
+                Duration::from_secs(ctx.web_timeout.max(1)),
+            )
+            .await;
+        let (usage, embedded_balance) = match console_result {
+            Ok(console::ConsoleUsage::Snapshot(usage)) => (*usage, None),
+            Ok(console::ConsoleUsage::NoSubscription) => {
+                zen_task.abort();
+                return Err(ProviderError::Parse(
+                    "No OpenCode Go subscription is available".to_string(),
+                ));
+            }
+            Err(console_error) if cookies.can_recover_with_legacy(&console_error) => {
+                zen_task.abort();
+                let session = match transport.resolve_legacy_session(&cookies).await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        return cookies.select_legacy_result(console_error, Err(error));
+                    }
+                };
+                return Self::fetch_legacy_with_session(
+                    ctx,
+                    &cookies,
+                    console_error,
+                    transport,
+                    session,
+                )
+                .await;
+            }
+            Err(error) => {
+                zen_task.abort();
+                return Err(error);
+            }
+        };
+        let balance = match embedded_balance {
+            Some(balance) => {
+                zen_task.abort();
+                Some(balance)
+            }
+            None => {
+                Self::finish_zen_balance(
+                    transport,
+                    &cookies,
+                    zen_task,
+                    zen_started,
+                    ctx.requires_optional_usage_completeness,
+                )
+                .await
+            }
+        };
+        Ok(Self::with_zen_balance(usage, "web", balance))
+    }
+
+    async fn fetch_legacy_with_cookies<T: WebTransport>(
+        ctx: &FetchContext,
+        cookies: &WebCookieSession,
+        console_error: ProviderError,
+        transport: Arc<T>,
+    ) -> Result<ProviderFetchResult, ProviderError> {
+        let session = match transport.resolve_legacy_session(cookies).await {
+            Ok(session) => session,
+            Err(error) => return cookies.select_legacy_result(console_error, Err(error)),
+        };
+        Self::fetch_legacy_with_session(ctx, cookies, console_error, transport, session).await
+    }
+
+    async fn fetch_legacy_with_session<T: WebTransport>(
+        ctx: &FetchContext,
+        cookies: &WebCookieSession,
+        console_error: ProviderError,
+        transport: Arc<T>,
+        session: T::LegacySession,
+    ) -> Result<ProviderFetchResult, ProviderError> {
+        let (zen_task, zen_started) = Self::spawn_legacy_balance_task(
+            Arc::clone(&transport),
+            session.clone(),
+            ctx.web_timeout,
+        );
+        let result = match cookies
+            .select_legacy_result(console_error, transport.fetch_legacy_usage(&session).await)
+        {
+            Ok(result) => result,
+            Err(error) => {
+                zen_task.abort();
+                return Err(error);
+            }
+        };
+        let balance = match result.embedded_balance {
+            Some(balance) => {
+                zen_task.abort();
+                Some(balance)
+            }
+            None => {
+                match Self::join_zen_balance(
+                    zen_task,
+                    zen_started,
+                    ctx.requires_optional_usage_completeness,
+                )
+                .await
+                {
+                    Some(OptionalZenBalance::Resolved(balance)) => balance,
+                    Some(OptionalZenBalance::LegacyBalanceRequired) | None => None,
+                }
+            }
+        };
+        Ok(Self::with_zen_balance(result.usage, "web", balance))
+    }
+
+    /// Attach an optional Zen balance to the snapshot: informational extra
+    /// window plus the cost row (existing bridge shape).
+    fn with_zen_balance(
+        mut usage: UsageSnapshot,
+        source: &str,
+        balance: Option<f64>,
+    ) -> ProviderFetchResult {
+        let Some(balance) = balance else {
+            return ProviderFetchResult::new(usage, source);
+        };
+        usage = usage.with_extra_rate_window(
+            "zen-balance",
+            "Zen balance",
+            RateWindow::with_details(0.0, None, None, Some(format!("${balance:.2}"))),
+        );
+        ProviderFetchResult::new(usage, source).with_cost(CostSnapshot::new(
+            balance,
+            "USD",
+            "Zen balance",
+        ))
     }
 }
 
@@ -355,45 +478,54 @@ impl Provider for OpenCodeGoProvider {
         tracing::debug!("Fetching OpenCode Go usage");
 
         match ctx.source_mode {
-            SourceMode::Auto | SourceMode::Web => {
-                if let Some(ref cookie_header) = ctx.manual_cookie_header {
-                    return self.fetch_with_cookies(cookie_header).await;
+            SourceMode::Auto => {
+                // Local-first unless workspace/token scope asks for web first
+                // (manual cookie source is already mapped to Web by the shell).
+                if Self::auto_prefers_web_first(ctx) {
+                    match self.fetch_web(ctx).await {
+                        Ok(result) => return Ok(result),
+                        Err(e) if Self::web_error_allows_local_fallback(ctx, &e) => {
+                            tracing::debug!(
+                                "OpenCode Go web failed in scoped Auto; trying local: {e}"
+                            );
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    return self.fetch_local_with_balance(ctx).await;
                 }
 
-                #[cfg(windows)]
-                {
-                    use crate::browser::cookies::{Cookie, CookieExtractor};
-                    use crate::browser::detection::BrowserDetector;
-
-                    for browser in BrowserDetector::detect_all() {
-                        if let Ok(cookies) =
-                            CookieExtractor::extract_for_domain(&browser, "opencode.ai")
-                        {
-                            let cookie_header: String = cookies
-                                .iter()
-                                .map(|c: &Cookie| format!("{}={}", c.name, c.value))
-                                .collect::<Vec<_>>()
-                                .join("; ");
-                            if !cookie_header.is_empty() {
-                                match self.fetch_with_cookies(&cookie_header).await {
-                                    Ok(result) => return Ok(result),
-                                    Err(ProviderError::AuthRequired) => continue,
-                                    Err(e) => return Err(e),
-                                }
-                            }
+                match self.fetch_local_with_balance(ctx).await {
+                    Ok(result) => return Ok(result),
+                    Err(e) => {
+                        tracing::debug!("OpenCode Go local failed in Auto; trying API/web: {e}");
+                    }
+                }
+                if let Some(api_key) = usage_api::resolve_api_key(ctx) {
+                    match usage_api::fetch(&self.client, ctx, &api_key, "api").await {
+                        Ok(result) => return Ok(result),
+                        Err(e) => {
+                            tracing::debug!("OpenCode Go API failed in Auto; trying web: {e}")
                         }
                     }
                 }
-
-                Err(ProviderError::AuthRequired)
+                self.fetch_web(ctx).await
             }
-            SourceMode::Cli => Err(ProviderError::UnsupportedSource(SourceMode::Cli)),
-            SourceMode::OAuth => Err(ProviderError::UnsupportedSource(SourceMode::OAuth)),
+            SourceMode::Web => self.fetch_web(ctx).await,
+            SourceMode::Cli => self.fetch_local_with_balance(ctx).await,
+            SourceMode::OAuth => {
+                let api_key = usage_api::resolve_api_key(ctx).ok_or_else(|| {
+                    ProviderError::NotInstalled(
+                        "Missing OpenCode Go API key. Add one in Settings or set OPENCODE_API_KEY."
+                            .to_string(),
+                    )
+                })?;
+                usage_api::fetch(&self.client, ctx, &api_key, "api").await
+            }
         }
     }
 
     fn available_sources(&self) -> Vec<SourceMode> {
-        vec![SourceMode::Auto, SourceMode::Web]
+        vec![SourceMode::Auto, SourceMode::Web, SourceMode::Cli]
     }
 
     fn supports_web(&self) -> bool {
@@ -401,57 +533,121 @@ impl Provider for OpenCodeGoProvider {
     }
 
     fn supports_cli(&self) -> bool {
-        false
+        true
     }
+}
+
+impl OpenCodeGoProvider {
+    /// Auto prefers web when a workspace override or active token-account scope
+    /// is present (upstream `requiresScopedWebStrategy`).
+    fn auto_prefers_web_first(ctx: &FetchContext) -> bool {
+        if ctx
+            .workspace_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty())
+        {
+            return true;
+        }
+        // Shell sets this when a token account is active for cookie/web scope.
+        ctx.auto_prefer_web
+    }
+
+    fn web_error_allows_local_fallback(ctx: &FetchContext, err: &ProviderError) -> bool {
+        // Upstream 0.53: an explicitly selected/manual token is an account
+        // choice. Never mask that account's auth failure with account-agnostic
+        // local SQLite estimates. Workspace-only scoping may still fall back.
+        if matches!(err, ProviderError::AuthRequired | ProviderError::NoCookies)
+            && (ctx.manual_cookie_header.is_some() || ctx.auto_prefer_web)
+        {
+            return false;
+        }
+        matches!(
+            err,
+            ProviderError::AuthRequired
+                | ProviderError::NoCookies
+                | ProviderError::Timeout
+                | ProviderError::Network(_)
+                | ProviderError::Parse(_)
+                | ProviderError::Other(_)
+        )
+    }
+
+    /// Local SQLite snapshot plus the optional bounded Zen balance enrichment
+    /// (upstream #2583 waits for the balance in usage-snapshot reads too, not
+    /// just web reads; cookie absence or a slow/broken billing lookup degrades
+    /// to no balance, never to an error).
+    async fn fetch_local_with_balance(
+        &self,
+        ctx: &FetchContext,
+    ) -> Result<ProviderFetchResult, ProviderError> {
+        let snap = local::fetch_local_usage(Utc::now())?;
+        let mut result = snap.to_fetch_result();
+        if let Some(api_key) = usage_api::resolve_api_key(ctx)
+            && let Ok(api_result) = usage_api::fetch(&self.client, ctx, &api_key, "local+api").await
+        {
+            result = api_result;
+        }
+        if !ctx.include_credits {
+            return Ok(result);
+        }
+        let cookie_header = match ctx.manual_cookie_header.clone() {
+            Some(header) => Some(header),
+            None => crate::providers::browser_cookie_header(&["opencode.ai"]).ok(),
+        };
+        let Some(cookie_header) = cookie_header else {
+            return Ok(result);
+        };
+        let cookies = WebCookieSession::new(&cookie_header);
+        let transport = Arc::new(HttpWebTransport::new(self.client.clone()));
+        let (task, started) = Self::spawn_zen_balance_task(
+            Arc::clone(&transport),
+            &cookies,
+            ctx.workspace_id.as_deref(),
+            ctx.web_timeout,
+        );
+        if let Some(balance) = Self::finish_zen_balance(
+            transport,
+            &cookies,
+            task,
+            started,
+            ctx.requires_optional_usage_completeness,
+        )
+        .await
+        {
+            result =
+                Self::with_zen_balance(result.usage, &result.source_label.clone(), Some(balance));
+        }
+        Ok(result)
+    }
+
+    async fn fetch_web(&self, ctx: &FetchContext) -> Result<ProviderFetchResult, ProviderError> {
+        if let Some(cookie_header) = &ctx.manual_cookie_header {
+            return self.fetch_with_cookies(ctx, cookie_header).await;
+        }
+
+        match crate::providers::browser_cookie_header(&["opencode.ai"]) {
+            Ok(cookie_header) => self.fetch_with_cookies(ctx, &cookie_header).await,
+            Err(ProviderError::NoCookies) => Err(ProviderError::AuthRequired),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+// ── F15 helpers ─────────────────────────────────────────────────────────────
+
+/// The optional-balance join bound, measured from task creation (upstream
+/// `optionalZenBalanceJoinTimeout`): usage-completeness reads get the remainder
+/// of the 5 s optional-balance budget so a slow usage fetch cannot stack a
+/// second full wait; background reads keep the short join grace.
+fn zen_balance_join_budget(
+    started_at: std::time::Instant,
+    requires_optional_usage_completeness: bool,
+) -> Duration {
+    if !requires_optional_usage_completeness {
+        return ZEN_BALANCE_JOIN_GRACE;
+    }
+    ZEN_BALANCE_TIMEOUT.saturating_sub(started_at.elapsed())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_workspace_ids() {
-        let text = r#"{ id: "wrk_abc123", name: "x" } { id: "wrk_def456" }"#;
-        let ids = OpenCodeGoProvider::parse_workspace_ids(text);
-        assert_eq!(
-            ids,
-            vec!["wrk_abc123".to_string(), "wrk_def456".to_string()]
-        );
-    }
-
-    #[test]
-    fn parses_usage_blocks() {
-        let text = r#"
-            rollingUsage: { usagePercent: 42.5, resetInSec: 3600 }
-            weeklyUsage: { usagePercent: 0.13, resetInSec: 86400 }
-            monthlyUsage: { usagePercent: 7, resetInSec: 2592000 }
-        "#;
-        let snap = OpenCodeGoProvider::parse_usage_text(text).unwrap();
-        assert!((snap.primary.used_percent - 42.5).abs() < 0.001);
-        let secondary = snap.secondary.expect("weekly");
-        // 0.13 normalized as fraction → 13%
-        assert!((secondary.used_percent - 13.0).abs() < 0.001);
-        let tertiary = snap.tertiary.expect("monthly");
-        assert!((tertiary.used_percent - 7.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn parses_renewal_window() {
-        let text = r#"
-            rollingUsage: { usagePercent: 42.5, resetInSec: 3600 }
-            weeklyUsage: { usagePercent: 50, resetInSec: 86400 }
-            renewAt: "2026-06-01T12:00:00Z"
-        "#;
-        let snap = OpenCodeGoProvider::parse_usage_text(text).unwrap();
-        let renewal = snap
-            .extra_rate_windows
-            .iter()
-            .find(|window| window.id == "renewal")
-            .expect("renewal window");
-        assert_eq!(renewal.title, "Renews");
-        assert_eq!(
-            renewal.window.resets_at.unwrap().to_rfc3339(),
-            "2026-06-01T12:00:00+00:00"
-        );
-    }
-}
+mod tests;

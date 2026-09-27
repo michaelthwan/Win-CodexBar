@@ -40,41 +40,69 @@ import type { SettingsSnapshot } from "../../../types/bridge";
 const settings: SettingsSnapshot = {
   enabledProviders: [],
   refreshIntervalSecs: 300,
+    adaptiveRefresh: false,
+  refreshAllProvidersOnMenuOpen: false,
+  lowPowerMode: false,
   startAtLogin: false,
   startMinimized: false,
   showNotifications: true,
   soundEnabled: true,
-  soundVolume: 100,
+  notificationSoundTheme: "windows",
+  notificationSoundPaths: {
+    predictiveWarning: null,
+    highUsage: null,
+    criticalUsage: null,
+    exhausted: null,
+    statusIssue: null,
+    sessionDepleted: null,
+    sessionRestored: null,
+  },
   highUsageThreshold: 70,
   criticalUsageThreshold: 90,
+  predictivePaceWarningEnabled: false,
   trayIconMode: "single",
   switcherShowsIcons: true,
   menuBarShowsHighestUsage: true,
   menuBarShowsPercent: true,
   showAsUsed: false,
-  showCreditsExtraUsage: true,
   showAllTokenAccountsInMenu: true,
-  surpriseAnimations: true,
   enableAnimations: true,
   resetTimeRelative: true,
+  showResetWhenExhausted: false,
   menuBarDisplayMode: "compact",
+  overviewLayout: "detailed",
   hidePersonalInfo: false,
   autoDownloadUpdates: false,
   installUpdatesOnQuit: false,
   globalShortcut: "",
+  codexCustomSessionsDirs: [],
   updateChannel: "stable",
   uiLanguage: "english",
   theme: "dark",
+  windowScalePercent: 125,
+  trayScalePercent: 100,
+  trayPanelAlwaysOnTop: false,
+  powertoysStatusPipeEnabled: false,
   claudeAvoidKeychainPrompts: true,
+  codexSparkUsageVisible: true,
   disableKeychainAccess: false,
-  showDebugSettings: false,
   providerMetrics: {},
   floatBarEnabled: false,
   floatBarOpacity: 0.9,
+  floatBarScale: 100,
   floatBarOrientation: "horizontal",
+  floatBarStyle: "floating",
   floatBarClickThrough: false,
   floatBarProviderIds: [],
   floatBarDarkText: false,
+  floatBarShowResetInline: false,
+  floatBarShowCost: false,
+  claudeDailyRoutinesUsageVisible: true,
+  claudeAllowReadingClaudeCodeCredentials: false,
+  alibabaTokenPlanRegion: "cn",
+  weeklyProgressWorkDays: null,
+    costSummaryDisplayStyle: "compact",
+    providerAccentColors: {},
 };
 
 describe("AboutTab", () => {
@@ -93,13 +121,14 @@ describe("AboutTab", () => {
   it("opens about links through the Tauri URL bridge", async () => {
     render(<AboutTab settings={settings} set={vi.fn()} saving={false} />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "GitHub" }));
-    fireEvent.click(screen.getByRole("button", { name: "Website" }));
-    fireEvent.click(screen.getByRole("button", { name: "Original Project" }));
+    fireEvent.click(await screen.findByRole("button", { name: "AboutLinkGitHub" }));
+    fireEvent.click(screen.getByRole("button", { name: "AboutLinkWebsite" }));
+    fireEvent.click(screen.getByRole("button", { name: "AboutLinkOriginalProject" }));
+    fireEvent.click(screen.getByRole("button", { name: "SubmitIssue" }));
 
     expect(tauriMocks.openExternalUrl).toHaveBeenNthCalledWith(
       1,
-      "https://github.com/Finesssee/Win-CodexBar",
+      "https://github.com/nesszer/Win-CodexBar",
     );
     expect(tauriMocks.openExternalUrl).toHaveBeenNthCalledWith(
       2,
@@ -109,6 +138,10 @@ describe("AboutTab", () => {
       3,
       "https://github.com/steipete/CodexBar",
     );
+    expect(tauriMocks.openExternalUrl).toHaveBeenNthCalledWith(
+      4,
+      "https://github.com/nesszer/Win-CodexBar/issues/new?labels=bug&template=bug_report.yml",
+    );
   });
 
   it("shows a link error if the OS browser launch fails", async () => {
@@ -116,10 +149,10 @@ describe("AboutTab", () => {
 
     render(<AboutTab settings={settings} set={vi.fn()} saving={false} />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Website" }));
+    fireEvent.click(await screen.findByRole("button", { name: "AboutLinkWebsite" }));
 
     await waitFor(() => {
-      expect(screen.getByText("Error: no browser")).toBeInTheDocument();
+      expect(screen.getByText("ErrorPrefix no browser")).toBeInTheDocument();
     });
   });
 });

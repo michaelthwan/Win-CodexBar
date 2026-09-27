@@ -7,8 +7,237 @@ fn test_settings_default() {
     assert!(settings.enabled_providers.contains("codex"));
     assert_eq!(settings.refresh_interval_secs, 300);
     assert!(settings.show_notifications);
+    assert_eq!(
+        settings.notification_sound_paths,
+        NotificationSoundPaths::default()
+    );
+    assert_eq!(
+        settings.notification_sound_theme,
+        NotificationSoundTheme::Windows
+    );
     assert_eq!(settings.high_usage_threshold, 70.0);
     assert_eq!(settings.critical_usage_threshold, 90.0);
+    assert!(!settings.show_reset_when_exhausted);
+    assert!(!settings.predictive_pace_warning_enabled);
+    assert!(!settings.float_bar_show_cost);
+    assert!(!settings.tray_panel_always_on_top);
+    assert_eq!(settings.overview_layout, "compact");
+    assert!(settings.promote_tray_icon);
+    assert!(settings.claude_daily_routines_usage_visible);
+    assert!(!settings.claude_allow_reading_claude_code_credentials);
+    assert_eq!(
+        settings.low_power_mode_preference,
+        LowPowerModePreference::Off
+    );
+}
+
+#[test]
+fn overview_layout_defaults_to_compact_and_round_trips() {
+    let defaulted: Settings = serde_json::from_str(r#"{ "enabled_providers": [] }"#)
+        .expect("missing overview layout defaults to compact");
+    assert_eq!(defaulted.overview_layout, "compact");
+
+    let compact = Settings {
+        overview_layout: "compact".to_string(),
+        ..Settings::default()
+    };
+    let json = serde_json::to_string(&compact).expect("serialize overview layout");
+    let loaded: Settings = serde_json::from_str(&json).expect("deserialize overview layout");
+    assert_eq!(loaded.overview_layout, "compact");
+
+    let unknown: Settings =
+        serde_json::from_str(r#"{ "enabled_providers": [], "overview_layout": "unsupported" }"#)
+            .expect("unknown overview layout is accepted and normalized");
+    assert_eq!(unknown.overview_layout, "compact");
+}
+
+#[test]
+fn tray_panel_always_on_top_defaults_off_and_round_trips() {
+    let defaulted: Settings = serde_json::from_str(r#"{ "enabled_providers": [] }"#)
+        .expect("missing tray panel topmost field defaults off");
+    assert!(!defaulted.tray_panel_always_on_top);
+
+    let enabled = Settings {
+        tray_panel_always_on_top: true,
+        ..Settings::default()
+    };
+    let json = serde_json::to_string(&enabled).expect("serialize tray panel topmost setting");
+    assert!(json.contains(r#""tray_panel_always_on_top":true"#));
+
+    let loaded: Settings =
+        serde_json::from_str(&json).expect("deserialize tray panel topmost setting");
+    assert!(loaded.tray_panel_always_on_top);
+}
+
+#[test]
+fn low_power_mode_migrates_legacy_boolean_and_round_trips_preference() {
+    let defaulted: Settings = serde_json::from_str(r#"{ "enabled_providers": [] }"#)
+        .expect("missing low power fields defaults off");
+    assert_eq!(
+        defaulted.low_power_mode_preference,
+        LowPowerModePreference::Off
+    );
+
+    let legacy: Settings =
+        serde_json::from_str(r#"{ "enabled_providers": [], "low_power_mode": true }"#)
+            .expect("legacy low_power_mode migrates");
+    assert_eq!(legacy.low_power_mode_preference, LowPowerModePreference::On);
+
+    let automatic = Settings {
+        low_power_mode_preference: LowPowerModePreference::Automatic,
+        ..Settings::default()
+    };
+    let json = serde_json::to_string(&automatic).expect("serialize low power preference");
+    assert!(json.contains(r#""low_power_mode_preference":"automatic""#));
+    let loaded: Settings = serde_json::from_str(&json).expect("deserialize low power preference");
+    assert_eq!(
+        loaded.low_power_mode_preference,
+        LowPowerModePreference::Automatic
+    );
+}
+
+#[test]
+fn open_codex_usage_logs_default_off_and_round_trip() {
+    let defaulted: Settings = serde_json::from_str(r#"{ "enabled_providers": [] }"#)
+        .expect("missing open_codex_usage_logs_enabled defaults false");
+    assert!(!defaulted.open_codex_usage_logs_enabled);
+
+    let enabled = Settings {
+        open_codex_usage_logs_enabled: true,
+        hide_native_codex_cost_when_open_codex_present: true,
+        ..Settings::default()
+    };
+    let json = serde_json::to_string(&enabled).expect("serialize OpenCodex usage opt-in");
+    assert!(json.contains(r#""open_codex_usage_logs_enabled":true"#));
+
+    let loaded: Settings = serde_json::from_str(&json).expect("deserialize OpenCodex usage opt-in");
+    assert!(loaded.open_codex_usage_logs_enabled);
+    assert!(loaded.hide_native_codex_cost_when_open_codex_present);
+}
+
+#[test]
+fn notification_sound_paths_round_trip_and_default_for_existing_settings() {
+    let settings = Settings {
+        notification_sound_theme: NotificationSoundTheme::CodexBar,
+        notification_sound_paths: NotificationSoundPaths {
+            critical_usage: Some(r"C:\sounds\critical.wav".to_string()),
+            ..NotificationSoundPaths::default()
+        },
+        ..Settings::default()
+    };
+    let json = serde_json::to_string(&settings).expect("serialize notification sound paths");
+    assert!(json.contains("\"criticalUsage\":\"C:\\\\sounds\\\\critical.wav\""));
+
+    let loaded: Settings =
+        serde_json::from_str(&json).expect("deserialize notification sound paths");
+    assert_eq!(
+        loaded.notification_sound_paths,
+        settings.notification_sound_paths
+    );
+    assert_eq!(
+        loaded.notification_sound_theme,
+        NotificationSoundTheme::CodexBar
+    );
+
+    let legacy: Settings = serde_json::from_str(r#"{ "enabled_providers": [] }"#)
+        .expect("deserialize settings without notification sound paths");
+    assert_eq!(
+        legacy.notification_sound_paths,
+        NotificationSoundPaths::default()
+    );
+    assert_eq!(
+        legacy.notification_sound_theme,
+        NotificationSoundTheme::Windows
+    );
+}
+
+#[test]
+fn promote_tray_icon_defaults_on_when_missing_from_disk() {
+    let loaded: Settings = serde_json::from_str(
+        r#"{
+            "enabled_providers": ["claude", "codex"],
+            "refresh_interval_secs": 300
+        }"#,
+    )
+    .expect("parse settings without promote_tray_icon");
+    assert!(loaded.promote_tray_icon);
+}
+
+#[test]
+fn promote_tray_default_migration_flips_old_false_once() {
+    assert!(Settings::should_migrate_promote_tray_default(false, false));
+    assert!(!Settings::should_migrate_promote_tray_default(true, false));
+    assert!(!Settings::should_migrate_promote_tray_default(false, true));
+    assert!(!Settings::should_migrate_promote_tray_default(true, true));
+}
+
+#[test]
+fn new_warning_and_reset_settings_are_backward_compatible() {
+    let loaded: Settings = serde_json::from_str(
+        r#"{
+            "enabled_providers": ["claude", "codex"],
+            "refresh_interval_secs": 300
+        }"#,
+    )
+    .expect("parse legacy settings");
+
+    assert!(!loaded.show_reset_when_exhausted);
+    assert!(!loaded.predictive_pace_warning_enabled);
+}
+
+#[test]
+fn usage_thresholds_inherit_from_window_provider_and_global_levels() {
+    let mut settings = Settings::default();
+    settings.provider_usage_thresholds.insert(
+        "codex".into(),
+        UsageThresholdOverride {
+            high: Some(75.0),
+            critical: None,
+        },
+    );
+    settings.provider_usage_thresholds.insert(
+        "codex:weekly".into(),
+        UsageThresholdOverride {
+            high: None,
+            critical: Some(95.0),
+        },
+    );
+
+    assert_eq!(
+        settings.usage_thresholds(ProviderId::Codex, "weekly"),
+        UsageThresholds {
+            high: 75.0,
+            critical: 95.0,
+        }
+    );
+    assert_eq!(
+        settings.usage_thresholds(ProviderId::Claude, "session"),
+        UsageThresholds {
+            high: 70.0,
+            critical: 90.0,
+        }
+    );
+}
+
+#[test]
+fn empty_and_out_of_range_threshold_overrides_are_normalized_on_load() {
+    let loaded: Settings = serde_json::from_str(
+        r#"{
+            "provider_usage_thresholds": {
+                "codex": {"high": 120.0},
+                "claude": {},
+                "codex:weekly": {"critical": -10.0}
+            }
+        }"#,
+    )
+    .expect("parse settings");
+
+    assert_eq!(loaded.provider_usage_thresholds.len(), 2);
+    assert_eq!(loaded.provider_usage_thresholds["codex"].high, Some(100.0));
+    assert_eq!(
+        loaded.provider_usage_thresholds["codex:weekly"].critical,
+        Some(0.0)
+    );
 }
 
 #[test]
@@ -16,10 +245,70 @@ fn float_bar_defaults_are_safe() {
     let settings = Settings::default();
     assert!(!settings.float_bar_enabled);
     assert_eq!(settings.float_bar_opacity, 80);
+    assert_eq!(settings.float_bar_scale, 100);
     assert_eq!(settings.float_bar_orientation, "horizontal");
+    assert_eq!(settings.float_bar_style, "floating");
     assert!(!settings.float_bar_click_through);
     assert!(settings.float_bar_provider_ids.is_empty());
     assert!(!settings.float_bar_dark_text);
+    assert!(!settings.float_bar_show_reset_inline);
+    assert!(!settings.float_bar_show_cost);
+}
+
+#[test]
+fn main_window_scale_defaults_to_100_percent() {
+    let settings = Settings::default();
+    assert_eq!(settings.window_scale_percent, 100);
+}
+
+#[test]
+fn main_window_scale_clamp_pins_to_supported_range() {
+    assert_eq!(clamp_window_scale_percent(0), 100);
+    assert_eq!(clamp_window_scale_percent(99), 100);
+    assert_eq!(clamp_window_scale_percent(100), 100);
+    assert_eq!(clamp_window_scale_percent(125), 125);
+    assert_eq!(clamp_window_scale_percent(180), 180);
+    assert_eq!(clamp_window_scale_percent(250), 250);
+    assert_eq!(clamp_window_scale_percent(251), 250);
+}
+
+#[test]
+fn raw_settings_clamps_main_window_scale_on_load() {
+    let json = r#"{
+            "enabled_providers": ["claude", "codex"],
+            "refresh_interval_secs": 300,
+            "window_scale_percent": 300
+        }"#;
+    let loaded: Settings = serde_json::from_str(json).expect("parse settings");
+    assert_eq!(loaded.window_scale_percent, 250);
+}
+
+#[test]
+fn tray_scale_defaults_to_100_percent() {
+    let settings = Settings::default();
+    assert_eq!(settings.tray_scale_percent, 100);
+}
+
+#[test]
+fn tray_scale_clamp_pins_to_supported_range() {
+    assert_eq!(clamp_tray_scale_percent(0), 100);
+    assert_eq!(clamp_tray_scale_percent(99), 100);
+    assert_eq!(clamp_tray_scale_percent(100), 100);
+    assert_eq!(clamp_tray_scale_percent(125), 125);
+    assert_eq!(clamp_tray_scale_percent(180), 180);
+    assert_eq!(clamp_tray_scale_percent(200), 200);
+    assert_eq!(clamp_tray_scale_percent(201), 200);
+}
+
+#[test]
+fn raw_settings_clamps_tray_scale_on_load() {
+    let json = r#"{
+            "enabled_providers": ["claude", "codex"],
+            "refresh_interval_secs": 300,
+            "tray_scale_percent": 300
+        }"#;
+    let loaded: Settings = serde_json::from_str(json).expect("parse settings");
+    assert_eq!(loaded.tray_scale_percent, 200);
 }
 
 #[test]
@@ -36,6 +325,15 @@ fn float_bar_opacity_clamp_pins_to_supported_range() {
 }
 
 #[test]
+fn float_bar_scale_clamp_pins_to_supported_range() {
+    assert_eq!(clamp_float_bar_scale(0), 75);
+    assert_eq!(clamp_float_bar_scale(74), 75);
+    assert_eq!(clamp_float_bar_scale(100), 100);
+    assert_eq!(clamp_float_bar_scale(150), 150);
+    assert_eq!(clamp_float_bar_scale(250), 200);
+}
+
+#[test]
 fn float_bar_orientation_normalization_rejects_unknown_values() {
     assert_eq!(normalize_float_bar_orientation("horizontal"), "horizontal");
     assert_eq!(normalize_float_bar_orientation("vertical"), "vertical");
@@ -47,6 +345,15 @@ fn float_bar_orientation_normalization_rejects_unknown_values() {
 }
 
 #[test]
+fn float_bar_style_normalization_rejects_unknown_values() {
+    assert_eq!(normalize_float_bar_style("floating"), "floating");
+    assert_eq!(normalize_float_bar_style("taskbar"), "taskbar");
+    assert_eq!(normalize_float_bar_style(""), "floating");
+    assert_eq!(normalize_float_bar_style("TASKBAR"), "floating");
+    assert_eq!(normalize_float_bar_style("glass"), "floating");
+}
+
+#[test]
 fn float_bar_settings_round_trip_through_raw() {
     // Serialize a Settings with custom float-bar values then deserialize
     // through the `from = "RawSettings"` path — values must survive intact
@@ -54,10 +361,14 @@ fn float_bar_settings_round_trip_through_raw() {
     let s = Settings {
         float_bar_enabled: true,
         float_bar_opacity: 65,
+        float_bar_scale: 140,
         float_bar_orientation: "vertical".to_string(),
+        float_bar_style: "taskbar".to_string(),
         float_bar_click_through: true,
         float_bar_provider_ids: vec!["claude".into(), "codex".into()],
         float_bar_dark_text: true,
+        float_bar_show_reset_inline: true,
+        float_bar_show_cost: true,
         ..Settings::default()
     };
 
@@ -65,10 +376,14 @@ fn float_bar_settings_round_trip_through_raw() {
     let back: Settings = serde_json::from_str(&json).expect("deserialize");
     assert!(back.float_bar_enabled);
     assert_eq!(back.float_bar_opacity, 65);
+    assert_eq!(back.float_bar_scale, 140);
     assert_eq!(back.float_bar_orientation, "vertical");
+    assert_eq!(back.float_bar_style, "taskbar");
     assert!(back.float_bar_click_through);
     assert_eq!(back.float_bar_provider_ids, vec!["claude", "codex"]);
     assert!(back.float_bar_dark_text);
+    assert!(back.float_bar_show_reset_inline);
+    assert!(back.float_bar_show_cost);
 }
 
 #[test]
@@ -81,25 +396,25 @@ fn float_bar_raw_clamps_out_of_range_opacity_on_load() {
             "start_at_login": false,
             "show_notifications": true,
             "sound_enabled": true,
-            "sound_volume": 100,
             "high_usage_threshold": 70.0,
             "critical_usage_threshold": 90.0,
             "merge_tray_icons": false,
             "show_as_used": true,
-            "surprise_animations": false,
             "enable_animations": true,
             "reset_time_relative": true,
             "menu_bar_display_mode": "detailed",
-            "show_credits_extra_usage": true,
-            "show_debug_settings": false,
             "disable_keychain_access": false,
             "hide_personal_info": false,
             "float_bar_opacity": 250,
-            "float_bar_orientation": "diagonal"
+            "float_bar_scale": 250,
+            "float_bar_orientation": "diagonal",
+            "float_bar_style": "glass"
         }"#;
     let loaded: Settings = serde_json::from_str(json).expect("parse");
     assert_eq!(loaded.float_bar_opacity, 100);
+    assert_eq!(loaded.float_bar_scale, 200);
     assert_eq!(loaded.float_bar_orientation, "horizontal");
+    assert_eq!(loaded.float_bar_style, "floating");
 }
 
 #[test]
@@ -108,6 +423,27 @@ fn test_settings_provider_enabled() {
     assert!(settings.is_provider_enabled(ProviderId::Claude));
     assert!(settings.is_provider_enabled(ProviderId::Codex));
     assert!(!settings.is_provider_enabled(ProviderId::Gemini));
+    assert!(!settings.is_provider_enabled(ProviderId::Wayfinder));
+    assert_eq!(
+        settings.gateway_url(ProviderId::Wayfinder),
+        "http://127.0.0.1:8088"
+    );
+}
+
+#[test]
+fn wayfinder_gateway_round_trips_without_changing_settings_paths() {
+    let mut settings = Settings::default();
+    settings.set_gateway_url(
+        ProviderId::Wayfinder,
+        "https://gateway.example.test/wayfinder/",
+    );
+
+    let json = serde_json::to_string(&settings).expect("serialize settings");
+    let loaded: Settings = serde_json::from_str(&json).expect("deserialize settings");
+    assert_eq!(
+        loaded.gateway_url(ProviderId::Wayfinder),
+        "https://gateway.example.test/wayfinder/"
+    );
 }
 
 #[test]
@@ -137,6 +473,42 @@ fn test_settings_get_enabled_provider_ids() {
 }
 
 #[test]
+fn provider_order_dedupes_unknowns_and_appends_canonical_ids() {
+    let order = normalize_provider_order(&[
+        "gemini".to_string(),
+        "not-a-provider".to_string(),
+        "claude".to_string(),
+        "gemini".to_string(),
+    ]);
+
+    assert_eq!(order[0], "gemini");
+    assert_eq!(order[1], "claude");
+    assert!(!order.iter().any(|id| id == "not-a-provider"));
+    assert_eq!(order.len(), ProviderId::all().len());
+}
+
+#[test]
+fn enabled_provider_ids_follow_custom_provider_order() {
+    let settings = Settings {
+        enabled_providers: ["claude", "codex", "gemini"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        provider_order: normalize_provider_order(&[
+            "gemini".to_string(),
+            "claude".to_string(),
+            "codex".to_string(),
+        ]),
+        ..Settings::default()
+    };
+
+    assert_eq!(
+        settings.get_enabled_provider_ids(),
+        vec![ProviderId::Gemini, ProviderId::Claude, ProviderId::Codex]
+    );
+}
+
+#[test]
 fn test_settings_get_all_providers_status() {
     let settings = Settings::default();
     let status = settings.get_all_providers_status();
@@ -158,11 +530,16 @@ fn test_api_key_provider_catalog_includes_token_providers() {
         ProviderId::Bedrock,
         ProviderId::Codebuff,
         ProviderId::DeepSeek,
+        ProviderId::DeepInfra,
+        ProviderId::HuggingFace,
+        ProviderId::AiAnd,
         ProviderId::ElevenLabs,
         ProviderId::Deepgram,
         ProviderId::Grok,
         ProviderId::Groq,
         ProviderId::LLMProxy,
+        ProviderId::Xai,
+        ProviderId::Meta,
     ] {
         assert!(
             providers.iter().any(|provider| provider.id == id),
@@ -210,6 +587,17 @@ fn test_manual_cookies_set_get_remove() {
 }
 
 #[test]
+fn api_key_display_mask_is_utf8_safe() {
+    let mut keys = ApiKeys::default();
+    keys.set("openrouter", "🔑🔒漢字abcdefgh🔐", Some("unicode"));
+
+    let display = keys.get_all_for_display();
+
+    assert_eq!(display.len(), 1);
+    assert_eq!(display[0].masked_key, "🔑🔒漢字...fgh🔐");
+}
+
+#[test]
 fn test_start_at_login_command_uses_only_the_executable_path() {
     let path = std::path::PathBuf::from(r"C:\Program Files\CodexBar\codexbar-desktop-tauri.exe");
     let command = Settings::start_at_login_command(&path);
@@ -221,6 +609,73 @@ fn test_start_at_login_command_uses_only_the_executable_path() {
 }
 
 #[test]
+fn test_start_at_login_prefers_desktop_sibling_when_called_from_cli() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let cli_path = temp.path().join("codexbar-cli.exe");
+    let desktop_path = temp.path().join("codexbar.exe");
+    std::fs::write(&cli_path, b"cli").expect("write cli");
+    std::fs::write(&desktop_path, b"desktop").expect("write desktop");
+
+    let command = Settings::start_at_login_command(&cli_path);
+
+    assert_eq!(command, format!("\"{}\"", desktop_path.display()));
+}
+
+#[test]
+fn test_start_at_login_keeps_current_exe_when_desktop_sibling_missing() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let cli_path = temp.path().join("codexbar-cli.exe");
+    std::fs::write(&cli_path, b"cli").expect("write cli");
+
+    let command = Settings::start_at_login_command(&cli_path);
+
+    assert_eq!(command, format!("\"{}\"", cli_path.display()));
+}
+
+#[test]
+fn test_start_at_login_repairs_stale_cli_command_after_update() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let cli_path = temp.path().join("codexbar-cli.exe");
+    let desktop_path = temp.path().join("codexbar.exe");
+    std::fs::write(&cli_path, b"cli").expect("write cli");
+    std::fs::write(&desktop_path, b"desktop").expect("write desktop");
+    let stale_command = format!("\"{}\"", cli_path.display());
+
+    assert!(Settings::start_at_login_command_needs_repair(
+        &stale_command,
+        &desktop_path
+    ));
+}
+
+#[test]
+fn test_start_at_login_keeps_current_desktop_command_after_update() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let desktop_path = temp.path().join("codexbar.exe");
+    std::fs::write(&desktop_path, b"desktop").expect("write desktop");
+    let current_command = format!("\"{}\"", desktop_path.display());
+
+    assert!(!Settings::start_at_login_command_needs_repair(
+        &current_command,
+        &desktop_path
+    ));
+}
+
+#[test]
+fn test_start_at_login_repairs_legacy_desktop_command_after_update() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let desktop_path = temp.path().join("codexbar.exe");
+    let legacy_desktop_path = temp.path().join("codexbar-desktop.exe");
+    std::fs::write(&desktop_path, b"desktop").expect("write desktop");
+    std::fs::write(&legacy_desktop_path, b"legacy desktop").expect("write legacy desktop");
+    let stale_command = format!("\"{}\"", legacy_desktop_path.display());
+
+    assert!(Settings::start_at_login_command_needs_repair(
+        &stale_command,
+        &legacy_desktop_path
+    ));
+}
+
+#[test]
 fn test_language_defaults_to_english() {
     let settings = Settings::default();
     assert_eq!(settings.ui_language, Language::English);
@@ -229,15 +684,40 @@ fn test_language_defaults_to_english() {
 #[test]
 fn test_language_all_variants_available() {
     let languages = Language::all();
-    assert_eq!(languages.len(), 2);
+    assert_eq!(languages.len(), 8);
     assert!(languages.contains(&Language::English));
     assert!(languages.contains(&Language::Chinese));
+    assert!(languages.contains(&Language::ChineseTraditional));
+    assert!(languages.contains(&Language::Japanese));
+    assert!(languages.contains(&Language::Korean));
+    assert!(languages.contains(&Language::Spanish));
+    assert!(languages.contains(&Language::Russian));
+    assert!(languages.contains(&Language::Turkish));
 }
 
 #[test]
 fn test_language_display_names() {
     assert_eq!(Language::English.display_name(), "English");
     assert_eq!(Language::Chinese.display_name(), "中文");
+    assert_eq!(Language::ChineseTraditional.display_name(), "繁體中文");
+    assert_eq!(Language::Japanese.display_name(), "日本語");
+    assert_eq!(Language::Russian.display_name(), "Русский");
+    assert_eq!(Language::Turkish.display_name(), "Türkçe");
+}
+
+#[test]
+fn test_language_resolves_russian_aliases() {
+    assert_eq!(Language::resolve("russian"), Some(Language::Russian));
+    assert_eq!(Language::resolve("ru-RU"), Some(Language::Russian));
+    assert_eq!(Language::resolve("Русский"), Some(Language::Russian));
+}
+
+#[test]
+fn test_language_resolves_turkish_aliases() {
+    assert_eq!(Language::resolve("turkish"), Some(Language::Turkish));
+    assert_eq!(Language::resolve("tr-TR"), Some(Language::Turkish));
+    assert_eq!(Language::resolve("Türkçe"), Some(Language::Turkish));
+    assert_eq!(Language::resolve("turkce"), Some(Language::Turkish));
 }
 
 #[test]
@@ -296,12 +776,15 @@ fn test_language_serde_serialization() {
     // Test that Language serializes to lowercase string
     let english = Language::English;
     let chinese = Language::Chinese;
+    let chinese_traditional = Language::ChineseTraditional;
 
     let english_json = serde_json::to_string(&english).unwrap();
     let chinese_json = serde_json::to_string(&chinese).unwrap();
+    let chinese_traditional_json = serde_json::to_string(&chinese_traditional).unwrap();
 
     assert_eq!(english_json, "\"english\"");
     assert_eq!(chinese_json, "\"chinese\"");
+    assert_eq!(chinese_traditional_json, "\"chinesetraditional\"");
 }
 
 #[test]
@@ -309,9 +792,31 @@ fn test_language_serde_deserialization() {
     // Test that lowercase strings deserialize correctly
     let english: Language = serde_json::from_str("\"english\"").unwrap();
     let chinese: Language = serde_json::from_str("\"chinese\"").unwrap();
+    let chinese_traditional: Language = serde_json::from_str("\"chinesetraditional\"").unwrap();
 
     assert_eq!(english, Language::English);
     assert_eq!(chinese, Language::Chinese);
+    assert_eq!(chinese_traditional, Language::ChineseTraditional);
+}
+
+#[test]
+fn test_language_resolves_traditional_chinese_aliases() {
+    assert_eq!(
+        Language::resolve("chinesetraditional"),
+        Some(Language::ChineseTraditional)
+    );
+    assert_eq!(
+        Language::resolve("zh-tw"),
+        Some(Language::ChineseTraditional)
+    );
+    assert_eq!(
+        Language::resolve("zh-hant-tw"),
+        Some(Language::ChineseTraditional)
+    );
+    assert_eq!(
+        Language::resolve("繁體中文"),
+        Some(Language::ChineseTraditional)
+    );
 }
 
 #[test]
@@ -472,6 +977,10 @@ fn test_provider_configs_roundtrip() {
     settings.set_openai_web_extras(ProviderId::Codex, false);
     settings.set_historical_tracking(ProviderId::Codex, true);
     settings.set_avoid_keychain_prompts(ProviderId::Claude, true);
+    settings.set_auto_resume_after_quota_reset(ProviderId::Codex, true);
+    settings
+        .set_seat_credit_entitlement(ProviderId::Copilot, Some(300.0))
+        .expect("valid seat credit entitlement");
 
     let json = serde_json::to_string(&settings).unwrap();
     // The legacy flat fields must NOT appear in serialized output.
@@ -499,6 +1008,11 @@ fn test_provider_configs_roundtrip() {
     assert!(!loaded.openai_web_extras(ProviderId::Codex));
     assert!(loaded.historical_tracking(ProviderId::Codex));
     assert!(loaded.avoid_keychain_prompts(ProviderId::Claude));
+    assert!(loaded.auto_resume_after_quota_reset(ProviderId::Codex));
+    assert_eq!(
+        loaded.seat_credit_entitlement(ProviderId::Copilot),
+        Some(300.0)
+    );
     assert_eq!(
         loaded.provider_configs.get(&ProviderId::Codex),
         settings.provider_configs.get(&ProviderId::Codex)
@@ -555,4 +1069,124 @@ fn test_per_provider_defaults_applied() {
     assert!(settings.openai_web_extras(ProviderId::Codex));
     assert!(!settings.historical_tracking(ProviderId::Codex));
     assert!(!settings.avoid_keychain_prompts(ProviderId::Claude));
+    assert!(!settings.auto_resume_after_quota_reset(ProviderId::Codex));
+    assert!(!settings.auto_resume_after_quota_reset(ProviderId::Claude));
+}
+
+#[test]
+fn codex_spark_usage_visibility_defaults_to_visible_and_roundtrips() {
+    let mut settings = Settings::default();
+    assert!(settings.codex_spark_usage_visible());
+
+    settings.set_codex_spark_usage_visible(false);
+    let serialized = serde_json::to_string(&settings).unwrap();
+    let loaded: Settings = serde_json::from_str(&serialized).unwrap();
+
+    assert!(!loaded.codex_spark_usage_visible());
+}
+
+#[test]
+fn migrate_legacy_visibility_flags_materializes_hidden_usage_item_ids() {
+    let mut settings = Settings::default();
+    settings.set_spark_usage_visible(ProviderId::Codex, false);
+    settings.claude_daily_routines_usage_visible = false;
+
+    settings.migrate_legacy_usage_item_flags();
+
+    assert_eq!(
+        settings.hidden_usage_item_ids(ProviderId::Codex),
+        CODEX_SPARK_USAGE_ITEM_IDS
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        settings.hidden_usage_item_ids(ProviderId::Claude),
+        vec![CLAUDE_DAILY_ROUTINES_USAGE_ITEM_ID.to_string()]
+    );
+}
+
+#[test]
+fn generic_claude_visibility_writes_only_the_usage_item_list() {
+    let mut settings = Settings::default();
+
+    settings.set_hidden_usage_item_ids(
+        ProviderId::Claude,
+        vec![CLAUDE_DAILY_ROUTINES_USAGE_ITEM_ID.to_string()],
+    );
+
+    assert!(settings.claude_daily_routines_usage_visible);
+    assert_eq!(
+        settings.hidden_usage_item_ids(ProviderId::Claude),
+        vec![CLAUDE_DAILY_ROUTINES_USAGE_ITEM_ID.to_string()]
+    );
+
+    settings.set_hidden_usage_item_ids(ProviderId::Claude, Vec::new());
+
+    assert!(settings.claude_daily_routines_usage_visible);
+    assert!(
+        settings
+            .hidden_usage_item_ids(ProviderId::Claude)
+            .is_empty()
+    );
+}
+
+#[test]
+fn explicit_hidden_usage_item_ids_roundtrip_and_restore_defaults() {
+    let mut settings = Settings::default();
+    settings.set_hidden_usage_item_ids(
+        ProviderId::Codex,
+        vec![
+            "metric:secondary".to_string(),
+            "metric:secondary".to_string(),
+            "not-a-metric".to_string(),
+        ],
+    );
+
+    assert_eq!(
+        settings.hidden_usage_item_ids(ProviderId::Codex),
+        vec!["metric:secondary".to_string()]
+    );
+    assert!(settings.codex_spark_usage_visible());
+
+    let serialized = serde_json::to_string(&settings).unwrap();
+    let loaded: Settings = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(
+        loaded.hidden_usage_item_ids(ProviderId::Codex),
+        vec!["metric:secondary".to_string()]
+    );
+
+    settings.set_hidden_usage_item_ids(ProviderId::Codex, Vec::new());
+    settings.set_hidden_usage_item_ids(ProviderId::Claude, Vec::new());
+    assert!(settings.hidden_usage_item_ids(ProviderId::Codex).is_empty());
+    assert!(settings.codex_spark_usage_visible());
+}
+
+#[test]
+fn legacy_visibility_setters_preserve_other_explicit_hidden_items() {
+    let mut settings = Settings::default();
+    settings.set_hidden_usage_item_ids(ProviderId::Claude, vec!["metric:secondary".to_string()]);
+
+    settings.toggle_hidden_items(
+        ProviderId::Claude,
+        &[CLAUDE_DAILY_ROUTINES_USAGE_ITEM_ID],
+        false,
+    );
+    assert_eq!(
+        settings.hidden_usage_item_ids(ProviderId::Claude),
+        vec![
+            "metric:extra-claude-routines".to_string(),
+            "metric:secondary".to_string(),
+        ]
+    );
+
+    settings.toggle_hidden_items(
+        ProviderId::Claude,
+        &[CLAUDE_DAILY_ROUTINES_USAGE_ITEM_ID],
+        true,
+    );
+    assert_eq!(
+        settings.hidden_usage_item_ids(ProviderId::Claude),
+        vec!["metric:secondary".to_string()]
+    );
 }

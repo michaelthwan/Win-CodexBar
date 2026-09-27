@@ -2,16 +2,26 @@
 //!
 //! Uses OAuth tokens stored by the Codex CLI in ~/.codex/auth.json
 
-use crate::core::{CostSnapshot, NamedRateWindow, ProviderError, RateWindow, UsageSnapshot};
+use super::{pat, weekly_reset};
+use crate::core::{
+    CostSnapshot, NamedRateWindow, ProviderError, RateWindow, RateWindowCadence, UsageSnapshot,
+};
+use crate::providers::openai::OpenAISubscriptionFetchResult;
+use base64::Engine;
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
+#[path = "subscription.rs"]
+mod subscription;
+
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const USAGE_PATH: &str = "/wham/usage";
+const RESET_CREDITS_PATH: &str = "/wham/rate-limit-reset-credits";
 const CREDENTIAL_CACHE_TTL: Duration = Duration::from_secs(5);
+const EXTERNAL_OAUTH_REFRESH_WINDOW: chrono::TimeDelta = chrono::Duration::minutes(5);
 
 static CREDENTIAL_CACHE: OnceLock<Mutex<Option<CachedCodexCredentials>>> = OnceLock::new();
 
@@ -19,12 +29,14 @@ static CREDENTIAL_CACHE: OnceLock<Mutex<Option<CachedCodexCredentials>>> = OnceL
 pub struct CodexApi {
     client: reqwest::Client,
     home_dir: PathBuf,
+    /// When set, overrides CODEX_HOME / ~/.codex for auth.json + config.toml (tests).
+    codex_home_override: Option<PathBuf>,
 }
 
 impl CodexApi {
     pub fn new() -> Self {
         // Build client with proper TLS settings
-        let client = reqwest::Client::builder()
+        let client = crate::core::credentialed_http_client_builder()
             .use_rustls_tls()
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -33,22 +45,210 @@ impl CodexApi {
         Self {
             client,
             home_dir: dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
+            codex_home_override: None,
         }
     }
 
-    /// Fetch usage information from Codex API
-    /// Returns (UsageSnapshot, optional CostSnapshot)
+    /// Point the client at a specific Codex home directory (contains auth.json / config.toml).
+    pub fn with_codex_home(mut self, codex_home: impl Into<PathBuf>) -> Self {
+        self.codex_home_override = Some(codex_home.into());
+        self
+    }
+
+    fn codex_dir(&self) -> PathBuf {
+        if let Some(override_dir) = &self.codex_home_override {
+            return override_dir.clone();
+        }
+        if let Ok(codex_home) = std::env::var("CODEX_HOME") {
+            let trimmed = codex_home.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed);
+            }
+        }
+        self.home_dir.join(".codex")
+    }
+
+    pub(super) fn has_pat_credentials(&self) -> bool {
+        pat::load_token(&self.get_auth_path()).is_ok()
+    }
+
+    pub(super) async fn fetch_usage_pat(
+        &self,
+        cli_version: Option<&str>,
+    ) -> Result<(UsageSnapshot, Option<CostSnapshot>, Option<String>), ProviderError> {
+        let token = pat::load_token(&self.get_auth_path())?;
+        let (json, whoami) =
+            pat::fetch_usage(&self.client, &self.resolve_base_url(), &token, cli_version).await?;
+        let account_id = whoami.account_id.clone();
+        // Email is display metadata, not a stable credential/account binding.
+        // A PAT without the provider's account id must fail closed for any
+        // operation that could reopen a local session.
+        let account_identity = account_id.clone();
+        let (mut usage, cost) = self.build_result_from_json(&json)?;
+        if let Some(email) = whoami.email {
+            usage = usage.with_email(email);
+        }
+        if usage.login_method.is_none()
+            && let Some(plan_type) = whoami.plan_type
+        {
+            usage = usage.with_login_method(format_plan_type(&plan_type));
+        }
+        let usage = self
+            .enrich_subscription_metadata(
+                &self.resolve_base_url(),
+                &token,
+                account_id.as_deref(),
+                usage,
+            )
+            .await;
+        Ok((usage, cost, account_identity))
+    }
+
+    /// Fetch usage information from Codex API.
+    ///
+    /// v0.55.1 weekly-reset publication is account-scoped and persistent: a
+    /// suspicious early drop to <=1% is confirmed before it can replace the
+    /// last published weekly window, and reset-credit inventory is evidence
+    /// only. The app never redeems or decrements credits on observation.
     pub async fn fetch_usage(
         &self,
-    ) -> Result<(UsageSnapshot, Option<CostSnapshot>), ProviderError> {
-        // Load credentials
+    ) -> Result<(UsageSnapshot, Option<CostSnapshot>, Option<String>), ProviderError> {
         let creds = self.load_credentials()?;
-
-        // Build request URL
         let base_url = self.resolve_base_url();
-        let url = format!("{}{}", base_url, USAGE_PATH);
+        let auth_path = self.get_auth_path();
+        let scope = weekly_reset::scope_key(creds.account_id.as_deref(), &auth_path);
+        let exact_oauth = creds.is_external_oauth;
+        let mut state = weekly_reset::load(&scope);
 
-        // Build request
+        let (first_usage, first_cost, first_credits) =
+            self.fetch_usage_once(&creds, &base_url).await?;
+        let observed_at = Utc::now();
+        let first_inventory = weekly_reset::inventory(first_credits.as_ref(), observed_at);
+        let (usage, cost) = match weekly_reset::initial_decision(
+            &mut state,
+            &first_usage,
+            first_inventory.as_ref(),
+            exact_oauth,
+            observed_at,
+        ) {
+            weekly_reset::InitialDecision::Publish => {
+                weekly_reset::commit_publication(&mut state, &first_usage, first_inventory);
+                weekly_reset::save(&scope, &state);
+                (first_usage, first_cost)
+            }
+            weekly_reset::InitialDecision::Preserve => {
+                let usage = weekly_reset::preserve_weekly(&state, first_usage);
+                weekly_reset::save(&scope, &state);
+                (usage, first_cost)
+            }
+            weekly_reset::InitialDecision::RequiresConfirmation => {
+                let confirmation = self.fetch_usage_once(&creds, &base_url).await;
+                let (confirmation_usage, confirmation_cost, confirmation_credits) =
+                    match confirmation {
+                        Ok(value) => value,
+                        Err(error) => {
+                            tracing::debug!(
+                                %error,
+                                "Codex weekly reset confirmation failed; preserving first successful usage"
+                            );
+                            let result = Self::preserve_after_confirmation_failure(
+                                &state,
+                                first_usage,
+                                first_cost,
+                            );
+                            weekly_reset::save(&scope, &state);
+                            let (usage, cost) = result;
+                            let usage = self
+                                .enrich_subscription_metadata(
+                                    &base_url,
+                                    &creds.access_token,
+                                    creds.account_id.as_deref(),
+                                    usage,
+                                )
+                                .await;
+                            return Ok((usage, cost, creds.account_id.clone()));
+                        }
+                    };
+                let confirmation_inventory =
+                    weekly_reset::inventory(confirmation_credits.as_ref(), Utc::now());
+                match weekly_reset::confirmation_decision(
+                    &mut state,
+                    &first_usage,
+                    first_inventory.as_ref(),
+                    &confirmation_usage,
+                    confirmation_inventory.as_ref(),
+                    exact_oauth,
+                    observed_at,
+                ) {
+                    weekly_reset::ConfirmationDecision::Publish => {
+                        weekly_reset::commit_publication(
+                            &mut state,
+                            &confirmation_usage,
+                            confirmation_inventory,
+                        );
+                        weekly_reset::save(&scope, &state);
+                        (confirmation_usage, confirmation_cost)
+                    }
+                    weekly_reset::ConfirmationDecision::Preserve => {
+                        let usage = weekly_reset::preserve_weekly(&state, first_usage);
+                        weekly_reset::save(&scope, &state);
+                        (usage, first_cost)
+                    }
+                }
+            }
+        };
+        let usage = self
+            .enrich_subscription_metadata(
+                &base_url,
+                &creds.access_token,
+                creds.account_id.as_deref(),
+                usage,
+            )
+            .await;
+        Ok((usage, cost, creds.account_id.clone()))
+    }
+
+    /// Subscription metadata is optional enrichment. Usage remains usable when
+    /// the endpoint is unavailable, malformed, unauthorized, or points at a
+    /// custom backend. A successful empty cancellation response is the only
+    /// result allowed to clear dates on the fresh snapshot.
+    async fn enrich_subscription_metadata(
+        &self,
+        base_url: &str,
+        access_token: &str,
+        account_id: Option<&str>,
+        usage: UsageSnapshot,
+    ) -> UsageSnapshot {
+        subscription::enrich_subscription_metadata(self, base_url, access_token, account_id, usage)
+            .await
+    }
+
+    async fn fetch_subscription_metadata(
+        &self,
+        base_url: &str,
+        access_token: &str,
+        account_id: Option<&str>,
+    ) -> OpenAISubscriptionFetchResult {
+        subscription::fetch_subscription_metadata(self, base_url, access_token, account_id).await
+    }
+
+    fn preserve_after_confirmation_failure(
+        state: &weekly_reset::AccountState,
+        first_usage: UsageSnapshot,
+        first_cost: Option<CostSnapshot>,
+    ) -> (UsageSnapshot, Option<CostSnapshot>) {
+        (
+            weekly_reset::preserve_weekly(state, first_usage),
+            first_cost,
+        )
+    }
+
+    async fn fetch_usage_once(
+        &self,
+        creds: &CodexCredentials,
+        base_url: &str,
+    ) -> Result<(UsageSnapshot, Option<CostSnapshot>, Option<ResetCredits>), ProviderError> {
+        let url = format!("{}{}", base_url, USAGE_PATH);
         let mut request = self
             .client
             .get(&url)
@@ -56,39 +256,70 @@ impl CodexApi {
             .header("User-Agent", "CodexBar")
             .header("Accept", "application/json")
             .timeout(std::time::Duration::from_secs(30));
-
         if let Some(account_id) = &creds.account_id
             && !account_id.is_empty()
         {
             request = request.header("ChatGPT-Account-Id", account_id);
         }
-
         let response = request.send().await?;
-
-        if response.status() == 401 || response.status() == 403 {
-            return Err(ProviderError::AuthRequired);
-        }
-
         if !response.status().is_success() {
-            return Err(ProviderError::Other(format!(
-                "Codex API returned {}",
-                response.status()
-            )));
+            return Err(super::authenticated_http_error(response, "Codex API").await);
         }
-
-        // Parse as raw JSON first for flexibility
         let json: serde_json::Value = response
             .json()
             .await
             .map_err(|e| ProviderError::Parse(e.to_string()))?;
+        let (mut usage, cost) = self.build_result_from_json(&json)?;
+        let reset_credits = self
+            .fetch_rate_limit_reset_credits(creds, base_url)
+            .await
+            .ok();
+        if let Some(reset_credits) = reset_credits.as_ref()
+            && reset_credits.available_count > 0
+        {
+            let window = reset_credits_rate_window(reset_credits, Utc::now());
+            usage = usage.with_extra_rate_window("reset-credits", "Reset credits", window);
+        }
+        Ok((usage, cost, reset_credits))
+    }
 
-        self.build_result_from_json(&json)
+    async fn fetch_rate_limit_reset_credits(
+        &self,
+        creds: &CodexCredentials,
+        base_url: &str,
+    ) -> Result<ResetCredits, ProviderError> {
+        let mut request = self
+            .client
+            .get(format!("{}{}", base_url, RESET_CREDITS_PATH))
+            .header("Authorization", format!("Bearer {}", creds.access_token))
+            .header("User-Agent", "CodexBar")
+            .header("Accept", "application/json");
+        if let Some(account_id) = &creds.account_id
+            && !account_id.is_empty()
+        {
+            request = request.header("ChatGPT-Account-Id", account_id);
+        }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            return Err(super::authenticated_http_error(response, "Codex reset credits").await);
+        }
+        decode_reset_credits(&response.bytes().await?)
     }
 
     fn load_credentials(&self) -> Result<CodexCredentials, ProviderError> {
         let auth_path = self.get_auth_path();
 
         if !auth_path.exists() {
+            // Upstream 0.50.0 #2679: when the CLI targets Amazon Bedrock or
+            // another custom backend without ChatGPT auth, sign-in guidance
+            // is wrong — rate limits simply are not available there.
+            if self.uses_custom_backend() {
+                return Err(ProviderError::NotInstalled(
+                    "Codex uses a custom backend (chatgpt_base_url / model_provider) without \
+                     ChatGPT auth. ChatGPT rate limits are unavailable for this setup."
+                        .to_string(),
+                ));
+            }
             return Err(ProviderError::NotInstalled(
                 "Codex auth.json not found. Run `codex login` in a terminal to sign in."
                     .to_string(),
@@ -99,6 +330,7 @@ impl CodexApi {
             .ok()
             .and_then(|metadata| metadata.modified().ok());
         if let Some(cached) = Self::cached_credentials(&auth_path, modified) {
+            Self::enforce_external_oauth_gate(&cached)?;
             return Ok(cached);
         }
 
@@ -107,6 +339,7 @@ impl CodexApi {
         })?;
 
         let credentials = Self::parse_credentials_json(&content)?;
+        Self::enforce_external_oauth_gate(&credentials)?;
         Self::store_cached_credentials(auth_path, modified, credentials.clone());
         Ok(credentials)
     }
@@ -122,11 +355,14 @@ impl CodexApi {
                 return Ok(CodexCredentials {
                     access_token: trimmed.to_string(),
                     account_id: None,
+                    is_external_oauth: false,
+                    access_token_expires_at: None,
+                    last_refresh: None,
                 });
             }
         }
 
-        // Otherwise, look for tokens object
+        // Otherwise, look for tokens object (external OAuth source)
         let tokens = json.get("tokens").ok_or_else(|| {
             ProviderError::Parse("Codex auth.json exists but contains no tokens.".to_string())
         })?;
@@ -146,10 +382,62 @@ impl CodexApi {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
 
+        // Upstream 0.50.1 #2944: an OAuth token set with a refresh_token is an
+        // external (CLI-owned) OAuth source. The `last_refresh` timestamp is
+        // retained only as provenance for the opt-in safety gate.
+        let has_refresh_token = tokens
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty());
+        let last_refresh = json
+            .get("last_refresh")
+            .and_then(|v| v.as_str())
+            .and_then(parse_timestamp);
+
+        let access_token_expires_at = parse_access_token_expiry(&access_token);
+
         Ok(CodexCredentials {
             access_token,
             account_id,
+            is_external_oauth: has_refresh_token,
+            access_token_expires_at,
+            last_refresh,
         })
+    }
+
+    /// Upstream 0.50.1 #2944: when `codex_external_oauth_sources_allowed` is
+    /// OFF (the default), external OAuth credential files without refresh
+    /// provenance fail closed instead of being used silently. An external
+    /// OAuth source is an auth.json `tokens` object with a `refresh_token`
+    /// (CLI-owned OAuth, not an API key). Win-CodexBar never refreshes or
+    /// writes this source: the gate only decides whether the read-only usage
+    /// request may use it. When the access token is a JWT, its native expiry
+    /// is the validity authority; opaque tokens are sent to the server.
+    fn enforce_external_oauth_gate(credentials: &CodexCredentials) -> Result<(), ProviderError> {
+        Self::enforce_external_oauth_gate_at(
+            credentials,
+            crate::settings::Settings::load().codex_external_oauth_sources_allowed,
+            Utc::now(),
+        )
+    }
+
+    fn enforce_external_oauth_gate_at(
+        credentials: &CodexCredentials,
+        external_sources_allowed: bool,
+        now: DateTime<Utc>,
+    ) -> Result<(), ProviderError> {
+        if !credentials.is_external_oauth {
+            return Ok(());
+        }
+        if !external_sources_allowed && credentials.last_refresh.is_none() {
+            return Err(ProviderError::AuthRequired);
+        }
+        if let Some(expires_at) = credentials.access_token_expires_at
+            && expires_at - now <= EXTERNAL_OAUTH_REFRESH_WINDOW
+        {
+            return Err(ProviderError::AuthRequired);
+        }
+        Ok(())
     }
 
     fn credential_cache() -> &'static Mutex<Option<CachedCodexCredentials>> {
@@ -187,29 +475,11 @@ impl CodexApi {
     }
 
     fn get_auth_path(&self) -> PathBuf {
-        // Check CODEX_HOME env var
-        if let Ok(codex_home) = std::env::var("CODEX_HOME") {
-            let trimmed = codex_home.trim();
-            if !trimmed.is_empty() {
-                return PathBuf::from(trimmed).join("auth.json");
-            }
-        }
-
-        self.home_dir.join(".codex").join("auth.json")
+        self.codex_dir().join("auth.json")
     }
 
     fn resolve_base_url(&self) -> String {
-        // Check CODEX_HOME for config.toml
-        let config_path = if let Ok(codex_home) = std::env::var("CODEX_HOME") {
-            let trimmed = codex_home.trim();
-            if !trimmed.is_empty() {
-                PathBuf::from(trimmed).join("config.toml")
-            } else {
-                self.home_dir.join(".codex").join("config.toml")
-            }
-        } else {
-            self.home_dir.join(".codex").join("config.toml")
-        };
+        let config_path = self.codex_dir().join("config.toml");
 
         if let Ok(content) = std::fs::read_to_string(&config_path)
             && let Some(base_url) = parse_chatgpt_base_url(&content)
@@ -231,6 +501,15 @@ impl CodexApi {
         DEFAULT_BASE_URL.to_string()
     }
 
+    /// Whether config.toml points the CLI at a backend that does not
+    /// authenticate against ChatGPT (Bedrock / other custom providers).
+    fn uses_custom_backend(&self) -> bool {
+        let Ok(content) = std::fs::read_to_string(self.codex_dir().join("config.toml")) else {
+            return false;
+        };
+        parse_chatgpt_base_url(&content).is_some() || config_uses_non_chatgpt_provider(&content)
+    }
+
     fn build_result_from_json(
         &self,
         json: &serde_json::Value,
@@ -242,37 +521,27 @@ impl CodexApi {
             .map(|s| s.to_string());
 
         // Extract rate limit info - handle multiple possible structures
-        let (primary, secondary, code_review) = self.extract_rate_limits(json);
+        let (primary, secondary, monthly, code_review, code_review_verified) =
+            self.extract_rate_limits(json);
 
         // Build login method string
-        let login_method = plan_type.as_ref().map(|pt| match pt.as_str() {
-            "guest" => "Guest".to_string(),
-            "free" => "ChatGPT Free".to_string(),
-            "go" => "Codex Go".to_string(),
-            "plus" => "ChatGPT Plus".to_string(),
-            "pro" | "pro_lite" | "prolite" | "pro-lite" => {
-                if pt == "pro" {
-                    "ChatGPT Pro".to_string()
-                } else {
-                    "Pro Lite".to_string()
-                }
-            }
-            "team" => "ChatGPT Team".to_string(),
-            "business" => "ChatGPT Business".to_string(),
-            "enterprise" => "ChatGPT Enterprise".to_string(),
-            "education" | "edu" => "ChatGPT Education".to_string(),
-            "free_workspace" | "freeWorkspace" => "Free Workspace".to_string(),
-            "quorum" => "Codex Quorum".to_string(),
-            "k12" => "Codex K12".to_string(),
-            other => format!("ChatGPT {}", capitalize(other)),
-        });
+        let login_method = plan_type.as_deref().map(format_plan_type);
 
         let mut usage = UsageSnapshot::new(primary);
         if let Some(sec) = secondary {
             usage = usage.with_secondary(sec);
         }
+        // F5 (upstream 0.48.0): monthly (30-day) windows go to tertiary so the
+        // bridge and frontend can show a monthly reset instead of swallowing it.
+        if let Some(mo) = monthly {
+            usage = usage.with_tertiary(mo);
+        }
         if let Some(cr) = code_review {
-            usage = usage.with_model_specific(cr);
+            usage = if code_review_verified {
+                usage.with_code_review(cr)
+            } else {
+                usage.with_model_specific(cr)
+            };
         }
         for extra in self.extract_additional_rate_limits(json) {
             usage.extra_rate_windows.push(extra);
@@ -287,77 +556,111 @@ impl CodexApi {
         Ok((usage, cost))
     }
 
+    #[cfg(test)]
+    pub(crate) fn build_result_from_json_for_test(
+        &self,
+        json: &serde_json::Value,
+    ) -> Result<(UsageSnapshot, Option<CostSnapshot>), ProviderError> {
+        self.build_result_from_json(json)
+    }
+
     fn extract_rate_limits(
         &self,
         json: &serde_json::Value,
-    ) -> (RateWindow, Option<RateWindow>, Option<RateWindow>) {
+    ) -> (
+        RateWindow,
+        Option<RateWindow>,
+        Option<RateWindow>,
+        Option<RateWindow>,
+        bool,
+    ) {
         // Try rate_limit object
         if let Some(rate_limit) = json.get("rate_limit") {
             let primary_opt = rate_limit
                 .get("primary_window")
-                .map(|w| self.parse_window(w));
+                .and_then(|w| self.parse_window_if_present(w));
 
             let secondary_opt = rate_limit
                 .get("secondary_window")
-                .map(|w| self.parse_window(w));
+                .and_then(|w| self.parse_window_if_present(w));
 
             let code_review = rate_limit
                 .get("code_review_window")
-                .map(|w| self.parse_window(w));
+                .and_then(|w| self.parse_window_if_present(w));
 
-            // If primary is missing, promote secondary to primary (weekly-only plans)
-            let (primary, secondary) = match (primary_opt, secondary_opt) {
-                (Some(p), s) => (p, s),
-                (None, Some(s)) => (s, None),
-                (None, None) => (RateWindow::new(0.0), None),
-            };
+            let (primary, secondary) = normalize_named_windows(primary_opt, secondary_opt);
 
-            return (primary, secondary, code_review);
+            // F5 (upstream 0.48.0): named windows carry only session/weekly/code_review.
+            // Monthly is extracted separately (from array windows) — return None here.
+            let code_review_verified = code_review.is_some();
+            return (primary, secondary, None, code_review, code_review_verified);
         }
 
         // Try rate_limits array
-        if let Some(rate_limits) = json.get("rate_limits").and_then(|v| v.as_array())
-            && let Some(first) = rate_limits.first()
-        {
-            let primary = self.parse_window(first);
-            let secondary = rate_limits.get(1).map(|w| self.parse_window(w));
-            let code_review = rate_limits.get(2).map(|w| self.parse_window(w));
-            return (primary, secondary, code_review);
+        if let Some(rate_limits) = json.get("rate_limits").and_then(|v| v.as_array()) {
+            let windows = rate_limits
+                .iter()
+                .filter_map(|window| self.parse_window_if_present(window))
+                .collect::<Vec<_>>();
+            let (primary, secondary, monthly, code_review) = normalize_array_windows(windows);
+            // F5 (upstream 0.48.0): route monthly to its own tertiary lane.
+            let mut usage = UsageSnapshot::new(primary);
+            if let Some(sec) = secondary {
+                usage = usage.with_secondary(sec);
+            }
+            if let Some(mo) = monthly {
+                usage = usage.with_tertiary(mo);
+            }
+            if let Some(cr) = code_review {
+                usage = usage.with_model_specific(cr);
+            }
+            return (
+                usage.primary,
+                usage.secondary,
+                usage.tertiary,
+                usage.model_specific,
+                false,
+            );
         }
 
         // Try direct fields
         let used_percent = json
             .get("used_percent")
             .or_else(|| json.get("usage_percent"))
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
+            .and_then(json_f64);
+        let primary = RateWindow::new(used_percent.unwrap_or(0.0))
+            .with_usage_known(valid_used_percent(used_percent));
 
-        (RateWindow::new(used_percent), None, None)
+        (primary, None, None, None, false)
     }
 
     fn parse_window(&self, window: &serde_json::Value) -> RateWindow {
         let used_percent = window
             .get("used_percent")
             .or_else(|| window.get("usage_percent"))
-            .and_then(json_f64)
-            .unwrap_or(0.0);
+            .and_then(json_f64);
 
         let window_minutes = window
             .get("limit_window_seconds")
-            .and_then(|v| v.as_i64())
-            .map(|s| (s / 60) as u32);
+            .and_then(json_i64)
+            .and_then(|seconds| u32::try_from(seconds / 60).ok());
 
         let reset_at = window
             .get("reset_at")
-            .and_then(|v| v.as_i64())
+            .and_then(json_i64)
             .and_then(|ts| Utc.timestamp_opt(ts, 0).single());
 
         RateWindow::with_details(
-            used_percent,
+            used_percent.unwrap_or(0.0),
             window_minutes,
             reset_at,
             format_reset_countdown(reset_at),
         )
+        .with_usage_known(valid_used_percent(used_percent))
+    }
+
+    fn parse_window_if_present(&self, window: &serde_json::Value) -> Option<RateWindow> {
+        (!window.is_null() && !is_placeholder_window(window)).then(|| self.parse_window(window))
     }
 
     fn extract_additional_rate_limits(&self, json: &serde_json::Value) -> Vec<NamedRateWindow> {
@@ -455,52 +758,25 @@ impl CodexApi {
         &self,
         response: UsageResponse,
     ) -> Result<(UsageSnapshot, Option<CostSnapshot>), ProviderError> {
-        // Extract primary rate window
-        let primary = if let Some(ref rate_limit) = response.rate_limit {
-            if let Some(ref primary_window) = rate_limit.primary_window {
-                let reset_at = timestamp_to_datetime(primary_window.reset_at);
-                RateWindow::with_details(
-                    primary_window.used_percent as f64,
-                    primary_window.limit_window_seconds.map(|s| (s / 60) as u32),
-                    reset_at,
-                    format_reset_countdown(reset_at),
-                )
-            } else {
-                RateWindow::new(0.0)
-            }
-        } else {
-            RateWindow::new(0.0)
-        };
-
-        // Extract secondary rate window
-        let secondary = response
-            .rate_limit
-            .as_ref()
-            .and_then(|rl| rl.secondary_window.as_ref())
-            .map(|window| {
-                let reset_at = timestamp_to_datetime(window.reset_at);
-                RateWindow::with_details(
-                    window.used_percent as f64,
-                    window.limit_window_seconds.map(|s| (s / 60) as u32),
-                    reset_at,
-                    format_reset_countdown(reset_at),
-                )
-            });
+        let (primary, secondary) = normalize_named_windows(
+            response
+                .rate_limit
+                .as_ref()
+                .and_then(|rate_limit| rate_limit.primary_window.as_ref())
+                .map(rate_window_from_snapshot),
+            response
+                .rate_limit
+                .as_ref()
+                .and_then(|rate_limit| rate_limit.secondary_window.as_ref())
+                .map(rate_window_from_snapshot),
+        );
 
         // Extract code review rate window
         let code_review = response
             .rate_limit
             .as_ref()
-            .and_then(|rl| rl.code_review_window.as_ref())
-            .map(|window| {
-                let reset_at = timestamp_to_datetime(window.reset_at);
-                RateWindow::with_details(
-                    window.used_percent as f64,
-                    window.limit_window_seconds.map(|s| (s / 60) as u32),
-                    reset_at,
-                    format_reset_countdown(reset_at),
-                )
-            });
+            .and_then(|rate_limit| rate_limit.code_review_window.as_ref())
+            .map(rate_window_from_snapshot);
 
         // Build usage snapshot
         let login_method = response.plan_type.as_ref().map(|pt| match pt.as_str() {
@@ -521,18 +797,28 @@ impl CodexApi {
             usage = usage.with_secondary(sec);
         }
         if let Some(cr) = code_review {
-            usage = usage.with_model_specific(cr);
+            usage = usage.with_code_review(cr);
         }
         if let Some(method) = login_method {
             usage = usage.with_login_method(method);
         }
 
         // Build cost snapshot if credits are present
+        let credit_limit = response.individual_limit.as_ref().or_else(|| {
+            response
+                .rate_limit
+                .as_ref()
+                .and_then(|rate_limit| rate_limit.individual_limit.as_ref())
+        });
         let cost = response.credits.as_ref().and_then(|credits| {
             if credits.has_credits() {
                 let balance = credits.balance.unwrap_or(0.0);
                 if credits.unlimited() {
                     None // Unlimited credits, no need to show
+                } else if let Some(limit) =
+                    credit_limit.and_then(|limit| limit.to_cost_snapshot(balance))
+                {
+                    Some(limit)
                 } else {
                     Some(CostSnapshot::new(balance, "USD", "Credits"))
                 }
@@ -542,6 +828,151 @@ impl CodexApi {
         });
 
         Ok((usage, cost))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexWindowRole {
+    Session,
+    Weekly,
+    Monthly,
+    Unknown,
+}
+
+fn codex_window_role(window: &RateWindow) -> CodexWindowRole {
+    match window
+        .window_minutes
+        .map(RateWindowCadence::from_minutes)
+        .unwrap_or(RateWindowCadence::Unknown)
+    {
+        RateWindowCadence::Session => CodexWindowRole::Session,
+        RateWindowCadence::Monthly => CodexWindowRole::Monthly,
+        RateWindowCadence::Weekly => CodexWindowRole::Weekly,
+        RateWindowCadence::Unknown => CodexWindowRole::Unknown,
+    }
+}
+
+/// Normalize the named `primary_window`/`secondary_window` fields by duration.
+fn normalize_named_windows(
+    primary: Option<RateWindow>,
+    secondary: Option<RateWindow>,
+) -> (RateWindow, Option<RateWindow>) {
+    match (primary, secondary) {
+        (None, None) => (RateWindow::no_active_session(), None),
+        (Some(window), None) => {
+            if codex_window_role(&window) == CodexWindowRole::Weekly {
+                (RateWindow::no_active_session(), Some(window))
+            } else {
+                (window, None)
+            }
+        }
+        (None, Some(window)) => {
+            if codex_window_role(&window) == CodexWindowRole::Weekly {
+                (RateWindow::no_active_session(), Some(window))
+            } else {
+                (window, None)
+            }
+        }
+        (Some(primary), Some(secondary)) => {
+            match (codex_window_role(&primary), codex_window_role(&secondary)) {
+                (CodexWindowRole::Weekly, CodexWindowRole::Session) => (secondary, Some(primary)),
+                (CodexWindowRole::Weekly, CodexWindowRole::Unknown) => {
+                    (RateWindow::no_active_session(), Some(primary))
+                }
+                (CodexWindowRole::Unknown, CodexWindowRole::Session) => (secondary, Some(primary)),
+                (CodexWindowRole::Session, CodexWindowRole::Weekly)
+                | (CodexWindowRole::Unknown, CodexWindowRole::Weekly) => (primary, Some(secondary)),
+                _ => (primary, Some(secondary)),
+            }
+        }
+    }
+}
+
+/// Normalize an array of Codex windows without relying on the API's ordering.
+/// Normalize an array of Codex windows without relying on the API's ordering.
+///
+/// Returns (session, weekly, monthly, code_review). F5 (upstream 0.48.0):
+/// monthly (30-day) windows are routed to their own lane so surfaces can
+/// display a monthly reset instead of swallowing it into the weekly label.
+fn normalize_array_windows(
+    windows: Vec<RateWindow>,
+) -> (
+    RateWindow,
+    Option<RateWindow>,
+    Option<RateWindow>,
+    Option<RateWindow>,
+) {
+    if windows.is_empty() {
+        return (RateWindow::no_active_session(), None, None, None);
+    }
+
+    // Preserve the old positional fallback when the API provides no role
+    // metadata at all. There is no safe way to infer session vs weekly then.
+    if !windows
+        .iter()
+        .any(|window| codex_window_role(window) != CodexWindowRole::Unknown)
+    {
+        let mut windows = windows.into_iter();
+        return (
+            windows.next().unwrap_or_else(RateWindow::no_active_session),
+            windows.next(),
+            windows.next(),
+            windows.next(),
+        );
+    }
+
+    let mut session = None;
+    let mut weekly = None;
+    let mut monthly = None;
+    let mut remaining = Vec::new();
+
+    for window in windows {
+        match codex_window_role(&window) {
+            CodexWindowRole::Session if session.is_none() => session = Some(window),
+            CodexWindowRole::Weekly if weekly.is_none() => weekly = Some(window),
+            CodexWindowRole::Monthly if monthly.is_none() => monthly = Some(window),
+            _ => remaining.push(window),
+        }
+    }
+
+    (
+        session.unwrap_or_else(RateWindow::no_active_session),
+        weekly,
+        monthly,
+        remaining.into_iter().next(),
+    )
+}
+
+fn rate_window_from_snapshot(window: &WindowSnapshot) -> RateWindow {
+    let reset_at = timestamp_to_datetime(window.reset_at);
+    let used_percent = f64::from(window.used_percent);
+    RateWindow::with_details(
+        used_percent,
+        window
+            .limit_window_seconds
+            .and_then(|seconds| u32::try_from(seconds / 60).ok()),
+        reset_at,
+        format_reset_countdown(reset_at),
+    )
+    .with_usage_known(valid_used_percent(Some(used_percent)))
+}
+
+fn format_plan_type(plan_type: &str) -> String {
+    match plan_type {
+        "guest" => "Guest".to_string(),
+        "free" => "ChatGPT Free".to_string(),
+        "go" => "Codex Go".to_string(),
+        "plus" => "ChatGPT Plus".to_string(),
+        "pro" => "ChatGPT Pro".to_string(),
+        "pro_lite" | "prolite" | "pro-lite" => "Pro Lite".to_string(),
+        "team" => "ChatGPT Team".to_string(),
+        "business" => "ChatGPT Business".to_string(),
+        "enterprise" => "ChatGPT Enterprise".to_string(),
+        "education" | "edu" => "ChatGPT Education".to_string(),
+        "free_workspace" | "freeWorkspace" => "Free Workspace".to_string(),
+        "quorum" => "Codex Quorum".to_string(),
+        "k12" => "Codex K12".to_string(),
+        other => format!("ChatGPT {}", capitalize(other)),
     }
 }
 
@@ -557,6 +988,19 @@ impl Default for CodexApi {
 struct CodexCredentials {
     access_token: String,
     account_id: Option<String>,
+    /// True when the source is an external OAuth token set (has a
+    /// `refresh_token`), as opposed to an `OPENAI_API_KEY`. The Codex CLI owns
+    /// refresh and persistence for this source; this app only reads it. The
+    /// `codex_external_oauth_sources_allowed` setting gates that read
+    /// (upstream 0.50.1 #2944).
+    is_external_oauth: bool,
+    /// Native access-token JWT expiry. When available, this is authoritative
+    /// for validity; the Codex CLI still owns the refresh lifecycle.
+    access_token_expires_at: Option<DateTime<Utc>>,
+    /// `last_refresh` timestamp from auth.json, when present. Its presence
+    /// supplies provenance when the external-source opt-in setting is OFF;
+    /// its age is not an access-token expiry signal.
+    last_refresh: Option<DateTime<Utc>>,
 }
 
 struct CachedCodexCredentials {
@@ -571,6 +1015,8 @@ struct UsageResponse {
     plan_type: Option<String>,
     rate_limit: Option<RateLimitDetails>,
     credits: Option<CreditDetails>,
+    #[serde(default, alias = "individualLimit")]
+    individual_limit: Option<SpendControlLimitSnapshot>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -578,6 +1024,8 @@ struct RateLimitDetails {
     primary_window: Option<WindowSnapshot>,
     secondary_window: Option<WindowSnapshot>,
     code_review_window: Option<WindowSnapshot>,
+    #[serde(default, alias = "individualLimit")]
+    individual_limit: Option<SpendControlLimitSnapshot>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -594,6 +1042,77 @@ struct CreditDetails {
     balance: Option<f64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SpendControlLimitSnapshot {
+    limit: Option<f64>,
+    used: Option<f64>,
+    #[serde(default, alias = "remainingPercent")]
+    remaining_percent: Option<f64>,
+    #[serde(default, alias = "resetsAt")]
+    resets_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct ResetCredit {
+    #[serde(default)]
+    pub(super) id: Option<String>,
+    #[serde(default, alias = "resetType")]
+    pub(super) reset_type: Option<String>,
+    #[serde(default)]
+    pub(super) status: Option<String>,
+    #[serde(default)]
+    pub(super) expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct ResetCredits {
+    #[serde(default)]
+    pub(super) credits: Vec<ResetCredit>,
+    #[serde(default)]
+    pub(super) available_count: u32,
+}
+
+fn decode_reset_credits(data: &[u8]) -> Result<ResetCredits, ProviderError> {
+    serde_json::from_slice(data)
+        .map_err(|e| ProviderError::Parse(format!("Failed to parse Codex reset credits: {e}")))
+}
+
+fn parse_credit_expiry(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn is_available_credit(credit: &ResetCredit) -> bool {
+    match credit.status.as_deref() {
+        None | Some("") => true,
+        Some(status) => status.eq_ignore_ascii_case("available"),
+    }
+}
+
+fn next_available_reset_credit_expiry(
+    credits: &[ResetCredit],
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    credits
+        .iter()
+        .filter(|credit| is_available_credit(credit))
+        .filter_map(|credit| credit.expires_at.as_deref().and_then(parse_credit_expiry))
+        .filter(|expires_at| *expires_at > now)
+        .min()
+}
+
+fn reset_credits_rate_window(reset: &ResetCredits, now: DateTime<Utc>) -> RateWindow {
+    let description = format!(
+        "{} reset credit{} available",
+        reset.available_count,
+        if reset.available_count == 1 { "" } else { "s" }
+    );
+    let mut window = RateWindow::informational(description);
+    window.resets_at = next_available_reset_credit_expiry(&reset.credits, now);
+    window
+}
+
 impl CreditDetails {
     // Helper to safely check has_credits
     fn has_credits(&self) -> bool {
@@ -605,10 +1124,60 @@ impl CreditDetails {
     }
 }
 
+impl SpendControlLimitSnapshot {
+    fn to_cost_snapshot(&self, balance: f64) -> Option<CostSnapshot> {
+        let limit = self
+            .limit
+            .filter(|limit| limit.is_finite() && *limit >= 0.0)?;
+        let used = self
+            .used
+            .filter(|used| used.is_finite() && *used >= 0.0)
+            .or_else(|| {
+                self.remaining_percent
+                    .filter(|pct| pct.is_finite() && *pct >= 0.0)
+                    .map(|remaining| limit * (1.0 - (remaining / 100.0)))
+            })
+            .unwrap_or_else(|| (limit - balance).max(0.0));
+        let mut cost =
+            CostSnapshot::new(used.clamp(0.0, limit), "USD", "Monthly credits").with_limit(limit);
+        if let Some(resets_at) = timestamp_to_datetime(self.resets_at) {
+            cost = cost.with_resets_at(resets_at);
+        }
+        Some(cost)
+    }
+}
+
 // --- Helper functions ---
 
 fn timestamp_to_datetime(timestamp: Option<i64>) -> Option<DateTime<Utc>> {
     timestamp.and_then(|ts| Utc.timestamp_opt(ts, 0).single())
+}
+
+/// Parse the native `exp` claim from an access-token JWT. Opaque or malformed
+/// tokens return `None` and are handled by the read-only usage request.
+fn parse_access_token_expiry(token: &str) -> Option<DateTime<Utc>> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    let exp = json.get("exp")?.as_i64()?;
+    Utc.timestamp_opt(exp, 0).single()
+}
+fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(trimmed)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.f")
+                .ok()
+                .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+        })
 }
 
 fn json_f64(value: &serde_json::Value) -> Option<f64> {
@@ -616,6 +1185,16 @@ fn json_f64(value: &serde_json::Value) -> Option<f64> {
         .as_f64()
         .or_else(|| value.as_i64().map(|value| value as f64))
         .or_else(|| value.as_str()?.trim().parse::<f64>().ok())
+}
+
+fn json_i64(value: &serde_json::Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
+}
+
+fn valid_used_percent(value: Option<f64>) -> bool {
+    value.is_some_and(|value| value.is_finite() && (0.0..=100.0).contains(&value))
 }
 
 fn is_placeholder_window(window: &serde_json::Value) -> bool {
@@ -626,9 +1205,9 @@ fn is_placeholder_window(window: &serde_json::Value) -> bool {
         .is_some();
     let has_duration = window
         .get("limit_window_seconds")
-        .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse::<i64>().ok()))
+        .and_then(json_i64)
         .is_some();
-    let has_reset = window.get("reset_at").is_some();
+    let has_reset = window.get("reset_at").and_then(json_i64).is_some();
 
     !has_usage && !has_duration && !has_reset
 }
@@ -700,6 +1279,21 @@ fn format_reset_countdown(reset_at: Option<DateTime<Utc>>) -> Option<String> {
     }
 }
 
+/// Whether config.toml selects a non-ChatGPT model provider (e.g. Bedrock),
+/// meaning the CLI never authenticates against ChatGPT.
+fn config_uses_non_chatgpt_provider(config_content: &str) -> bool {
+    config_content.lines().any(|line| {
+        let Some((key, value)) = line.trim().split_once('=') else {
+            return false;
+        };
+        if !key.trim().eq_ignore_ascii_case("model_provider") {
+            return false;
+        }
+        let provider = value.trim().trim_matches('"').trim_matches('\'');
+        !provider.is_empty() && !provider.eq_ignore_ascii_case("openai")
+    })
+}
+
 fn parse_chatgpt_base_url(config_content: &str) -> Option<String> {
     for line in config_content.lines() {
         // Skip comments
@@ -762,6 +1356,24 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn non_chatgpt_model_provider_is_detected_for_guidance() {
+        // Upstream 0.50.0 #2679: Bedrock and other custom backends get
+        // rate-limit guidance instead of login instructions.
+        assert!(config_uses_non_chatgpt_provider(
+            "model_provider = \"bedrock\"\n"
+        ));
+        assert!(config_uses_non_chatgpt_provider(
+            "# relay\nmodel_provider = 'ollama'"
+        ));
+        assert!(!config_uses_non_chatgpt_provider(
+            "model_provider = \"openai\""
+        ));
+        assert!(!config_uses_non_chatgpt_provider(
+            "model = \"gpt-5\"\napproval_policy = \"never\""
+        ));
+    }
+
+    #[test]
     fn parses_codex_credentials_without_retaining_refresh_token() {
         let credentials = CodexApi::parse_credentials_json(
             r#"{
@@ -776,6 +1388,409 @@ mod tests {
 
         assert_eq!(credentials.access_token, "access");
         assert_eq!(credentials.account_id.as_deref(), Some("acct_123"));
+    }
+
+    #[test]
+    fn decodes_reset_credits() {
+        let credits = decode_reset_credits(
+            br#"{"available_count":2,"credits":[{"id":"a","status":"available","expires_at":"2026-08-01T12:00:00Z"}]}"#,
+        )
+        .expect("reset credits");
+        assert_eq!(credits.available_count, 2);
+        assert_eq!(credits.credits.len(), 1);
+        assert_eq!(credits.credits[0].status.as_deref(), Some("available"));
+        assert_eq!(
+            credits.credits[0].expires_at.as_deref(),
+            Some("2026-08-01T12:00:00Z")
+        );
+    }
+
+    #[test]
+    fn next_expiry_picks_soonest_available() {
+        let now = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let credits = vec![
+            ResetCredit {
+                id: None,
+                reset_type: None,
+                status: Some("available".into()),
+                expires_at: Some("2026-07-10T00:00:00Z".into()),
+            },
+            ResetCredit {
+                id: None,
+                reset_type: None,
+                status: Some("available".into()),
+                expires_at: Some("2026-07-05T00:00:00Z".into()),
+            },
+            ResetCredit {
+                id: None,
+                reset_type: None,
+                status: Some("available".into()),
+                expires_at: Some("2026-07-20T00:00:00Z".into()),
+            },
+        ];
+        let expiry = next_available_reset_credit_expiry(&credits, now).expect("expiry");
+        assert_eq!(
+            expiry,
+            DateTime::parse_from_rfc3339("2026-07-05T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+    }
+
+    #[test]
+    fn next_expiry_skips_past_and_non_available() {
+        let now = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let credits = vec![
+            ResetCredit {
+                id: None,
+                reset_type: None,
+                status: Some("available".into()),
+                expires_at: Some("2026-06-01T00:00:00Z".into()),
+            },
+            ResetCredit {
+                id: None,
+                reset_type: None,
+                status: Some("used".into()),
+                expires_at: Some("2026-07-03T00:00:00Z".into()),
+            },
+            ResetCredit {
+                id: None,
+                reset_type: None,
+                status: Some("AVAILABLE".into()),
+                expires_at: Some("2026-07-08T00:00:00Z".into()),
+            },
+            ResetCredit {
+                id: None,
+                reset_type: None,
+                status: None,
+                expires_at: Some("2026-07-09T00:00:00Z".into()),
+            },
+        ];
+        let expiry = next_available_reset_credit_expiry(&credits, now).expect("expiry");
+        assert_eq!(
+            expiry,
+            DateTime::parse_from_rfc3339("2026-07-08T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+    }
+
+    #[test]
+    fn reset_credits_window_sets_informational_and_expiry() {
+        let now = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let reset = ResetCredits {
+            available_count: 2,
+            credits: vec![
+                ResetCredit {
+                    id: None,
+                    reset_type: None,
+                    status: Some("available".into()),
+                    expires_at: Some("2026-07-15T12:00:00Z".into()),
+                },
+                ResetCredit {
+                    id: None,
+                    reset_type: None,
+                    status: Some("available".into()),
+                    expires_at: Some("2026-07-10T12:00:00Z".into()),
+                },
+            ],
+        };
+        let window = reset_credits_rate_window(&reset, now);
+        assert!(window.is_informational);
+        assert_eq!(
+            window.reset_description.as_deref(),
+            Some("2 reset credits available")
+        );
+        assert_eq!(
+            window.resets_at,
+            Some(
+                DateTime::parse_from_rfc3339("2026-07-10T12:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+    }
+
+    #[test]
+    fn reset_credits_window_count_only_without_expiry() {
+        let now = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let reset = ResetCredits {
+            available_count: 1,
+            credits: vec![],
+        };
+        let window = reset_credits_rate_window(&reset, now);
+        assert!(window.is_informational);
+        assert_eq!(
+            window.reset_description.as_deref(),
+            Some("1 reset credit available")
+        );
+        assert!(window.resets_at.is_none());
+    }
+
+    fn write_codex_home(base_url: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp codex home");
+        std::fs::write(
+            dir.path().join("auth.json"),
+            r#"{"tokens":{"access_token":"test-token","account_id":"acct_test"}}"#,
+        )
+        .expect("auth.json");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!("chatgpt_base_url = \"{base_url}\""),
+        )
+        .expect("config.toml");
+        dir
+    }
+
+    #[tokio::test]
+    async fn fetch_usage_attaches_reset_credits_from_http() {
+        let mut server = mockito::Server::new_async().await;
+        let soonest = (Utc::now() + chrono::Duration::days(5)).to_rfc3339();
+        let later = (Utc::now() + chrono::Duration::days(12)).to_rfc3339();
+
+        let usage_mock = server
+            .mock("GET", "/wham/usage")
+            .match_header("authorization", "Bearer test-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000}}}"#,
+            )
+            .create_async()
+            .await;
+
+        let reset_body = format!(
+            r#"{{"available_count":2,"credits":[
+                {{"status":"available","expires_at":"{later}"}},
+                {{"status":"available","expires_at":"{soonest}"}}
+            ]}}"#
+        );
+        let reset_mock = server
+            .mock("GET", "/wham/rate-limit-reset-credits")
+            .match_header("authorization", "Bearer test-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(reset_body)
+            .create_async()
+            .await;
+
+        let home = write_codex_home(&server.url());
+        let api = CodexApi::new().with_codex_home(home.path());
+        let (usage, _, _) = api.fetch_usage().await.expect("fetch_usage");
+
+        usage_mock.assert_async().await;
+        reset_mock.assert_async().await;
+
+        let extra = usage
+            .extra_rate_windows
+            .iter()
+            .find(|w| w.id == "reset-credits")
+            .expect("reset-credits window attached");
+        assert_eq!(extra.title, "Reset credits");
+        assert!(extra.window.is_informational);
+        assert_eq!(
+            extra.window.reset_description.as_deref(),
+            Some("2 reset credits available")
+        );
+        let expected = DateTime::parse_from_rfc3339(&soonest)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(extra.window.resets_at, Some(expected));
+    }
+
+    #[tokio::test]
+    async fn authenticated_codex_http_distinguishes_401_from_403() {
+        for (status, expects_authentication) in [(401, true), (403, false)] {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/wham/usage")
+                .with_status(status)
+                .with_body("fixture refusal")
+                .create_async()
+                .await;
+
+            let home = write_codex_home(&server.url());
+            let api = CodexApi::new().with_codex_home(home.path());
+            let error = match api.fetch_usage().await {
+                Ok(_) => panic!("expected HTTP {status} to fail"),
+                Err(error) => error,
+            };
+
+            if expects_authentication {
+                assert!(matches!(error, ProviderError::AuthRequired));
+            } else {
+                let message = error.to_string();
+                assert!(message.contains("403"));
+                assert!(message.contains("fixture refusal"));
+                assert!(!matches!(error, ProviderError::AuthRequired));
+            }
+            mock.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn old_opaque_external_oauth_reaches_usage_request() {
+        let mut server = mockito::Server::new_async().await;
+        let usage_mock = server
+            .mock("GET", "/wham/usage")
+            .match_header("authorization", "Bearer opaque-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000}}}"#,
+            )
+            .create_async()
+            .await;
+        let reset_mock = server
+            .mock("GET", "/wham/rate-limit-reset-credits")
+            .match_header("authorization", "Bearer opaque-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"available_count":0,"credits":[]}"#)
+            .create_async()
+            .await;
+
+        let creds = CodexApi::parse_credentials_json(
+            r#"{
+                "tokens": {
+                    "access_token": "opaque-token",
+                    "refresh_token": "refresh",
+                    "account_id": "acct_test"
+                },
+                "last_refresh": "2026-01-01T00:00:00Z"
+            }"#,
+        )
+        .expect("credentials");
+        assert!(CodexApi::enforce_external_oauth_gate_at(&creds, false, Utc::now()).is_ok());
+
+        let api = CodexApi::new();
+        let (usage, _, _) = api
+            .fetch_usage_once(&creds, &server.url())
+            .await
+            .expect("opaque OAuth usage request");
+        assert_eq!(usage.primary.used_percent, 10.0);
+        usage_mock.assert_async().await;
+        reset_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fetch_usage_skips_reset_credits_when_available_count_zero() {
+        let mut server = mockito::Server::new_async().await;
+
+        let usage_mock = server
+            .mock("GET", "/wham/usage")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000}}}"#,
+            )
+            .create_async()
+            .await;
+
+        let reset_mock = server
+            .mock("GET", "/wham/rate-limit-reset-credits")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"available_count":0,"credits":[]}"#)
+            .create_async()
+            .await;
+
+        let home = write_codex_home(&server.url());
+        let api = CodexApi::new().with_codex_home(home.path());
+        let (usage, _, _) = api.fetch_usage().await.expect("fetch_usage");
+
+        usage_mock.assert_async().await;
+        reset_mock.assert_async().await;
+
+        assert!(
+            usage
+                .extra_rate_windows
+                .iter()
+                .all(|w| w.id != "reset-credits"),
+            "available_count=0 must not attach reset-credits"
+        );
+    }
+
+    #[test]
+    fn keeps_weekly_window_in_secondary_when_session_is_absent() {
+        let api = CodexApi::new();
+        let (usage, _) = api
+            .build_result_from_json(&json!({
+                "rate_limit": {
+                    "secondary_window": {
+                        "used_percent": 25,
+                        "limit_window_seconds": 604800,
+                        "reset_at": 1783036800
+                    }
+                }
+            }))
+            .expect("codex usage");
+
+        assert!(usage.primary.is_informational);
+        assert_eq!(usage.primary.window_minutes, Some(300));
+        assert_eq!(
+            usage.primary.reset_description.as_deref(),
+            Some("No active 5h session")
+        );
+
+        let weekly = usage.secondary.expect("weekly window");
+        assert!(!weekly.is_informational);
+        assert_eq!(weekly.used_percent, 25.0);
+        assert_eq!(weekly.window_minutes, Some(10080));
+    }
+
+    #[test]
+    fn identifies_rate_limit_array_windows_by_duration() {
+        let api = CodexApi::new();
+        let (usage, _) = api
+            .build_result_from_json(&json!({
+                "rate_limits": [
+                    {
+                        "used_percent": 25,
+                        "limit_window_seconds": 604800,
+                        "reset_at": 1783036800
+                    },
+                    {
+                        "used_percent": 10,
+                        "limit_window_seconds": 18000,
+                        "reset_at": 1783018800
+                    }
+                ]
+            }))
+            .expect("codex usage");
+
+        assert!(!usage.primary.is_informational);
+        assert_eq!(usage.primary.used_percent, 10.0);
+        assert_eq!(usage.primary.window_minutes, Some(300));
+
+        let weekly = usage.secondary.expect("weekly window");
+        assert_eq!(weekly.used_percent, 25.0);
+        assert_eq!(weekly.window_minutes, Some(10080));
+    }
+
+    #[test]
+    fn identifies_weekly_only_rate_limit_array_without_a_session() {
+        let api = CodexApi::new();
+        let (usage, _) = api
+            .build_result_from_json(&json!({
+                "rate_limits": [{
+                    "used_percent": 25,
+                    "limit_window_seconds": 604800,
+                    "reset_at": 1783036800
+                }]
+            }))
+            .expect("codex usage");
+
+        assert!(usage.primary.is_informational);
+        assert_eq!(usage.secondary.expect("weekly window").used_percent, 25.0);
     }
 
     #[test]
@@ -835,5 +1850,279 @@ mod tests {
             .expect("codex usage");
 
         assert!(usage.extra_rate_windows.is_empty());
+    }
+
+    #[test]
+    fn maps_top_level_individual_credit_limit_to_cost_snapshot() {
+        let api = CodexApi::new();
+        let (_, cost) = api
+            .build_result(UsageResponse {
+                plan_type: None,
+                rate_limit: None,
+                credits: Some(CreditDetails {
+                    has_credits: Some(true),
+                    unlimited: Some(false),
+                    balance: Some(7.5),
+                }),
+                individual_limit: Some(SpendControlLimitSnapshot {
+                    limit: Some(20.0),
+                    used: Some(12.5),
+                    remaining_percent: None,
+                    resets_at: Some(1783036800),
+                }),
+            })
+            .expect("codex result");
+        let cost = cost.expect("cost");
+        assert_eq!(cost.used, 12.5);
+        assert_eq!(cost.limit, Some(20.0));
+        assert!(cost.resets_at.is_some());
+    }
+
+    #[test]
+    fn maps_nested_individual_credit_limit_to_cost_snapshot() {
+        let api = CodexApi::new();
+        let (_, cost) = api
+            .build_result(UsageResponse {
+                plan_type: None,
+                rate_limit: Some(RateLimitDetails {
+                    primary_window: None,
+                    secondary_window: None,
+                    code_review_window: None,
+                    individual_limit: Some(SpendControlLimitSnapshot {
+                        limit: Some(100.0),
+                        used: None,
+                        remaining_percent: Some(60.0),
+                        resets_at: None,
+                    }),
+                }),
+                credits: Some(CreditDetails {
+                    has_credits: Some(true),
+                    unlimited: Some(false),
+                    balance: Some(60.0),
+                }),
+                individual_limit: None,
+            })
+            .expect("codex result");
+        let cost = cost.expect("cost");
+        assert_eq!(cost.used, 40.0);
+        assert_eq!(cost.limit, Some(100.0));
+    }
+
+    fn win(minutes: u32, used: f64) -> RateWindow {
+        RateWindow::with_details(used, Some(minutes), None, None)
+    }
+
+    #[test]
+    fn f5_normalize_array_routes_session_weekly_monthly_to_lanes() {
+        // 5h session + weekly + monthly → (session, weekly, monthly, None)
+        let windows = vec![win(300, 10.0), win(10_080, 20.0), win(43_200, 30.0)];
+        let (primary, secondary, tertiary, code_review) = normalize_array_windows(windows);
+        assert_eq!(primary.window_minutes, Some(300));
+        assert_eq!(secondary.unwrap().window_minutes, Some(10_080));
+        assert_eq!(tertiary.unwrap().window_minutes, Some(43_200));
+        assert!(code_review.is_none());
+    }
+
+    #[test]
+    fn f5_normalize_array_monthly_routes_to_tertiary_not_secondary() {
+        // Monthly must go to tertiary, NOT secondary — so #268's weekly math
+        // and "Weekly" label stay untouched.
+        let windows = vec![win(43_200, 50.0), win(10_080, 20.0)];
+        let (primary, secondary, tertiary, _) = normalize_array_windows(windows);
+        assert_eq!(primary.window_minutes, Some(300)); // no session → placeholder
+        assert_eq!(secondary.unwrap().window_minutes, Some(10_080));
+        assert_eq!(tertiary.unwrap().window_minutes, Some(43_200));
+    }
+
+    #[test]
+    fn f5_normalize_array_empty_returns_placeholder_primary() {
+        let (primary, secondary, tertiary, code_review) = normalize_array_windows(vec![]);
+        assert!(primary.is_informational);
+        assert!(secondary.is_none());
+        assert!(tertiary.is_none());
+        assert!(code_review.is_none());
+    }
+
+    #[test]
+    fn f5_normalize_array_unknown_windows_fall_to_code_review() {
+        // Windows with unrecognized durations (not 300/10080/43200) go to the
+        // remaining/code_review bucket.
+        let windows = vec![win(300, 10.0), win(999, 5.0)];
+        let (primary, secondary, tertiary, code_review) = normalize_array_windows(windows);
+        assert_eq!(primary.window_minutes, Some(300));
+        assert!(secondary.is_none());
+        assert!(tertiary.is_none());
+        assert_eq!(code_review.unwrap().window_minutes, Some(999));
+    }
+
+    // ── Upstream 0.50.1 #2944: external OAuth source gate ──────────────────
+
+    #[test]
+    fn confirmation_failure_fallback_keeps_first_successful_usage_and_cost() {
+        let state = weekly_reset::AccountState::default();
+        let first = UsageSnapshot::new(RateWindow::new(10.0)).with_secondary(RateWindow::new(0.5));
+        let cost = Some(CostSnapshot::new(3.25, "USD", "Monthly"));
+        let (usage, kept_cost) = CodexApi::preserve_after_confirmation_failure(&state, first, cost);
+        assert!((usage.secondary.expect("weekly").used_percent - 0.5).abs() < f64::EPSILON);
+        assert_eq!(kept_cost.expect("cost").used, 3.25);
+    }
+    #[test]
+    fn api_key_credentials_are_not_external_oauth() {
+        let creds = CodexApi::parse_credentials_json(r#"{"OPENAI_API_KEY": "sk-test"}"#)
+            .expect("credentials");
+        assert!(!creds.is_external_oauth);
+        assert!(creds.access_token_expires_at.is_none());
+        assert!(creds.last_refresh.is_none());
+        assert!(CodexApi::enforce_external_oauth_gate(&creds).is_ok());
+    }
+
+    #[test]
+    fn oauth_tokens_with_refresh_token_are_external_source() {
+        let creds = CodexApi::parse_credentials_json(
+            r#"{
+                "tokens": {
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "account_id": "acct_123"
+                }
+            }"#,
+        )
+        .expect("credentials");
+        assert!(creds.is_external_oauth);
+        assert!(creds.access_token_expires_at.is_none());
+        assert!(creds.last_refresh.is_none());
+    }
+
+    #[test]
+    fn oauth_tokens_without_refresh_token_are_not_external() {
+        let creds = CodexApi::parse_credentials_json(
+            r#"{
+                "tokens": {
+                    "access_token": "access",
+                    "account_id": "acct_123"
+                }
+            }"#,
+        )
+        .expect("credentials");
+        assert!(!creds.is_external_oauth);
+    }
+
+    #[test]
+    fn external_oauth_gate_fails_closed_without_last_refresh() {
+        let creds = CodexCredentials {
+            access_token: "access".to_string(),
+            account_id: None,
+            is_external_oauth: true,
+            access_token_expires_at: None,
+            last_refresh: None,
+        };
+        let err = CodexApi::enforce_external_oauth_gate(&creds)
+            .expect_err("external OAuth without provenance must fail closed");
+        assert!(matches!(err, ProviderError::AuthRequired));
+    }
+
+    #[test]
+    fn external_oauth_gate_ignores_old_last_refresh_for_opaque_token() {
+        let old = Utc::now() - chrono::Duration::days(10);
+        let creds = CodexCredentials {
+            access_token: "access".to_string(),
+            account_id: None,
+            is_external_oauth: true,
+            access_token_expires_at: None,
+            last_refresh: Some(old),
+        };
+        assert!(CodexApi::enforce_external_oauth_gate(&creds).is_ok());
+    }
+
+    #[test]
+    fn external_oauth_gate_allows_refresh_provenance() {
+        let fresh = Utc::now() - chrono::Duration::hours(1);
+        let creds = CodexCredentials {
+            access_token: "access".to_string(),
+            account_id: None,
+            is_external_oauth: true,
+            access_token_expires_at: None,
+            last_refresh: Some(fresh),
+        };
+        assert!(CodexApi::enforce_external_oauth_gate(&creds).is_ok());
+    }
+
+    #[test]
+    fn external_oauth_gate_uses_future_jwt_expiry_over_old_last_refresh() {
+        let now = Utc::now();
+        let future = now + chrono::Duration::hours(2);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"exp":{}}}"#, future.timestamp()));
+        let token = format!("header.{payload}.signature");
+        let json = format!(
+            r#"{{"tokens":{{"access_token":"{token}","refresh_token":"refresh"}},"last_refresh":"2026-01-01T00:00:00Z"}}"#
+        );
+        let creds = CodexApi::parse_credentials_json(&json).expect("credentials");
+        assert!(creds.access_token_expires_at.is_some());
+        assert!(CodexApi::enforce_external_oauth_gate_at(&creds, false, now).is_ok());
+        assert!(CodexApi::enforce_external_oauth_gate_at(&creds, true, now).is_ok());
+    }
+
+    #[test]
+    fn external_oauth_gate_rejects_expired_jwt() {
+        let expired = Utc::now() - chrono::Duration::minutes(1);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"exp":{}}}"#, expired.timestamp()));
+        let token = format!("header.{payload}.signature");
+        let json = format!(
+            r#"{{"tokens":{{"access_token":"{token}","refresh_token":"refresh"}},"last_refresh":"{}"}}"#,
+            Utc::now().to_rfc3339()
+        );
+        let creds = CodexApi::parse_credentials_json(&json).expect("credentials");
+        let err = CodexApi::enforce_external_oauth_gate(&creds)
+            .expect_err("expired native OAuth must be rejected");
+        assert!(matches!(err, ProviderError::AuthRequired));
+    }
+
+    #[test]
+    fn external_oauth_gate_requires_cli_refresh_when_jwt_is_near_expiry() {
+        let soon = Utc::now() + chrono::Duration::minutes(2);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"exp":{}}}"#, soon.timestamp()));
+        let token = format!("header.{payload}.signature");
+        let json = format!(
+            r#"{{"tokens":{{"access_token":"{token}","refresh_token":"refresh"}},"last_refresh":"{}"}}"#,
+            Utc::now().to_rfc3339()
+        );
+        let creds = CodexApi::parse_credentials_json(&json).expect("credentials");
+        let err = CodexApi::enforce_external_oauth_gate(&creds)
+            .expect_err("near-expiry native OAuth must refresh through the CLI");
+        assert!(matches!(err, ProviderError::AuthRequired));
+    }
+
+    #[test]
+    fn external_oauth_gate_allows_missing_last_refresh_when_opted_in() {
+        let creds = CodexCredentials {
+            access_token: "opaque-token".to_string(),
+            account_id: None,
+            is_external_oauth: true,
+            access_token_expires_at: None,
+            last_refresh: None,
+        };
+        assert!(CodexApi::enforce_external_oauth_gate_at(&creds, true, Utc::now()).is_ok());
+    }
+
+    #[test]
+    fn opaque_token_uses_refresh_provenance_when_no_jwt_expiry_exists() {
+        let fresh = Utc::now().to_rfc3339();
+        let json = format!(
+            r#"{{"tokens":{{"access_token":"opaque-token","refresh_token":"refresh"}},"last_refresh":"{fresh}"}}"#
+        );
+        let creds = CodexApi::parse_credentials_json(&json).expect("credentials");
+        assert!(creds.access_token_expires_at.is_none());
+        assert!(CodexApi::enforce_external_oauth_gate(&creds).is_ok());
+    }
+    #[test]
+    fn parse_timestamp_reads_iso8601() {
+        assert!(parse_timestamp("2026-08-17T10:00:00Z").is_some());
+        assert!(parse_timestamp("2026-08-17T10:00:00.123Z").is_some());
+        assert!(parse_timestamp("  2026-08-17T10:00:00Z  ").is_some());
+        assert!(parse_timestamp("").is_none());
+        assert!(parse_timestamp("not-a-date").is_none());
     }
 }

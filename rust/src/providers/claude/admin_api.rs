@@ -24,7 +24,7 @@ pub struct ClaudeAdminApiFetcher {
 impl ClaudeAdminApiFetcher {
     pub fn new() -> Self {
         Self {
-            client: Client::builder()
+            client: crate::core::credentialed_http_client_builder()
                 .timeout(std::time::Duration::from_secs(20))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
@@ -139,7 +139,10 @@ struct CostReportResponse {
 #[derive(Debug, Deserialize)]
 struct CostBucket {
     starting_at: String,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "admin API response fields are deserialized for parsing but not all are read"
+    )]
     ending_at: String,
     results: Vec<CostResult>,
 }
@@ -159,7 +162,10 @@ struct MessagesUsageResponse {
 #[derive(Debug, Deserialize)]
 struct MessageBucket {
     starting_at: String,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "admin API response fields are deserialized for parsing but not all are read"
+    )]
     ending_at: String,
     results: Vec<MessageResult>,
 }

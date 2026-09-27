@@ -28,35 +28,23 @@
 .PARAMETER WarmCacheOnly
     Build the desktop binary and stop before installer packaging. Use this to
     warm the Windows Cargo and pnpm caches after a large port.
-
-.PARAMETER WarmCliCache
-    Also build the CLI in a separate Cargo target cache. This keeps CLI warming
-    from invalidating or competing with desktop release artifacts.
-
 .PARAMETER SmokeInstall
     After packaging, run scripts/windows-smoke-install.ps1 against the generated
     installer and uninstall it again.
 
-.PARAMETER UploadRelease
-    GitHub release tag to upload assets to after packaging, for example v0.27.5.
-    Requires the GitHub CLI to be installed and authenticated.
 
 .EXAMPLE
     .\scripts\windows-release-build.ps1 -Ref v0.27.4
 
-.EXAMPLE
-    .\scripts\windows-release-build.ps1 -Ref v0.27.5 -SmokeInstall -UploadRelease v0.27.5
 #>
 
 param(
     [string]$Ref = "HEAD",
-    [string]$RepoUrl = "https://github.com/Finesssee/Win-CodexBar.git",
+    [string]$RepoUrl = "https://github.com/nesszer/Win-CodexBar.git",
     [string]$WorkRoot = "C:\code\Win-CodexBar-release",
     [switch]$RefreshInstallerDependencies,
     [switch]$WarmCacheOnly,
-    [switch]$WarmCliCache,
-    [switch]$SmokeInstall,
-    [string]$UploadRelease = ""
+    [switch]$SmokeInstall
 )
 
 Set-StrictMode -Version Latest
@@ -77,10 +65,27 @@ $AssetsDir = Join-Path $WorkRoot "assets"
 $DesktopCargoTargetDir = Join-Path $CacheDir "cargo-target"
 $CliCargoTargetDir = Join-Path $CacheDir "cargo-target-cli"
 
-$UserCargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
-if (Test-Path $UserCargoBin) {
-    $env:Path = "$UserCargoBin;$env:Path"
+function Add-PathIfPresent {
+    param([AllowNull()][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Container)) {
+        return
+    }
+    if (@($env:Path -split ';') -notcontains $Path) {
+        $env:Path = "$Path;$env:Path"
+    }
 }
+
+$UserCargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+Add-PathIfPresent $UserCargoBin
+foreach ($nodeRoot in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA)) {
+    if (-not [string]::IsNullOrWhiteSpace($nodeRoot)) {
+        Add-PathIfPresent (Join-Path $nodeRoot 'nodejs')
+    }
+}
+if ($env:APPDATA) { Add-PathIfPresent (Join-Path $env:APPDATA 'npm') }
+if ($env:LOCALAPPDATA) { Add-PathIfPresent (Join-Path $env:LOCALAPPDATA 'pnpm') }
+if ($env:LOCALAPPDATA) { Add-PathIfPresent (Join-Path $env:LOCALAPPDATA 'CodexBar\release-toolchain\pnpm') }
 
 function Require-Command {
     param([string]$Name)
@@ -98,9 +103,16 @@ function Invoke-Native {
         [string[]]$ArgumentList
     )
 
-    & $FilePath @ArgumentList
-    if ($LASTEXITCODE -ne 0) {
-        throw "$FilePath exited with code $LASTEXITCODE"
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $FilePath @ArgumentList 2>&1 | ForEach-Object { Write-Host $_ }
+        $nativeExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($nativeExitCode -ne 0) {
+        throw "$FilePath exited with code $nativeExitCode"
     }
 }
 
@@ -130,6 +142,27 @@ function Assert-MicrosoftSignature {
     if ($subject -notlike "*Microsoft Corporation*") {
         throw "$Path signer is unexpected: $subject"
     }
+}
+
+function Get-InnoSetupCompiler {
+    $candidates = @(
+        (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"),
+        (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
+    )
+
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path $candidate)) {
+            return $candidate
+        }
+    }
+
+    $command = Get-Command "ISCC.exe" -ErrorAction SilentlyContinue
+    if ($command) {
+        return $command.Source
+    }
+
+    throw "Inno Setup compiler not found. Install JRSoftware.InnoSetup with winget or Inno Setup 6 from jrsoftware.org."
 }
 
 function Invoke-DownloadWithRetry {
@@ -167,9 +200,63 @@ function Get-ObjdumpImportsWebView2Loader {
 }
 
 $git = Require-Command "git"
-$cargo = Require-Command "cargo"
-$pnpm = Require-Command "pnpm"
+$rustupBinCandidates = @()
+if ($env:CARGO_HOME) {
+    $rustupBinCandidates += Join-Path $env:CARGO_HOME 'bin'
+}
+if ($env:USERPROFILE) {
+    $rustupBinCandidates += Join-Path $env:USERPROFILE '.cargo\bin'
+}
+foreach ($rustupBinDir in $rustupBinCandidates) {
+    if ((Test-Path -LiteralPath $rustupBinDir -PathType Container) -and (@($env:Path -split ';') -notcontains $rustupBinDir)) {
+        $env:Path = "$rustupBinDir;$env:Path"
+    }
+}
 $rustup = Get-Command rustup -ErrorAction SilentlyContinue
+if (-not $rustup) {
+    throw 'rustup is required for Windows release builds.'
+}
+$previousErrorActionPreference = $ErrorActionPreference
+try {
+    $ErrorActionPreference = 'Continue'
+    & $rustup.Source set auto-self-update disable 2>&1 | ForEach-Object { Write-Host $_ }
+    $rustupExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+}
+if ($rustupExitCode -ne 0) {
+    Write-Host "Warning: rustup auto-self-update disable failed with exit code $rustupExitCode"
+}
+$toolchain = 'stable-x86_64-pc-windows-msvc'
+$target = if ($env:CARGO_BUILD_TARGET) { $env:CARGO_BUILD_TARGET } else { 'x86_64-pc-windows-msvc' }
+Invoke-Native $rustup.Source @('toolchain', 'install', $toolchain, '--profile', 'default')
+$previousErrorActionPreference = $ErrorActionPreference
+try {
+    $ErrorActionPreference = 'Continue'
+    & $rustup.Source target add $target --toolchain $toolchain 2>&1 | ForEach-Object { Write-Host $_ }
+    $rustupExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+}
+if ($rustupExitCode -ne 0) {
+    throw "$($rustup.Source) target add $target --toolchain $toolchain exited with code $rustupExitCode"
+}
+$env:RUSTUP_TOOLCHAIN = $toolchain
+$rustupBinDir = Split-Path -Parent $rustup.Source
+foreach ($proxy in @('cargo', 'rustc', 'rustfmt', 'clippy-driver', 'rls', 'rust-analyzer')) {
+    $proxyPath = Join-Path $rustupBinDir "$proxy.exe"
+    if (-not (Test-Path -LiteralPath $proxyPath)) {
+        Copy-Item -LiteralPath $rustup.Source -Destination $proxyPath -Force
+        Write-Host "Created rustup proxy: $proxyPath"
+    }
+}
+$env:Path = "$rustupBinDir;$env:Path"
+$cargo = Get-Command cargo -ErrorAction Stop
+$rustcCmd = Get-Command rustc -ErrorAction Stop
+$pnpm = Require-Command "pnpm"
+Write-Host "Rustup command: $($rustup.Source)"
+Write-Host "Cargo command: $($cargo.Source)"
+Write-Host "Rustc command: $($rustcCmd.Source)"
 
 New-Item -ItemType Directory -Force $WorkRoot, $CacheDir, $DesktopCargoTargetDir, $CliCargoTargetDir, $PnpmStoreDir, $InstallerDepsDir, $AssetsDir | Out-Null
 
@@ -198,16 +285,8 @@ try {
         $env:CARGO_BUILD_TARGET = "x86_64-pc-windows-msvc"
     }
     if ($env:CARGO_BUILD_TARGET -and $rustup) {
-        $toolchain = "stable-x86_64-pc-windows-msvc"
-        & $rustup.Source set auto-self-update disable
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "Warning: rustup auto-self-update disable failed with exit code $LASTEXITCODE"
-        }
-        Invoke-Native $rustup.Source @("toolchain", "install", $toolchain, "--profile", "minimal")
-        if ($env:CARGO_BUILD_TARGET -ne "x86_64-pc-windows-msvc") {
-            Invoke-Native $rustup.Source @("target", "add", $env:CARGO_BUILD_TARGET, "--toolchain", $toolchain)
-        }
-        $env:RUSTUP_TOOLCHAIN = $toolchain
+        $installedRustTargets = @(& $rustup.Source target list --installed --toolchain $toolchain)
+        Write-Host "Rust installed targets ($toolchain): $($installedRustTargets -join ', ')"
     }
     $env:PNPM_HOME = if ($env:PNPM_HOME) { $env:PNPM_HOME } else { Join-Path $CacheDir "pnpm-home" }
 
@@ -215,10 +294,6 @@ try {
     Write-Host "Source: $SourceDir"
     Write-Host "Cargo target cache: $DesktopCargoTargetDir"
     Write-Host "pnpm store cache: $PnpmStoreDir"
-
-    if ($WarmCliCache) {
-        Write-Host "WarmCliCache requested; the CLI is now built during every release packaging run."
-    }
 
     Invoke-Native $pnpm.Source @(
         "--dir", "apps\desktop-tauri",
@@ -298,15 +373,17 @@ try {
         throw "pnpm tauri build exited with code $tauriExitCode"
     }
 
-    $desktopExe = Join-Path $releaseBinDir "codexbar-desktop.exe"
-    $releaseExe = Join-Path $releaseBinDir "codexbar.exe"
+    $desktopExe = Join-Path $releaseBinDir "codexbar.exe"
+    $legacyDesktopExe = Join-Path $releaseBinDir "codexbar-desktop.exe"
+    $releaseExe = Join-Path $releaseBinDir "codexbar-cli.exe"
     if (-not (Test-Path $sourceExe)) {
         throw "Missing expected Tauri binary: $sourceExe"
     }
 
     Copy-Item $sourceExe $desktopExe -Force
+    Copy-Item $sourceExe $legacyDesktopExe -Force
     if (Get-ObjdumpImportsWebView2Loader -ExePath $desktopExe) {
-        throw "codexbar-desktop.exe imports WebView2Loader.dll, but release builds are expected to statically link the loader."
+        throw "codexbar.exe imports WebView2Loader.dll, but release builds are expected to statically link the loader."
     }
 
     $env:CARGO_TARGET_DIR = $CliCargoTargetDir
@@ -331,6 +408,16 @@ try {
     }
     Copy-Item $sourceCliExe $releaseExe -Force
 
+    $verifyExecutablesScript = Join-Path $SourceDir "scripts\verify-windows-executables.ps1"
+    if (-not (Test-Path $verifyExecutablesScript)) {
+        throw "Executable verification script not found: $verifyExecutablesScript"
+    }
+    & $verifyExecutablesScript `
+        -DesktopExe $desktopExe `
+        -CliExe $releaseExe `
+        -LegacyDesktopExe $legacyDesktopExe `
+        -CheckCliStdout
+
     if ($WarmCacheOnly) {
         $warmExe = Join-Path $AssetsDir "CodexBar-$version-warm.exe"
         Copy-Item $desktopExe $warmExe -Force
@@ -353,10 +440,7 @@ try {
     Assert-MicrosoftSignature -Path $vcRedistPath
     Assert-MicrosoftSignature -Path $webView2BootstrapperPath
 
-    $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
-    if (-not (Test-Path $iscc)) {
-        throw "Inno Setup compiler not found at $iscc"
-    }
+    $iscc = Get-InnoSetupCompiler
 
     $installerOut = Join-Path $CacheDir "installer"
     New-Item -ItemType Directory -Force $installerOut | Out-Null
@@ -380,6 +464,7 @@ try {
     $installer = Join-Path $installerOut "CodexBar-$version-Setup.exe"
     $portableExe = Join-Path $AssetsDir "CodexBar-$version-portable.exe"
     $installerAsset = Join-Path $AssetsDir "CodexBar-$version-Setup.exe"
+    $cliZip = Join-Path $AssetsDir "CodexBarCLI-v$version-windows-x64.zip"
 
     foreach ($path in @($desktopExe, $releaseExe, $installer)) {
         if (-not (Test-Path $path)) {
@@ -389,8 +474,15 @@ try {
 
     Copy-Item $desktopExe $portableExe -Force
     Copy-Item $installer $installerAsset -Force
+    Compress-Archive -Path $releaseExe -DestinationPath $cliZip -Force
 
-    foreach ($asset in @($installerAsset, $portableExe)) {
+    $zipVerifyDir = Join-Path ([IO.Path]::GetTempPath()) ("codexbar-cli-zip-verify-" + [guid]::NewGuid().ToString('N'))
+    Expand-Archive -LiteralPath $cliZip -DestinationPath $zipVerifyDir -Force
+    $extractedCli = Join-Path $zipVerifyDir "codexbar-cli.exe"
+    if (-not (Test-Path -LiteralPath $extractedCli -PathType Leaf)) { throw "CLI zip missing codexbar-cli.exe entry: $cliZip" }
+    if ((Get-FileHash -LiteralPath $extractedCli -Algorithm SHA256).Hash -cne (Get-FileHash -LiteralPath $releaseExe -Algorithm SHA256).Hash) { throw "CLI zip entry hash mismatch: $cliZip" }
+
+    foreach ($asset in @($installerAsset, $portableExe, $cliZip)) {
         $fileName = Split-Path $asset -Leaf
         $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLower()
         "$hash  $fileName" | Set-Content -Encoding ascii "$asset.sha256"
@@ -407,27 +499,10 @@ try {
         }
     }
 
-    if ($UploadRelease) {
-        $gh = Require-Command "gh"
-        $assetPaths = @(
-            $installerAsset,
-            "$installerAsset.sha256",
-            $portableExe,
-            "$portableExe.sha256"
-        )
-        foreach ($path in $assetPaths) {
-            if (-not (Test-Path $path)) {
-                throw "Missing upload asset: $path"
-            }
-        }
-
-        Invoke-Native $gh.Source @("release", "view", $UploadRelease)
-        Invoke-Native $gh.Source (@("release", "upload", $UploadRelease) + $assetPaths + @("--clobber"))
-    }
 
     Write-Host ""
     Write-Host "Release assets:"
-    Get-ChildItem $AssetsDir -Filter "CodexBar-$version-*" |
+    Get-ChildItem $AssetsDir -Filter "CodexBar*" |
         Sort-Object Name |
         Select-Object Name, Length, LastWriteTime |
         Format-Table -AutoSize

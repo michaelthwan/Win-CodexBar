@@ -11,11 +11,11 @@ mod sec_token;
 
 use async_trait::async_trait;
 
-use crate::browser::cookies::get_cookie_header;
 use crate::core::{
     FetchContext, Provider, ProviderError, ProviderFetchResult, ProviderId, ProviderMetadata,
     SourceMode, UsageSnapshot,
 };
+use crate::providers::browser_cookie_header;
 
 use self::parser::parse_response;
 pub use self::region::AlibabaRegion;
@@ -45,6 +45,7 @@ impl AlibabaProvider {
                 is_primary: false,
                 dashboard_url: Some("https://modelstudio.console.alibabacloud.com"),
                 status_page_url: None,
+                tertiary_label_key: None,
             },
         }
     }
@@ -73,13 +74,7 @@ impl AlibabaProvider {
         }
 
         let region = AlibabaRegion::from_settings_value(ctx.api_region.as_deref());
-        for domain in region.cookie_domains() {
-            match get_cookie_header(domain) {
-                Ok(cookies) if !cookies.is_empty() => return Ok(cookies),
-                _ => {}
-            }
-        }
-        Err(ProviderError::AuthRequired)
+        browser_cookie_header(region.cookie_domains())
     }
 
     async fn resolve_sec_token(
@@ -140,7 +135,7 @@ impl AlibabaProvider {
         let cookies = self.resolve_cookies(ctx)?;
         let cache_key = sec_token_cache_key(region.region_code(), &cookies);
 
-        let client = reqwest::Client::builder()
+        let client = crate::core::credentialed_http_client_builder()
             .timeout(std::time::Duration::from_secs(ctx.web_timeout.max(15)))
             .build()
             .map_err(|e| ProviderError::Other(e.to_string()))?;

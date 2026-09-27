@@ -12,6 +12,8 @@ pub fn is_ssh_session() -> bool {
 #[cfg(windows)]
 pub fn is_remote_session() -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_REMOTESESSION};
+    // SAFETY: GetSystemMetrics is a query-only Win32 call taking a constant
+    // metric index; it reads no caller memory and returns a small int.
     unsafe { GetSystemMetrics(SM_REMOTESESSION) != 0 }
 }
 
@@ -23,12 +25,12 @@ pub fn is_remote_session() -> bool {
 
 /// User-facing message explaining why launch is blocked under SSH.
 pub fn ssh_session_error_message() -> &'static str {
-    "CodexBar can't render its native window from an SSH session on this machine.\n\nOpen it from the logged-in Windows desktop session instead, or use the CLI over SSH:\n\n  codexbar usage -p claude\n\nThe startup log is written to %TEMP%\\codexbar_launch_<pid>.log."
+    "CodexBar can't render its native window from an SSH session on this machine.\n\nOpen it from the logged-in Windows desktop session instead, or use the installed CLI over SSH:\n\n  codexbar-cli usage -p claude\n\nThe startup log is written to %TEMP%\\codexbar_launch_<pid>.log."
 }
 
 /// User-facing message explaining why launch is blocked under RDP.
 pub fn remote_session_error_message() -> &'static str {
-    "CodexBar can't render its native window inside a Windows Remote Desktop session on this machine.\n\nRun it from the local desktop session instead, or use the CLI while connected over RDP:\n\n  codexbar usage -p claude\n\nThe startup log is written to %TEMP%\\codexbar_launch_<pid>.log."
+    "CodexBar can't render its native window inside a Windows Remote Desktop session on this machine.\n\nRun it from the local desktop session instead, or use the installed CLI while connected over RDP:\n\n  codexbar-cli usage -p claude\n\nThe startup log is written to %TEMP%\\codexbar_launch_<pid>.log."
 }
 
 /// Return a user-facing reason for blocking launch, or `None` when launch is fine.
@@ -68,6 +70,9 @@ pub fn primary_work_area_pixels() -> Option<WorkAreaPixels> {
     };
 
     let mut rect = RECT::default();
+    // SAFETY: SystemParametersInfoW with SPI_GETWORKAREA reads the desktop work
+    // area into the single RECT we pass by mutable pointer; the flags field is
+    // zero and the function performs no other memory access.
     let ok = unsafe {
         SystemParametersInfoW(
             SPI_GETWORKAREA,

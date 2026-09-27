@@ -2,20 +2,9 @@
 //!
 //! Fetches operational status from provider status pages
 
-#![allow(dead_code)]
-#![allow(unused_imports)]
-
-pub mod indicators;
-
+#![allow(dead_code, reason = "status types reserved for future UI integration")]
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
-// Re-export indicator types for convenience
-pub use indicators::{
-    OverlayPosition, ProviderStatus as IndicatorProviderStatus,
-    StatusLevel as IndicatorStatusLevel, StatusOverlayConfig, StatuspageIncident,
-    StatuspageResponse, StatuspageStatus,
-};
 
 /// Status level for a provider
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -90,7 +79,7 @@ pub fn get_status_page_url(provider: &str) -> Option<&'static str> {
 
 /// Fetch status from a Statuspage.io-based status page
 pub async fn fetch_statuspage_io(url: &str) -> Result<ProviderStatus, String> {
-    let client = reqwest::Client::builder()
+    let client = crate::core::apply_app_proxy(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| e.to_string())?;
@@ -142,7 +131,7 @@ pub async fn fetch_statuspage_io(url: &str) -> Result<ProviderStatus, String> {
 
 /// Fetch status with components from a Statuspage.io-based status page
 pub async fn fetch_statuspage_io_components(url: &str) -> Result<ProviderStatus, String> {
-    let client = reqwest::Client::builder()
+    let client = crate::core::apply_app_proxy(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| e.to_string())?;
@@ -198,18 +187,50 @@ pub async fn fetch_statuspage_io_components(url: &str) -> Result<ProviderStatus,
     })
 }
 
-/// Fetch status for a specific provider
+/// Fetch status for a specific provider.
+///
+/// Upstream 0.50.0 #2925: transport errors are omitted until a real status
+/// fetch succeeds — a failed refresh never replaces the last successful
+/// result, so long-running consumers (hooks watch, serve) keep showing the
+/// last known status instead of dropping to "unknown".
 pub async fn fetch_provider_status(provider: &str) -> Option<ProviderStatus> {
     let url = get_status_page_url(provider)?;
 
     // Try the simple status endpoint first
-    match fetch_statuspage_io(url).await {
+    let fresh = match fetch_statuspage_io(url).await {
         Ok(status) => Some(status),
         Err(_) => {
             // Fall back to components endpoint
             fetch_statuspage_io_components(url).await.ok()
         }
+    };
+    match fresh {
+        Some(status) => {
+            cache_last_success(provider, &status);
+            Some(status)
+        }
+        None => last_cached_success(provider),
     }
+}
+
+/// Process-wide cache of the last successful status per provider.
+fn status_cache() -> &'static std::sync::Mutex<HashMap<String, ProviderStatus>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, ProviderStatus>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn cache_last_success(provider: &str, status: &ProviderStatus) {
+    if let Ok(mut cache) = status_cache().lock() {
+        cache.insert(provider.to_string(), status.clone());
+    }
+}
+
+fn last_cached_success(provider: &str) -> Option<ProviderStatus> {
+    status_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(provider).cloned())
 }
 
 /// Fetch status for all providers in parallel

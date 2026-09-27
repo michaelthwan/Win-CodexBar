@@ -6,7 +6,10 @@
 //! - Manual cookies
 //! - Other user preferences
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "settings types mirror the full config schema; some fields are not yet consumed"
+)]
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -14,14 +17,24 @@ use std::path::PathBuf;
 
 use crate::core::ProviderId;
 
+/// Stable namespace used by the desktop bridge for quota metric rows.
+pub const USAGE_ITEM_METRIC_PREFIX: &str = "metric:";
+pub const CODEX_SPARK_USAGE_ITEM_IDS: [&str; 2] = [
+    "metric:extra-codex-spark",
+    "metric:extra-codex-spark-weekly",
+];
+pub const CLAUDE_DAILY_ROUTINES_USAGE_ITEM_ID: &str = "metric:extra-claude-routines";
+
 mod api_keys;
 mod manual_cookies;
+mod provider_workspace;
 mod raw;
 mod status;
 mod types;
 
 pub use api_keys::*;
 pub use manual_cookies::*;
+pub use provider_workspace::*;
 use raw::RawSettings;
 pub use status::*;
 pub use types::*;
@@ -30,14 +43,63 @@ pub use types::*;
 mod tests;
 
 /// Application settings
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LowPowerModePreference {
+    #[default]
+    Off,
+    On,
+    Automatic,
+}
+
+impl LowPowerModePreference {
+    pub fn resolve(self, system_battery_saver_enabled: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::On => true,
+            Self::Automatic => system_battery_saver_enabled,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Automatic => "automatic",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "on" => Some(Self::On),
+            "automatic" => Some(Self::Automatic),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(from = "RawSettings", default)]
 pub struct Settings {
     /// Enabled provider IDs (by CLI name)
     pub enabled_providers: HashSet<String>,
 
-    /// Refresh interval in seconds (0 = manual only)
+    /// Refresh interval in seconds (0 = manual only).
+    /// Ignored when [`Self::adaptive_refresh`] is true.
     pub refresh_interval_secs: u64,
+
+    /// When true, ignore the fixed interval and use adaptive refresh delays.
+    #[serde(default)]
+    pub adaptive_refresh: bool,
+
+    /// Force-refresh enabled providers whenever the tray/menu surface opens.
+    #[serde(default)]
+    pub refresh_all_providers_on_menu_open: bool,
+
+    /// Off/On/Automatic background-work power preference (upstream 0.53).
+    #[serde(default)]
+    pub low_power_mode_preference: LowPowerModePreference,
 
     /// Whether to start minimized
     pub start_minimized: bool,
@@ -51,14 +113,21 @@ pub struct Settings {
     /// Whether to play sound effects for threshold alerts
     pub sound_enabled: bool,
 
-    /// Sound volume for alerts (0-100)
-    pub sound_volume: u8,
+    /// Per-notification WAV files. Unassigned events use the selected sound theme.
+    #[serde(default)]
+    pub notification_sound_paths: NotificationSoundPaths,
+
+    /// Sound theme used when an event has no custom WAV file.
+    #[serde(default)]
+    pub notification_sound_theme: NotificationSoundTheme,
 
     /// High usage threshold for warnings (percentage)
     pub high_usage_threshold: f64,
 
     /// Critical usage threshold for alerts (percentage)
     pub critical_usage_threshold: f64,
+
+    pub provider_usage_thresholds: HashMap<String, UsageThresholdOverride>,
 
     /// Merge mode: show all enabled providers in a single tray icon
     pub merge_tray_icons: bool,
@@ -82,20 +151,30 @@ pub struct Settings {
     /// Show usage bars as "used" (true) or "remaining" (false)
     pub show_as_used: bool,
 
-    /// Enable random "surprise" animations (blinks, wiggles)
-    pub surprise_animations: bool,
-
     /// Enable UI animations (chart entrances, transitions)
     pub enable_animations: bool,
 
     /// Show reset times as relative (e.g., "2h 30m" instead of "3:00 PM")
     pub reset_time_relative: bool,
 
+    /// Replace exhausted quota text with its concrete future reset time.
+    #[serde(default)]
+    pub show_reset_when_exhausted: bool,
+
+    /// Warn when Codex or Claude pace predicts exhaustion before reset.
+    #[serde(default)]
+    pub predictive_pace_warning_enabled: bool,
+
+    /// Show pace visualizations and forecast text in provider menu cards.
+    #[serde(default = "default_true")]
+    pub show_pace: bool,
+
     /// Menu bar display mode: "minimal", "compact", or "detailed"
     pub menu_bar_display_mode: String,
 
-    /// Show credits and extra usage information in the UI
-    pub show_credits_extra_usage: bool,
+    /// Overview card layout: "detailed" or "compact".
+    #[serde(default = "default_overview_layout")]
+    pub overview_layout: String,
 
     /// Show all token accounts in provider menus instead of collapsing behind switchers
     #[serde(default)]
@@ -106,10 +185,6 @@ pub struct Settings {
     /// fields; legacy `settings.json` files are migrated via [`RawSettings`].
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub provider_configs: HashMap<ProviderId, ProviderConfig>,
-
-    /// Show debug-oriented settings and troubleshooting surfaces
-    #[serde(default)]
-    pub show_debug_settings: bool,
 
     /// Disable credential/keychain-style reads where supported
     #[serde(default)]
@@ -137,6 +212,38 @@ pub struct Settings {
     #[serde(default = "default_global_shortcut")]
     pub global_shortcut: String,
 
+    /// Additional Codex home or sessions directories to include in local cost scans.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codex_custom_sessions_dirs: Vec<String>,
+
+    /// Discover local and configured SSH Codex/Claude sessions.
+    #[serde(default)]
+    pub agent_sessions_enabled: bool,
+
+    /// SSH targets queried for remote agent sessions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_session_ssh_hosts: Vec<String>,
+
+    /// Master switch for external hooks (`hooks.json` next to settings).
+    #[serde(default)]
+    pub hooks_enabled: bool,
+
+    /// Route provider/app HTTPS through a user-configured HTTP(S) proxy (#235).
+    #[serde(default)]
+    pub http_proxy_enabled: bool,
+
+    /// Proxy base URL, e.g. `http://127.0.0.1:7890`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub http_proxy_url: String,
+
+    /// Optional proxy basic-auth username.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub http_proxy_username: String,
+
+    /// Optional proxy basic-auth password (stored in local settings.json).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub http_proxy_password: String,
+
     /// Automatically download updates in the background
     #[serde(default)]
     pub auto_download_updates: bool,
@@ -153,6 +260,25 @@ pub struct Settings {
     #[serde(default)]
     pub theme: ThemePreference,
 
+    /// Main PopOut window display scale, in the inclusive range 100..=250.
+    /// 100 % is normal size; higher values enlarge the window content.
+    #[serde(default = "default_window_scale_percent")]
+    pub window_scale_percent: u16,
+
+    /// Tray flyout display scale, in the inclusive range 100..=200.
+    /// 100 % is normal size; higher values enlarge the flyout content.
+    #[serde(default = "default_tray_scale_percent")]
+    pub tray_scale_percent: u16,
+
+    /// Keep the tray flyout above other windows after it loses focus.
+    /// Disabled by default so the flyout retains normal z-order behavior.
+    #[serde(default)]
+    pub tray_panel_always_on_top: bool,
+
+    /// Enable the local PowerToys Command Palette status pipe.
+    #[serde(default)]
+    pub powertoys_status_pipe_enabled: bool,
+
     /// Show the always-on-top floating capacity bar.
     #[serde(default)]
     pub float_bar_enabled: bool,
@@ -162,9 +288,17 @@ pub struct Settings {
     #[serde(default = "default_float_bar_opacity")]
     pub float_bar_opacity: u8,
 
+    /// Floating-bar visual scale, in the inclusive range 75..=200.
+    #[serde(default = "default_float_bar_scale")]
+    pub float_bar_scale: u8,
+
     /// Floating-bar orientation: "horizontal" (default) or "vertical".
     #[serde(default = "default_float_bar_orientation")]
     pub float_bar_orientation: String,
+
+    /// Floating-bar visual style: "floating" (default) or "taskbar".
+    #[serde(default = "default_float_bar_style")]
+    pub float_bar_style: String,
 
     /// When true the floating bar is fully click-through (overlay mode).
     #[serde(default)]
@@ -179,14 +313,98 @@ pub struct Settings {
     /// (light-on-dark, the original look).
     #[serde(default)]
     pub float_bar_dark_text: bool,
+
+    /// When true, show the primary window's next reset inline in each pill.
+    #[serde(default)]
+    pub float_bar_show_reset_inline: bool,
+
+    /// When true, show local cost summaries in the floating bar.
+    #[serde(default)]
+    pub float_bar_show_cost: bool,
+
+    /// Promote the tray icon out of the Windows hidden-icons overflow area.
+    /// Only has effect on Windows 11 (build ≥ 22000); silently ignored elsewhere.
+    /// Defaults on so upgrades keep the icon pinned to the taskbar notification area.
+    #[serde(default = "default_true")]
+    pub promote_tray_icon: bool,
+
+    /// When true, show Claude Daily Routines usage in extras.
+    /// Defaults on to match upstream visibility.
+    #[serde(default = "default_true")]
+    pub claude_daily_routines_usage_visible: bool,
+
+    /// Explicit consent to read (and refresh) Claude Code's own credentials
+    /// (`~/.claude/.credentials.json` / Credential Manager). Default OFF —
+    /// upstream #2634: without consent the OAuth source stays closed and Auto
+    /// falls back to labeled reduced-fidelity CLI usage; refreshed tokens are
+    /// never rotated into Claude Code's storage without consent (#2745).
+    #[serde(default)]
+    pub claude_allow_reading_claude_code_credentials: bool,
+
+    /// Optional work-week length [2,6] for session-equivalent weekly forecast.
+    /// `None` uses wall-clock time until weekly reset.
+    #[serde(default)]
+    pub weekly_progress_work_days: Option<u8>,
+
+    /// Alibaba Token Plan API region: "cn" | "intl" | "cn-personal" | "intl-personal".
+    #[serde(default = "default_alibaba_token_plan_region")]
+    pub alibaba_token_plan_region: String,
+
+    /// Opt-in: allow read-only Codex usage reads from the CLI-owned OAuth
+    /// credential source. Win-CodexBar never refreshes or writes `auth.json`.
+    /// Default OFF — when disabled, the source must contain refresh
+    /// provenance; JWT expiry is checked when available (upstream 0.50.1
+    /// #2944).
+    #[serde(default)]
+    pub codex_external_oauth_sources_allowed: bool,
+
+    /// How cost is rendered on provider MenuCards (#2976).
+    #[serde(default)]
+    pub cost_summary_display_style: CostSummaryDisplayStyle,
+
+    /// Opt-in read-only import of OpenCodex usage.jsonl into Usage & Spend / CLI cost output.
+    #[serde(default)]
+    pub open_codex_usage_logs_enabled: bool,
+
+    /// Hide native Codex spend rows when an OpenCodex import is present.
+    #[serde(default)]
+    pub hide_native_codex_cost_when_open_codex_present: bool,
+}
+
+fn default_window_scale_percent() -> u16 {
+    100
+}
+
+fn default_alibaba_token_plan_region() -> String {
+    "cn".to_string()
+}
+
+pub fn clamp_window_scale_percent(value: u16) -> u16 {
+    value.clamp(100, 250)
+}
+
+fn default_tray_scale_percent() -> u16 {
+    100
+}
+
+pub fn clamp_tray_scale_percent(value: u16) -> u16 {
+    value.clamp(100, 200)
 }
 
 fn default_float_bar_opacity() -> u8 {
     80
 }
 
+fn default_float_bar_scale() -> u8 {
+    100
+}
+
 fn default_float_bar_orientation() -> String {
     "horizontal".to_string()
+}
+
+fn default_float_bar_style() -> String {
+    "floating".to_string()
 }
 
 /// Clamp the floating-bar opacity to the supported range.
@@ -197,6 +415,11 @@ pub fn clamp_float_bar_opacity(value: u8) -> u8 {
     value.clamp(30, 100)
 }
 
+/// Clamp the floating-bar visual scale to the supported range.
+pub fn clamp_float_bar_scale(value: u8) -> u8 {
+    value.clamp(75, 200)
+}
+
 /// Normalize a floating-bar orientation string. Unknown values fall back to
 /// the default ("horizontal") so a corrupt settings file can't put the
 /// renderer into an undefined state.
@@ -205,6 +428,44 @@ pub fn normalize_float_bar_orientation(value: &str) -> String {
         "vertical" => "vertical".to_string(),
         _ => "horizontal".to_string(),
     }
+}
+
+/// Normalize a floating-bar style string. Unknown values fall back to the
+/// original floating style so existing settings keep their previous look.
+pub fn normalize_float_bar_style(value: &str) -> String {
+    match value {
+        "taskbar" => "taskbar".to_string(),
+        _ => "floating".to_string(),
+    }
+}
+
+/// Canonicalize a requested provider display order.
+///
+/// Keeps requested provider IDs that map to a real [`ProviderId`], drops
+/// duplicates, and appends omitted providers in canonical order. An empty
+/// request intentionally returns the full canonical order so display callers
+/// can use one path for default and customized ordering.
+pub fn normalize_provider_order(requested: &[String]) -> Vec<String> {
+    let canonical = ProviderId::all()
+        .iter()
+        .map(|provider| provider.cli_name().to_string())
+        .collect::<Vec<_>>();
+    let valid = canonical.iter().map(String::as_str).collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(canonical.len());
+
+    for provider_id in requested {
+        if valid.contains(provider_id.as_str()) && seen.insert(provider_id.clone()) {
+            out.push(provider_id.clone());
+        }
+    }
+    for provider_id in canonical {
+        if seen.insert(provider_id.clone()) {
+            out.push(provider_id);
+        }
+    }
+
+    out
 }
 
 fn default_global_shortcut() -> String {
@@ -229,6 +490,7 @@ const DEFAULT_PROVIDER_SOURCE: &str = "auto";
 fn default_api_region(id: ProviderId) -> &'static str {
     match id {
         ProviderId::Alibaba => crate::providers::AlibabaRegion::Singapore.settings_value(),
+        ProviderId::AlibabaTokenPlan => "cn",
         ProviderId::Zai | ProviderId::MiniMax => "global",
         _ => "",
     }
@@ -236,6 +498,24 @@ fn default_api_region(id: ProviderId) -> &'static str {
 
 /// Default for the codex `openai_web_extras` boolean (true = show extras).
 const DEFAULT_CODEX_OPENAI_WEB_EXTRAS: bool = true;
+const DEFAULT_CODEX_SPARK_USAGE_VISIBLE: bool = true;
+
+fn normalize_hidden_usage_item_ids(ids: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut normalized = ids
+        .into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && !id.chars().any(char::is_control)
+                && id.starts_with(USAGE_ITEM_METRIC_PREFIX)
+        })
+        .filter(|id| seen.insert(id.clone()))
+        .collect::<Vec<_>>();
+    normalized.sort_unstable();
+    normalized
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -247,56 +527,102 @@ impl Default for Settings {
         Self {
             enabled_providers: enabled,
             refresh_interval_secs: 300, // 5 minutes
+            adaptive_refresh: false,
+            refresh_all_providers_on_menu_open: false,
+            low_power_mode_preference: LowPowerModePreference::Off,
             start_minimized: false,
             start_at_login: false,
             show_notifications: true,
             sound_enabled: true,
-            sound_volume: 100,
+            notification_sound_paths: NotificationSoundPaths::default(),
+            notification_sound_theme: NotificationSoundTheme::default(),
             high_usage_threshold: 70.0,
             critical_usage_threshold: 90.0,
+            provider_usage_thresholds: HashMap::new(),
             merge_tray_icons: false, // Show single provider by default
             tray_icon_mode: TrayIconMode::default(), // Single icon by default
             switcher_shows_icons: true,
             menu_bar_shows_highest_usage: false,
             menu_bar_shows_percent: false,
-            show_as_used: true,         // Show as "used" by default
-            surprise_animations: false, // Off by default
-            enable_animations: true,    // Animations enabled by default
-            reset_time_relative: true,  // Show relative times by default
+            show_as_used: true,        // Show as "used" by default
+            enable_animations: true,   // Animations enabled by default
+            reset_time_relative: true, // Show relative times by default
+            show_reset_when_exhausted: false,
+            predictive_pace_warning_enabled: false,
+            show_pace: true,
             menu_bar_display_mode: "detailed".to_string(), // Detailed mode by default
-            show_credits_extra_usage: true, // Show credits + extra usage by default
+            overview_layout: default_overview_layout(),
             show_all_token_accounts_in_menu: false,
             provider_configs: HashMap::new(),
-            show_debug_settings: false,
             disable_keychain_access: false,
             hide_personal_info: false, // Show personal info by default
             update_channel: UpdateChannel::default(), // Stable by default
             provider_metrics: HashMap::new(), // Empty = use Automatic for all
             provider_order: Vec::new(), // Empty = canonical ProviderId::all() order
             global_shortcut: default_global_shortcut(), // Ctrl+Shift+U by default
+            codex_custom_sessions_dirs: Vec::new(),
+            agent_sessions_enabled: false,
+            agent_session_ssh_hosts: Vec::new(),
+            hooks_enabled: false,
+            http_proxy_enabled: false,
+            http_proxy_url: String::new(),
+            http_proxy_username: String::new(),
+            http_proxy_password: String::new(),
             auto_download_updates: false, // Require explicit opt-in for background downloads
             install_updates_on_quit: false, // Don't auto-install on quit by default
             ui_language: Language::default(), // English by default
             theme: ThemePreference::default(), // Auto (follows prefers-color-scheme)
+            window_scale_percent: default_window_scale_percent(),
+            tray_scale_percent: default_tray_scale_percent(),
+            tray_panel_always_on_top: false,
+            powertoys_status_pipe_enabled: false,
             float_bar_enabled: false,
             float_bar_opacity: default_float_bar_opacity(),
+            float_bar_scale: default_float_bar_scale(),
             float_bar_orientation: default_float_bar_orientation(),
+            float_bar_style: default_float_bar_style(),
             float_bar_click_through: false,
             float_bar_provider_ids: Vec::new(),
             float_bar_dark_text: false,
+            float_bar_show_reset_inline: false,
+            float_bar_show_cost: false,
+            promote_tray_icon: true,
+            claude_daily_routines_usage_visible: true,
+            claude_allow_reading_claude_code_credentials: false,
+            weekly_progress_work_days: None,
+            alibaba_token_plan_region: default_alibaba_token_plan_region(),
+            codex_external_oauth_sources_allowed: false,
+            cost_summary_display_style: CostSummaryDisplayStyle::default(),
+            open_codex_usage_logs_enabled: false,
+            hide_native_codex_cost_when_open_codex_present: false,
         }
+    }
+}
+
+fn default_overview_layout() -> String {
+    "compact".to_string()
+}
+
+pub fn normalize_overview_layout(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "compact" => "compact".to_string(),
+        "detailed" => "detailed".to_string(),
+        _ => default_overview_layout(),
     }
 }
 
 impl Settings {
     /// Get the settings file path
     pub fn settings_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|p| p.join("CodexBar").join("settings.json"))
+        crate::logging::config_root().map(|p| p.join("settings.json"))
     }
 
     /// Load settings from disk
     pub fn load() -> Self {
-        #[allow(unused_mut)]
+        #[allow(
+            unused_mut,
+            reason = "mutability is needed for conditional initialization paths that the compiler cannot prove"
+        )]
         let mut settings = match Self::settings_path() {
             Some(path) if path.exists() => match crate::secure_file::read_string(&path) {
                 Ok(content) => {
@@ -307,13 +633,80 @@ impl Settings {
             _ => Self::default(),
         };
 
-        // Sync autostart toggle with actual registry state
+        // Sync autostart toggle with actual registry state and repair stale commands from older builds.
         #[cfg(target_os = "windows")]
         {
-            settings.start_at_login = Self::is_start_at_login_enabled();
+            settings.start_at_login = Self::sync_start_at_login_registry();
+            settings.apply_promote_tray_default_migration();
         }
 
+        // One-shot migration: materialize the persisted hidden usage-item list
+        // from the pre-0.62 per-provider visibility flags. After this the list
+        // is the sole source of truth and the flags stay untouched.
+        settings.migrate_legacy_usage_item_flags();
+
         settings
+    }
+
+    /// Materialize `hidden_usage_item_ids` from the pre-0.62 per-provider
+    /// visibility flags where the list was never persisted. Idempotent: a
+    /// provider with an explicit list is left alone.
+    fn migrate_legacy_usage_item_flags(&mut self) {
+        if self
+            .provider_config(ProviderId::Codex)
+            .and_then(|config| config.hidden_usage_item_ids.as_ref())
+            .is_none()
+            && !self.spark_usage_visible(ProviderId::Codex)
+        {
+            self.toggle_hidden_items(ProviderId::Codex, &CODEX_SPARK_USAGE_ITEM_IDS, false);
+        }
+        if self
+            .provider_config(ProviderId::Claude)
+            .and_then(|config| config.hidden_usage_item_ids.as_ref())
+            .is_none()
+            && !self.claude_daily_routines_usage_visible
+        {
+            self.toggle_hidden_items(
+                ProviderId::Claude,
+                &[CLAUDE_DAILY_ROUTINES_USAGE_ITEM_ID],
+                false,
+            );
+        }
+    }
+
+    /// Marker written after the one-shot "pin tray by default" migration (issue #237).
+    fn promote_tray_default_marker_path() -> Option<PathBuf> {
+        crate::logging::config_root().map(|p| p.join(".tray-pin-default-v1"))
+    }
+
+    /// Old builds defaulted `promote_tray_icon` to false and persisted that on any
+    /// settings save. Flip those installs to the new default once; later opt-outs
+    /// are preserved because the marker file remains.
+    fn should_migrate_promote_tray_default(
+        promote_tray_icon: bool,
+        already_migrated: bool,
+    ) -> bool {
+        !already_migrated && !promote_tray_icon
+    }
+
+    fn apply_promote_tray_default_migration(&mut self) {
+        let Some(marker) = Self::promote_tray_default_marker_path() else {
+            return;
+        };
+        let already_migrated = marker.exists();
+        if Self::should_migrate_promote_tray_default(self.promote_tray_icon, already_migrated) {
+            self.promote_tray_icon = true;
+            if let Err(error) = self.save() {
+                tracing::warn!("Failed to persist promote_tray_icon default migration: {error}");
+            }
+        }
+        if !already_migrated && let Some(parent) = marker.parent() {
+            // Best-effort marker dir creation; the write below reports failure.
+            let _created_dir = std::fs::create_dir_all(parent);
+            if let Err(error) = std::fs::write(&marker, b"1") {
+                tracing::warn!("Failed to write promote_tray_icon migration marker: {error}");
+            }
+        }
     }
 
     /// Save settings to disk
@@ -332,8 +725,29 @@ impl Settings {
         Ok(())
     }
 
-    fn start_at_login_command(exe_path: &std::path::Path) -> String {
+    fn start_at_login_exe_path(current_exe: &std::path::Path) -> std::path::PathBuf {
+        let file_name = current_exe.file_name().and_then(|name| name.to_str());
+        if file_name.is_some_and(|name| {
+            name.eq_ignore_ascii_case("codexbar-cli.exe")
+                || name.eq_ignore_ascii_case("codexbar-desktop.exe")
+        }) && let Some(desktop_exe) = current_exe
+            .parent()
+            .map(|dir| dir.join("codexbar.exe"))
+            .filter(|path| path.exists())
+        {
+            return desktop_exe;
+        }
+
+        current_exe.to_path_buf()
+    }
+
+    fn start_at_login_command(current_exe: &std::path::Path) -> String {
+        let exe_path = Self::start_at_login_exe_path(current_exe);
         format!("\"{}\"", exe_path.display())
+    }
+
+    fn start_at_login_command_needs_repair(existing: &str, current_exe: &std::path::Path) -> bool {
+        existing != Self::start_at_login_command(current_exe)
     }
 
     #[cfg(target_os = "windows")]
@@ -352,10 +766,46 @@ impl Settings {
             let command = Self::start_at_login_command(&exe_path);
             run_key.set_value("CodexBar", &command)?;
         } else {
-            let _ = run_key.delete_value("CodexBar");
+            // Best-effort removal; a missing value means the desired state already.
+            let _removed_value = run_key.delete_value("CodexBar");
         }
 
         Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn sync_start_at_login_registry() -> bool {
+        use winreg::RegKey;
+        use winreg::enums::*;
+
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let Ok(run_key) = hkcu.open_subkey_with_flags(
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            KEY_READ | KEY_WRITE,
+        ) else {
+            return false;
+        };
+
+        let Ok(existing) = run_key.get_value::<String, _>("CodexBar") else {
+            return false;
+        };
+
+        match std::env::current_exe() {
+            Ok(exe_path) if Self::start_at_login_command_needs_repair(&existing, &exe_path) => {
+                let command = Self::start_at_login_command(&exe_path);
+                if let Err(error) = run_key.set_value("CodexBar", &command) {
+                    tracing::warn!("Failed to repair CodexBar start-at-login command: {error}");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to resolve current executable for start-at-login sync: {error}"
+                );
+            }
+            _ => {}
+        }
+
+        true
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -418,23 +868,36 @@ impl Settings {
 
     /// Get list of enabled provider IDs
     pub fn get_enabled_provider_ids(&self) -> Vec<ProviderId> {
-        ProviderId::all()
-            .iter()
-            .filter(|id| self.is_provider_enabled(**id))
-            .copied()
+        self.provider_display_order()
+            .into_iter()
+            .filter(|id| self.is_provider_enabled(*id))
             .collect()
     }
 
     /// Get all available providers with their enabled status
     pub fn get_all_providers_status(&self) -> Vec<ProviderStatus> {
-        ProviderId::all()
-            .iter()
+        self.provider_display_order()
+            .into_iter()
             .map(|id| ProviderStatus {
                 id: id.cli_name().to_string(),
                 name: id.display_name().to_string(),
-                enabled: self.is_provider_enabled(*id),
+                enabled: self.is_provider_enabled(id),
             })
             .collect()
+    }
+
+    /// Provider display order as typed IDs, falling back to canonical order
+    /// when no custom order has been persisted.
+    pub fn provider_display_order(&self) -> Vec<ProviderId> {
+        normalize_provider_order(&self.provider_order)
+            .into_iter()
+            .filter_map(|provider_id| ProviderId::from_cli_name(&provider_id))
+            .collect()
+    }
+
+    /// Provider display order as CLI-name strings.
+    pub fn provider_display_order_names(&self) -> Vec<String> {
+        normalize_provider_order(&self.provider_order)
     }
 
     /// Get the metric preference for a provider
@@ -496,6 +959,9 @@ impl Settings {
 
     /// API region for `id`, or the provider-specific default if unset.
     pub fn api_region(&self, id: ProviderId) -> &str {
+        if id == ProviderId::AlibabaTokenPlan && !self.alibaba_token_plan_region.trim().is_empty() {
+            return self.alibaba_token_plan_region.as_str();
+        }
         self.provider_configs
             .get(&id)
             .and_then(|c| c.api_region.as_deref())
@@ -503,7 +969,11 @@ impl Settings {
     }
 
     pub fn set_api_region(&mut self, id: ProviderId, region: impl Into<String>) {
-        self.provider_config_mut(id).api_region = Some(region.into());
+        let region = region.into();
+        if id == ProviderId::AlibabaTokenPlan {
+            self.alibaba_token_plan_region = region.clone();
+        }
+        self.provider_config_mut(id).api_region = Some(region);
     }
 
     /// Manual cookie header for `id`, or `""` if unset.
@@ -530,6 +1000,21 @@ impl Settings {
         self.provider_config_mut(id).api_token = Some(token.into());
     }
 
+    pub fn management_api_token(&self, id: ProviderId) -> Option<&str> {
+        self.provider_configs
+            .get(&id)
+            .and_then(|config| config.management_api_token.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    pub fn set_management_api_token(&mut self, id: ProviderId, token: Option<String>) {
+        let token = token
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.provider_config_mut(id).management_api_token = token;
+    }
+
     /// Workspace ID override for `id`, or `""` if unset.
     pub fn workspace_id(&self, id: ProviderId) -> &str {
         self.provider_configs
@@ -540,6 +1025,57 @@ impl Settings {
 
     pub fn set_workspace_id(&mut self, id: ProviderId, value: impl Into<String>) {
         self.provider_config_mut(id).workspace_id = Some(value.into());
+    }
+
+    /// Optional user-entered allowance for Copilot seat AI credits.
+    ///
+    /// GitHub reports the absolute `credits_used` counter but does not expose
+    /// a documented included-credit ceiling, so callers must keep an absent
+    /// or non-positive value as unknown rather than inventing a denominator.
+    ///
+    /// This setter is the single owner of the positive-finite invariant:
+    /// invalid values are rejected instead of silently dropped, while the
+    /// getter keeps defensively filtering values persisted by older builds.
+    pub fn seat_credit_entitlement(&self, id: ProviderId) -> Option<f64> {
+        self.provider_configs
+            .get(&id)
+            .and_then(|config| config.seat_credit_entitlement)
+            .filter(|value| value.is_finite() && *value > 0.0)
+    }
+
+    pub fn set_seat_credit_entitlement(
+        &mut self,
+        id: ProviderId,
+        value: Option<f64>,
+    ) -> Result<(), String> {
+        if let Some(value) = value
+            && (!value.is_finite() || value <= 0.0)
+        {
+            return Err(
+                "Copilot seat AI-credit allowance must be a finite number greater than zero"
+                    .to_string(),
+            );
+        }
+        self.provider_config_mut(id).seat_credit_entitlement = value;
+        Ok(())
+    }
+
+    /// Wayfinder gateway URL, defaulting to the local loopback gateway.
+    pub fn gateway_url(&self, id: ProviderId) -> &str {
+        self.provider_configs
+            .get(&id)
+            .and_then(|c| c.gateway_url.as_deref())
+            .unwrap_or_else(|| {
+                if id == ProviderId::Wayfinder {
+                    crate::providers::wayfinder::DEFAULT_GATEWAY_URL
+                } else {
+                    ""
+                }
+            })
+    }
+
+    pub fn set_gateway_url(&mut self, id: ProviderId, value: impl Into<String>) {
+        self.provider_config_mut(id).gateway_url = Some(value.into());
     }
 
     /// IDE base path override for `id`, or `""` if unset.
@@ -566,6 +1102,54 @@ impl Settings {
         self.provider_config_mut(id).openai_web_extras = Some(value);
     }
 
+    /// Codex Spark rows are visible by default.
+    pub fn spark_usage_visible(&self, id: ProviderId) -> bool {
+        self.provider_configs
+            .get(&id)
+            .and_then(|c| c.spark_usage_visible)
+            .unwrap_or(DEFAULT_CODEX_SPARK_USAGE_VISIBLE)
+    }
+
+    pub fn set_spark_usage_visible(&mut self, id: ProviderId, value: bool) {
+        self.provider_config_mut(id).spark_usage_visible = Some(value);
+    }
+
+    /// Return the persisted hidden usage-item IDs for `id`.
+    pub fn hidden_usage_item_ids(&self, id: ProviderId) -> Vec<String> {
+        self.provider_configs
+            .get(&id)
+            .and_then(|config| config.hidden_usage_item_ids.as_ref())
+            .map_or_else(Vec::new, |ids| normalize_hidden_usage_item_ids(ids.clone()))
+    }
+
+    /// Persist an explicit presentation-only usage-item visibility list.
+    pub fn set_hidden_usage_item_ids(&mut self, id: ProviderId, ids: Vec<String>) {
+        let hidden = normalize_hidden_usage_item_ids(ids);
+        self.provider_config_mut(id).hidden_usage_item_ids = Some(hidden);
+    }
+
+    /// Add or remove `items` from the provider's hidden usage-item list.
+    ///
+    /// `visible = false` hides the items; `visible = true` un-hides them. This
+    /// is the single write path for usage-item visibility; it only touches the
+    /// presentation list and never the legacy per-provider boolean flags.
+    pub fn toggle_hidden_items(&mut self, id: ProviderId, items: &[&str], visible: bool) {
+        let mut hidden = self.hidden_usage_item_ids(id);
+        if visible {
+            hidden.retain(|item| !items.contains(&item.as_str()));
+        } else {
+            hidden.extend(items.iter().map(|item| (*item).to_string()));
+        }
+        self.set_hidden_usage_item_ids(id, hidden);
+    }
+
+    /// Update the old Claude Daily Routines flag without touching the
+    /// usage-item list; the flag is presentation-only and kept for callers
+    /// that still read the boolean directly.
+    pub fn set_claude_daily_routines_usage_visible(&mut self, value: bool) {
+        self.claude_daily_routines_usage_visible = value;
+    }
+
     /// Per-provider historical-tracking toggle (currently codex-only).
     pub fn historical_tracking(&self, id: ProviderId) -> bool {
         self.provider_configs
@@ -588,6 +1172,19 @@ impl Settings {
 
     pub fn set_avoid_keychain_prompts(&mut self, id: ProviderId, value: bool) {
         self.provider_config_mut(id).avoid_keychain_prompts = value;
+    }
+
+    /// Whether the desktop shell may reopen a captured CLI session after its
+    /// provider quota becomes available again. This is intentionally opt-in.
+    pub fn auto_resume_after_quota_reset(&self, id: ProviderId) -> bool {
+        self.provider_configs
+            .get(&id)
+            .map(|config| config.auto_resume_after_quota_reset)
+            .unwrap_or(false)
+    }
+
+    pub fn set_auto_resume_after_quota_reset(&mut self, id: ProviderId, value: bool) {
+        self.provider_config_mut(id).auto_resume_after_quota_reset = value;
     }
 
     // ── Legacy field-name aliases ────────────────────────────────────
@@ -758,6 +1355,12 @@ impl Settings {
     pub fn set_codex_openai_web_extras(&mut self, v: bool) {
         self.set_openai_web_extras(ProviderId::Codex, v)
     }
+    pub fn codex_spark_usage_visible(&self) -> bool {
+        self.spark_usage_visible(ProviderId::Codex)
+    }
+    pub fn set_codex_spark_usage_visible(&mut self, v: bool) {
+        self.set_spark_usage_visible(ProviderId::Codex, v)
+    }
     pub fn codex_historical_tracking(&self) -> bool {
         self.historical_tracking(ProviderId::Codex)
     }
@@ -769,5 +1372,66 @@ impl Settings {
     }
     pub fn set_claude_avoid_keychain_prompts(&mut self, v: bool) {
         self.set_avoid_keychain_prompts(ProviderId::Claude, v)
+    }
+
+    /// Claude-only: whether the external claude-swap (`cswap`) adapter is
+    /// enabled. Disabled by default.
+    pub fn claude_swap_enabled(&self) -> bool {
+        self.provider_configs
+            .get(&ProviderId::Claude)
+            .map(|config| config.claude_swap_enabled)
+            .unwrap_or(false)
+    }
+
+    pub fn set_claude_swap_enabled(&mut self, value: bool) {
+        self.provider_config_mut(ProviderId::Claude)
+            .claude_swap_enabled = value;
+    }
+
+    /// Claude-only: configured claude-swap executable path, or `""` when unset.
+    pub fn claude_swap_executable_path(&self) -> &str {
+        self.provider_configs
+            .get(&ProviderId::Claude)
+            .and_then(|config| config.claude_swap_executable_path.as_deref())
+            .unwrap_or("")
+    }
+
+    pub fn set_claude_swap_executable_path(&mut self, value: impl Into<String>) {
+        let trimmed = value.into().trim().to_string();
+        let config = self.provider_config_mut(ProviderId::Claude);
+        config.claude_swap_executable_path = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }
+
+    // ── Per-provider accent color override (#2972) ──────────────────
+
+    /// The user-overridden accent color for `id`, or `None` to use the
+    /// shipped brand color.
+    pub fn accent_color(&self, id: ProviderId) -> Option<&str> {
+        self.provider_configs
+            .get(&id)
+            .and_then(|c| c.accent_color.as_deref())
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    /// Set the accent color override for `id`. Pass an empty string or
+    /// `None` to clear the override and revert to the shipped brand color.
+    pub fn set_accent_color(&mut self, id: ProviderId, color: Option<impl Into<String>>) {
+        let entry = self.provider_config_mut(id);
+        entry.accent_color = color
+            .map(Into::into)
+            .filter(|s: &String| !s.trim().is_empty());
+    }
+
+    /// Resolve the effective accent color for `id`: the user override if
+    /// set, otherwise the shipped brand color from the provider registry.
+    pub fn effective_accent_color(&self, id: ProviderId) -> String {
+        if let Some(override_color) = self.accent_color(id) {
+            return override_color.trim().to_string();
+        }
+        crate::core::brand_color(id).to_string()
     }
 }

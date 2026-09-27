@@ -29,7 +29,7 @@ const PERCENT_KEYS: &[&str] = &[
     "utilization",
     "utilizationPercent",
     "utilization_percent",
-    "usage",
+    // Note: raw "usage" is often a token count — handled via used/limit only.
 ];
 
 /// Keys to look for when parsing reset time in seconds
@@ -263,7 +263,7 @@ impl OpenCodeUsageFetcher {
         }
 
         // Try to parse as URL
-        if let Ok(url) = url::Url::parse(trimmed) {
+        if let Ok(url) = reqwest::Url::parse(trimmed) {
             let parts: Vec<&str> = url.path_segments().map(|s| s.collect()).unwrap_or_default();
             if let Some(idx) = parts.iter().position(|&p| p == "workspace")
                 && parts.len() > idx + 1
@@ -290,7 +290,7 @@ impl OpenCodeUsageFetcher {
     ) -> Result<String, OpenCodeError> {
         let url = Self::build_server_url(&request.server_id, &request.args, &request.method);
 
-        let client = reqwest::Client::builder()
+        let client = crate::core::credentialed_http_client_builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .build()
             .map_err(|e| OpenCodeError::NetworkError(e.to_string()))?;
@@ -407,7 +407,7 @@ impl OpenCodeUsageFetcher {
                 weekly_usage_percent: wp,
                 rolling_reset_in_sec: rr,
                 weekly_reset_in_sec: wr,
-                renews_at: Self::extract_renewal(text),
+                renews_at: crate::providers::extract_renewal(text),
                 updated_at: now,
             }),
             _ => Err(OpenCodeError::ParseFailed(
@@ -470,25 +470,37 @@ impl OpenCodeUsageFetcher {
 
     /// Parse a window object into (percent, reset_in_sec)
     fn parse_window(json: &serde_json::Value, _now: DateTime<Utc>) -> Option<(f64, i64)> {
-        let percent = PERCENT_KEYS
+        // Direct percent field (may be 0..1 fraction or 0..100).
+        let direct = PERCENT_KEYS
             .iter()
             .find_map(|k| json.get(k).and_then(|v| v.as_f64()));
+        let percent_is_direct = direct.is_some();
+
+        let percent = direct.or_else(|| {
+            // Computed used/limit is already 0..100 — never apply fraction rescale (#2331).
+            let used = ["used", "usage", "consumed", "count", "usedTokens"]
+                .iter()
+                .find_map(|k| json.get(*k).and_then(|v| v.as_f64()));
+            let limit = ["limit", "total", "allowance"]
+                .iter()
+                .find_map(|k| json.get(*k).and_then(|v| v.as_f64()));
+            match (used, limit) {
+                (Some(u), Some(l)) if l > 0.0 => Some((u / l) * 100.0),
+                _ => None,
+            }
+        })?;
 
         let reset_in = RESET_IN_KEYS
             .iter()
-            .find_map(|k| json.get(k).and_then(|v| v.as_i64()));
+            .find_map(|k| json.get(k).and_then(|v| v.as_i64()))
+            .unwrap_or(0);
 
-        match (percent, reset_in) {
-            (Some(p), Some(r)) => {
-                let normalized_percent = if (0.0..=1.0).contains(&p) {
-                    p * 100.0
-                } else {
-                    p.clamp(0.0, 100.0)
-                };
-                Some((normalized_percent, r.max(0)))
-            }
-            _ => None,
-        }
+        let normalized_percent = if percent_is_direct && (0.0..=1.0).contains(&percent) {
+            percent * 100.0
+        } else {
+            percent.clamp(0.0, 100.0)
+        };
+        Some((normalized_percent.clamp(0.0, 100.0), reset_in.max(0)))
     }
 
     fn find_datetime(json: &serde_json::Value, keys: &[&str]) -> Option<DateTime<Utc>> {
@@ -538,6 +550,10 @@ impl OpenCodeUsageFetcher {
         } else {
             number
         };
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "timestamps are normalized to whole seconds (ms input divided by 1000) before the cast"
+        )]
         DateTime::<Utc>::from_timestamp(seconds as i64, 0)
     }
 
@@ -617,14 +633,6 @@ impl OpenCodeUsageFetcher {
         let captures = regex.captures(text)?;
         let value_str = captures.get(1)?.as_str();
         value_str.parse().ok()
-    }
-
-    fn extract_renewal(text: &str) -> Option<DateTime<Utc>> {
-        let regex =
-            Regex::new(r#"(?:"renewAt"|"renew_at"|renewAt|renew_at)\s*[:=]\s*"?([^",}\s]+)"?"#)
-                .ok()?;
-        let raw = regex.captures(text)?.get(1)?.as_str();
-        Self::date_from_value(&serde_json::Value::String(raw.to_string()))
     }
 }
 

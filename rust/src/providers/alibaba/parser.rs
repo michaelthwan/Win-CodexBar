@@ -71,10 +71,22 @@ pub(crate) fn parse_response(json: &serde_json::Value) -> Result<UsageSnapshot, 
     let detail = |used_key: &str, total_key: &str| -> Option<String> {
         let used = quota.get(used_key).and_then(|v| v.as_f64())?;
         let total = quota.get(total_key).and_then(|v| v.as_f64())?;
+        // Token counts are whole numbers; the fractional part is rounding
+        // noise from JSON float parsing.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "token counts are whole numbers; fractional part is rounding noise"
+        )]
+        let used_tokens = used as i64;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "token counts are whole numbers; fractional part is rounding noise"
+        )]
+        let total_tokens = total as i64;
         Some(format!(
             "{} / {} tokens",
-            fmt_tokens(used as i64),
-            fmt_tokens(total as i64)
+            fmt_tokens(used_tokens),
+            fmt_tokens(total_tokens)
         ))
     };
 
@@ -90,10 +102,11 @@ pub(crate) fn parse_response(json: &serde_json::Value) -> Result<UsageSnapshot, 
         ms_to_dt("perWeekQuotaNextRefreshTime"),
         detail("perWeekUsedQuota", "perWeekTotalQuota"),
     );
+    let monthly_reset = ms_to_dt("perBillMonthQuotaNextRefreshTime");
     let monthly = RateWindow::with_details(
         pct("perBillMonthUsedQuota", "perBillMonthTotalQuota"),
-        Some(30 * 24 * 60),
-        ms_to_dt("perBillMonthQuotaNextRefreshTime"),
+        RateWindow::monthly_window_minutes(monthly_reset).or(Some(30 * 24 * 60)),
+        monthly_reset,
         detail("perBillMonthUsedQuota", "perBillMonthTotalQuota"),
     );
 
@@ -167,6 +180,8 @@ mod tests {
 
         let monthly = usage.tertiary.unwrap();
         assert!((monthly.used_percent - 0.028).abs() < 0.01);
+        // perBillMonthQuotaNextRefreshTime 1783267200000 = 2026-07-05 → 30-day cycle.
+        assert_eq!(monthly.window_minutes, Some(30 * 24 * 60));
 
         assert_eq!(usage.login_method.as_deref(), Some("Coding Plan Pro"));
     }

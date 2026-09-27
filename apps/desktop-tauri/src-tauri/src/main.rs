@@ -3,18 +3,24 @@
 use std::time::Duration;
 
 mod auto_refresh;
+mod auto_resume;
+mod coding_activity;
 mod commands;
 mod events;
 mod floatbar;
 mod geometry_store;
+mod powertoys;
 mod proof_harness;
 mod shell;
 mod shortcut_bridge;
 mod state;
 mod surface;
 mod surface_target;
+mod tray_accounts;
 mod tray_bridge;
 mod tray_menu;
+mod tray_visibility;
+mod usage_metric;
 mod window_positioner;
 
 use std::sync::Mutex;
@@ -25,7 +31,13 @@ use surface_target::SurfaceTarget;
 use tauri::Manager;
 
 const PROOF_ACTIVATION_DELAY: Duration = Duration::from_millis(0);
-const VISIBLE_START_ACTIVATION_DELAY: Duration = Duration::from_millis(0);
+const VISIBLE_START_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LaunchBehavior {
+    open_primary_window_at_start: bool,
+    suppress_blur_dismiss: bool,
+}
 
 fn should_hide_close_request(mode: SurfaceMode) -> bool {
     matches!(
@@ -34,7 +46,15 @@ fn should_hide_close_request(mode: SurfaceMode) -> bool {
     )
 }
 
-fn should_open_tray_panel_from_args<I, S>(args: I) -> bool
+fn primary_window_request() -> shell::ShellTransitionRequest {
+    shell::ShellTransitionRequest {
+        mode: SurfaceMode::PopOut,
+        target: SurfaceTarget::Dashboard,
+        position: None,
+    }
+}
+
+fn should_open_primary_window_from_args<I, S>(args: I) -> bool
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -50,47 +70,139 @@ where
     })
 }
 
+fn nonblank_launch_args<I, S>(args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter()
+        .map(|arg| arg.as_ref().trim().to_string())
+        .filter(|arg| !arg.is_empty())
+        .collect()
+}
+
+fn should_reopen_primary_window_from_instance_args<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let args = nonblank_launch_args(args);
+    args.is_empty() || should_open_primary_window_from_args(&args)
+}
+
+fn launch_behavior<I, S>(force_visible: bool, start_minimized: bool, args: I) -> LaunchBehavior
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let args = nonblank_launch_args(args);
+    let explicit_primary_launch = should_open_primary_window_from_args(&args);
+    let plain_desktop_launch = args.is_empty();
+
+    LaunchBehavior {
+        open_primary_window_at_start: force_visible
+            || explicit_primary_launch
+            || (plain_desktop_launch && !start_minimized),
+        suppress_blur_dismiss: force_visible,
+    }
+}
+
+fn should_suppress_blur_dismiss(launch: LaunchBehavior, proof_mode: bool) -> bool {
+    launch.suppress_blur_dismiss || proof_mode
+}
+
 fn main() {
+    // Per-process log file names: the shell writes codexbar-desktop.log so
+    // its cached handle never blocks the CLI's rotation on Windows.
+    // SAFETY: runs before any thread spawns; no concurrent env access exists.
+    unsafe { std::env::set_var("CODEXBAR_PROCESS", "desktop") };
+    codexbar::logging::install_panic_hook();
     codexbar::logging::init(false, false).expect("failed to initialize logging");
 
     let proof_config = proof_harness::ProofConfig::from_env();
     let is_proof_mode = proof_config.is_some();
-    let force_start_visible = std::env::var_os("CODEXBAR_START_VISIBLE").is_some()
-        || should_open_tray_panel_from_args(std::env::args().skip(1));
+    let force_start_visible = std::env::var_os("CODEXBAR_START_VISIBLE").is_some();
+    let settings = codexbar::settings::Settings::load();
+    let launch = launch_behavior(
+        force_start_visible,
+        settings.start_minimized,
+        std::env::args().skip(1),
+    );
 
     let mut initial_state = AppState::new();
     initial_state.proof_config = proof_config;
+    // Proof-harness seed: CODEXBAR_SEED_USAGE_JSON plants one synthetic Codex
+    // ProviderUsageSnapshot before the event loop and any WebView read. The
+    // cache timestamp makes the seeded cache count as fresh so the first
+    // frontend refresh-if-stale call does not evict the synthetic data.
+    if let Some(snapshot) = proof_harness::seed_usage_snapshot_from_env() {
+        tracing::info!(
+            "proof-harness: seeded provider snapshot for '{}'",
+            snapshot.provider_id
+        );
+        initial_state.provider_cache.push(snapshot);
+        initial_state.provider_cache_updated_at = Some(std::time::Instant::now());
+    }
 
     tauri::Builder::default()
         .manage(Mutex::new(initial_state))
         .plugin(shortcut_bridge::plugin())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            if args.len() <= 1 || should_open_tray_panel_from_args(args.iter().skip(1)) {
-                let _ = shell::reopen_to_target(
-                    app,
-                    SurfaceMode::TrayPanel,
-                    SurfaceTarget::Summary,
-                    None,
-                );
+            if should_reopen_primary_window_from_instance_args(args.iter().skip(1)) {
+                let request = primary_window_request();
+                let _ =
+                    shell::reopen_to_target(app, request.mode, request.target, request.position);
             }
         }))
         .invoke_handler(tauri::generate_handler![
             commands::get_bootstrap_state,
             commands::get_provider_catalog,
             commands::get_settings_snapshot,
+            commands::list_agent_sessions,
+            commands::focus_agent_session,
             commands::update_settings,
             commands::set_surface_mode,
+            commands::dismiss_tray_panel,
+            commands::begin_flyout_gesture,
+            commands::end_flyout_gesture,
             commands::reveal_tray_panel_window,
             commands::open_settings_window,
+            commands::open_flyout_window,
             commands::close_settings_window,
-            commands::get_current_surface_mode,
+            commands::set_flyout_size,
+            commands::flyout_stored_size,
             commands::get_current_surface_state,
-            commands::get_proof_state,
-            commands::run_proof_command,
             commands::refresh_providers,
             commands::refresh_providers_if_stale,
             commands::get_cached_providers,
-            commands::get_safe_diagnostics,
+            commands::get_deepseek_pricing_status,
+            commands::codex_accounts_list,
+            commands::claude_accounts_list,
+            commands::claude_reconciliation_state,
+            commands::claude_account_add,
+            commands::claude_account_cancel_login,
+            commands::claude_account_save_current,
+            commands::claude_account_remove,
+            commands::claude_account_switch,
+            commands::grok_accounts_list,
+            commands::grok_account_add,
+            commands::grok_account_cancel_login,
+            commands::grok_account_save_current,
+            commands::grok_account_remove,
+            commands::grok_account_switch,
+            commands::grok_account_fetch,
+            commands::claude_swap_accounts_list,
+            commands::claude_swap_account_switch,
+            commands::claude_swap_account_reauthenticate,
+            commands::codex_account_add,
+            commands::codex_account_reauthenticate,
+            commands::codex_account_remove,
+            commands::codex_account_switch,
+            commands::codex_account_fetch,
+            commands::codex_account_snapshots,
+            commands::codex_account_restart_desktop,
+            commands::get_codex_accounts_state,
             commands::get_credential_storage_status,
             commands::get_update_state,
             commands::check_for_updates,
@@ -113,15 +225,27 @@ fn main() {
             commands::remove_token_account,
             commands::set_active_token_account,
             commands::get_app_info,
+            commands::get_safe_diagnostics,
             commands::get_provider_chart_data,
+            commands::get_provider_local_usage_summary,
+            commands::get_usage_spend_summary,
+            commands::write_usage_spend_export,
+            commands::get_spend_contract,
+            commands::get_codex_workspaces_snapshot,
             commands::reorder_providers,
             commands::set_provider_cookie_source,
-            commands::get_provider_cookie_source,
+            commands::set_provider_usage_source,
+            commands::set_provider_auto_resume_after_quota_reset,
+            commands::has_openrouter_management_api_key,
+            commands::set_openrouter_management_api_key,
+            commands::remove_openrouter_management_api_key,
+            commands::get_provider_azure_api_version,
+            commands::set_provider_azure_api_version,
             commands::get_provider_cookie_source_options,
             commands::set_provider_region,
-            commands::get_provider_region,
             commands::get_provider_region_options,
             commands::set_provider_workspace_id,
+            commands::set_provider_gateway_url,
             commands::get_provider_workspace_id,
             commands::get_gemini_cli_signed_in,
             commands::get_vertexai_status,
@@ -130,8 +254,6 @@ fn main() {
             commands::get_kiro_status,
             commands::register_global_shortcut,
             commands::unregister_global_shortcut,
-            commands::is_remote_session,
-            commands::get_launch_block_reason,
             commands::get_work_area_rect,
             commands::play_notification_sound,
             commands::open_external_url,
@@ -142,16 +264,22 @@ fn main() {
             commands::get_provider_detail,
             commands::trigger_provider_login,
             commands::revoke_provider_credentials,
+            commands::get_available_languages,
             commands::get_locale_strings,
             commands::set_ui_language,
             commands::open_path,
+            tray_visibility::tray_visibility_status,
             floatbar::show_float_bar,
             floatbar::hide_float_bar,
             floatbar::set_float_bar_opacity,
             floatbar::set_float_bar_click_through,
+            floatbar::resize_float_bar,
             floatbar::set_float_bar_orientation,
         ])
         .setup(move |app| {
+            if let Err(error) = codexbar::providers::claude::accounts::cleanup_abandoned_logins() {
+                tracing::warn!("failed to clean abandoned Claude sign-in directories: {error}");
+            }
             if let Some(window) = app.get_webview_window("main") {
                 shell::dwm::force_dark_caption(&window);
                 window.hide()?;
@@ -160,24 +288,29 @@ fn main() {
             shortcut_bridge::register(app.handle());
             floatbar::install(app.handle());
             auto_refresh::install(app.handle().clone());
+            if settings.powertoys_status_pipe_enabled {
+                powertoys::install(app.handle().clone());
+            }
 
-            // The frontend receives surface state before show, so fixed
-            // startup sleeps only make tray activation feel slower.
+            // Give the WebView/event loop one turn to finish startup before
+            // routing shortcut launches into the tray panel. Without this, the
+            // Windows shell can leave only Tauri's tiny internal window visible.
             if is_proof_mode {
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(PROOF_ACTIVATION_DELAY).await;
                     proof_harness::activate(&app_handle);
                 });
-            } else if force_start_visible {
+            } else if launch.open_primary_window_at_start {
                 let app = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(VISIBLE_START_ACTIVATION_DELAY).await;
+                    let request = primary_window_request();
                     let _ = shell::reopen_to_target(
                         &app,
-                        SurfaceMode::TrayPanel,
-                        SurfaceTarget::Summary,
-                        None,
+                        request.mode,
+                        request.target,
+                        request.position,
                     );
                 });
             }
@@ -186,6 +319,9 @@ fn main() {
         })
         .on_window_event(move |window, event| {
             if floatbar::handle_window_event(window, event) {
+                return;
+            }
+            if shell::flyout_window::handle_window_event(window, event) {
                 return;
             }
             // Only the main window participates in blur-dismiss and close-to-hide.
@@ -197,28 +333,72 @@ fn main() {
                 tauri::WindowEvent::Focused(false) => {
                     // Suppress blur-dismiss in proof mode so the window stays
                     // visible for automated screenshot capture.
-                    if force_start_visible || proof_harness::is_proof_mode(window.app_handle()) {
+                    if should_suppress_blur_dismiss(
+                        launch,
+                        proof_harness::is_proof_mode(window.app_handle()),
+                    ) {
+                        return;
+                    }
+                    if let Some(st) = window.app_handle().try_state::<Mutex<AppState>>()
+                        && st
+                            .lock()
+                            .unwrap()
+                            .take_startup_tray_blur_grace(std::time::Instant::now())
+                    {
                         return;
                     }
                     // Grace period: ignore blur within 500ms of showing the panel.
                     // On Windows, the tray click can cause a spurious blur before
                     // the window fully acquires focus.
                     if let Some(st) = window.app_handle().try_state::<Mutex<AppState>>()
-                        && let Some(shown_at) = st.lock().unwrap().last_shown_at
-                        && shown_at.elapsed() < Duration::from_millis(500)
+                        && st.lock().unwrap().was_tray_panel_recently_shown(
+                            std::time::Instant::now(),
+                            Duration::from_millis(500),
+                        )
                     {
                         return;
                     }
-                    // Blur in TrayPanel mode → auto-hide.
-                    let _ = shell::hide_to_tray_if_current(window.app_handle(), |mode| {
-                        mode == SurfaceMode::TrayPanel
-                    });
+                    // Gesture guard: ignore blur while a resize-grip drag or
+                    // HTML5 drag-reorder is running its Win32/OLE modal loop.
+                    // Windows produces a spurious Focused(false) the instant
+                    // such a loop starts even though the user never left the
+                    // window; see AppState::begin_gesture_blur_guard.
+                    if let Some(st) = window.app_handle().try_state::<Mutex<AppState>>()
+                        && st
+                            .lock()
+                            .unwrap()
+                            .is_gesture_blur_guard_active(std::time::Instant::now())
+                    {
+                        return;
+                    }
+                    // Blur in TrayPanel mode → auto-hide. Record successful
+                    // dismissals so the same tray click cannot reopen it.
+                    if matches!(
+                        shell::hide_to_tray_if_current(window.app_handle(), |mode| {
+                            mode == SurfaceMode::TrayPanel
+                        }),
+                        Ok(Some(_))
+                    ) && let Some(st) = window.app_handle().try_state::<Mutex<AppState>>()
+                    {
+                        st.lock()
+                            .unwrap()
+                            .mark_blur_dismissed(std::time::Instant::now());
+                    }
+                }
+                tauri::WindowEvent::Focused(true) => {
+                    // A genuine refocus (after the gesture's own focus flicker
+                    // has settled) re-arms the gesture guard so a later
+                    // outside-click blur dismisses immediately again.
+                    if let Some(st) = window.app_handle().try_state::<Mutex<AppState>>() {
+                        st.lock()
+                            .unwrap()
+                            .clear_gesture_guard_on_refocus(std::time::Instant::now());
+                    }
                 }
                 tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => {
-                    // Capture geometry for surfaces eligible for persistence
-                    // (currently only Settings). The helper is a no-op when the
-                    // current surface is not eligible.
-                    shell::remember_current_geometry_if_settings(window);
+                    // Capture geometry for surfaces eligible for persistence.
+                    // The helper is a no-op when the current surface is not eligible.
+                    shell::remember_current_geometry_if_eligible(window);
                 }
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     // Close visible shell surfaces → hide instead of quitting.
@@ -256,20 +436,112 @@ mod tests {
     }
 
     #[test]
-    fn menubar_launch_arg_opens_tray_panel() {
-        assert!(should_open_tray_panel_from_args(["menubar"]));
-        assert!(should_open_tray_panel_from_args(["--tray-panel"]));
-        assert!(should_open_tray_panel_from_args(["/tray_panel"]));
+    fn primary_window_request_targets_popout_dashboard() {
+        let request = primary_window_request();
+        assert_eq!(request.mode, SurfaceMode::PopOut);
+        assert_eq!(request.target, SurfaceTarget::Dashboard);
+        assert_eq!(request.position, None);
     }
 
     #[test]
-    fn unrelated_launch_args_do_not_open_tray_panel() {
-        assert!(!should_open_tray_panel_from_args(["usage", "-p", "claude"]));
+    fn menubar_launch_arg_opens_primary_window() {
+        assert!(should_open_primary_window_from_args(["menubar"]));
+        assert!(should_open_primary_window_from_args(["--tray-panel"]));
+        assert!(should_open_primary_window_from_args(["/tray_panel"]));
+    }
+
+    #[test]
+    fn unrelated_launch_args_do_not_open_primary_window() {
+        assert!(!should_open_primary_window_from_args([
+            "usage", "-p", "claude"
+        ]));
+        assert!(!should_reopen_primary_window_from_instance_args([
+            "usage", "-p", "claude"
+        ]));
+        assert_eq!(
+            launch_behavior(false, false, ["usage", "-p", "claude"]),
+            LaunchBehavior {
+                open_primary_window_at_start: false,
+                suppress_blur_dismiss: false,
+            }
+        );
+    }
+
+    #[test]
+    fn plain_desktop_launch_opens_unless_start_minimized() {
+        assert_eq!(
+            launch_behavior(false, false, std::iter::empty::<&str>()),
+            LaunchBehavior {
+                open_primary_window_at_start: true,
+                suppress_blur_dismiss: false,
+            }
+        );
+        assert_eq!(
+            launch_behavior(false, false, [""]),
+            LaunchBehavior {
+                open_primary_window_at_start: true,
+                suppress_blur_dismiss: false,
+            }
+        );
+        assert_eq!(
+            launch_behavior(false, false, ["  "]),
+            LaunchBehavior {
+                open_primary_window_at_start: true,
+                suppress_blur_dismiss: false,
+            }
+        );
+        assert_eq!(
+            launch_behavior(false, true, std::iter::empty::<&str>()),
+            LaunchBehavior {
+                open_primary_window_at_start: false,
+                suppress_blur_dismiss: false,
+            }
+        );
+    }
+
+    #[test]
+    fn single_instance_plain_launch_reopens_primary_window() {
+        assert!(should_reopen_primary_window_from_instance_args(
+            std::iter::empty::<&str>()
+        ));
+        assert!(should_reopen_primary_window_from_instance_args([""]));
+        assert!(should_reopen_primary_window_from_instance_args(["  "]));
+        assert!(should_reopen_primary_window_from_instance_args(["menubar"]));
+    }
+
+    #[test]
+    fn menubar_launch_does_not_suppress_blur_dismiss() {
+        assert_eq!(
+            launch_behavior(false, true, ["menubar"]),
+            LaunchBehavior {
+                open_primary_window_at_start: true,
+                suppress_blur_dismiss: false,
+            }
+        );
+    }
+
+    #[test]
+    fn automation_launch_opens_and_suppresses_blur_dismiss() {
+        let launch = launch_behavior(true, true, std::iter::empty::<&str>());
+        assert_eq!(
+            launch,
+            LaunchBehavior {
+                open_primary_window_at_start: true,
+                suppress_blur_dismiss: true,
+            }
+        );
+        assert!(should_suppress_blur_dismiss(launch, false));
+    }
+
+    #[test]
+    fn proof_mode_suppresses_blur_dismiss() {
+        let launch = launch_behavior(false, true, std::iter::empty::<&str>());
+        assert!(should_suppress_blur_dismiss(launch, true));
     }
 
     #[test]
     fn visible_start_delays_stay_short() {
         assert_eq!(PROOF_ACTIVATION_DELAY, Duration::ZERO);
-        assert_eq!(VISIBLE_START_ACTIVATION_DELAY, Duration::ZERO);
+        assert!(VISIBLE_START_ACTIVATION_DELAY <= Duration::from_millis(500));
     }
 }

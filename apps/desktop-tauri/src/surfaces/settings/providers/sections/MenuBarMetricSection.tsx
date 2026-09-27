@@ -87,11 +87,19 @@ function metricOptions(
   if (provider.modelSpecific) {
     options.push({ value: "model", label: t("DetailWindowModelSpecific") });
   }
-  if (provider.tertiary) {
-    options.push({ value: "tertiary", label: t("DetailWindowTertiary") });
+  if (provider.tertiary || provider.tertiaryLabelKey) {
+    options.push({
+      value: "tertiary",
+      label: t(
+        (provider.tertiaryLabelKey ?? "DetailWindowTertiary") as LocaleKey,
+      ),
+    });
   }
-  if (provider.id === "cursor") {
+  if (provider.id === "cursor" || provider.extraRateWindows.length > 0) {
     options.push({ value: "extraUsage", label: t("ExtraUsage") });
+  }
+  if (provider.id === "mistral") {
+    options.push({ value: "monthlyPlan", label: t("MistralMonthlySpend") });
   }
   if (provider.id === "gemini" && provider.weekly) {
     options.push({ value: "average", label: t("Average") });

@@ -56,6 +56,7 @@ const STATUS_TO_KEY: Record<ProviderSidebarStatus, LocaleKey> = {
  * Responsibilities (Phase 6a only):
  *  - render rows with brand icon + status dot + two-line subtitle + toggle
  *  - drag-and-drop reorder (HTML5 native; emits `onReorder`)
+ *  - button reorder for WebView2/automation paths where HTML5 drag can be brittle
  *  - keyboard reorder: Alt+ArrowUp / Alt+ArrowDown on the selected row
  *  - mount-in reveal animation keyed on row id
  */
@@ -86,10 +87,14 @@ export function ProvidersSidebar({
     .filter((p): p is ProviderSidebarRow => Boolean(p));
 
   // Track previously-mounted ids to trigger a reveal animation for new rows.
-  const seenRef = useRef<Set<string>>(new Set(ordered.map((p) => p.id)));
+  const seenRef = useRef<Set<string> | null>(null);
+  if (seenRef.current === null) {
+    seenRef.current = new Set(ordered.map((p) => p.id));
+  }
   const [justMounted, setJustMounted] = useState<Set<string>>(new Set());
   useEffect(() => {
     const seen = seenRef.current;
+    if (!seen) return;
     const newly = new Set<string>();
     for (const p of ordered) {
       if (!seen.has(p.id)) {
@@ -213,7 +218,7 @@ export function ProvidersSidebar({
         ref={sidebarRef}
         className="providers-sidebar"
         role="listbox"
-        aria-label="Providers"
+        aria-label={t("ProvidersAriaLabel")}
         aria-orientation="vertical"
         onWheel={handleWheel}
       >
@@ -222,12 +227,14 @@ export function ProvidersSidebar({
             {t("ProviderSidebarNoMatches")}
           </li>
         )}
-        {ordered.map((p) => {
+        {ordered.map((p, index) => {
           const isSelected = p.id === selectedId;
           const isDrop = dropTargetId === p.id;
           const isDragging = dragId === p.id;
           const reveal = justMounted.has(p.id);
           const brand = getProviderIcon(p.id).brandColor;
+          const canMoveUp = index > 0 && !disabled;
+          const canMoveDown = index < ordered.length - 1 && !disabled;
           const cls = [
             "providers-sidebar__row",
             isSelected && "providers-sidebar__row--selected",
@@ -285,6 +292,34 @@ export function ProvidersSidebar({
               >
                 ⋮⋮
               </span>
+              <span className="providers-sidebar__reorder-controls">
+                <button
+                  type="button"
+                  className="providers-sidebar__reorder-button"
+                  disabled={!canMoveUp}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    moveId(p.id, -1);
+                  }}
+                  aria-label={`${t("ProviderSidebarMoveUp")} ${p.displayName}`}
+                  title={`${t("ProviderSidebarMoveUp")} ${p.displayName}`}
+                >
+                  ↑
+                </button>
+                <button
+                  type="button"
+                  className="providers-sidebar__reorder-button"
+                  disabled={!canMoveDown}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    moveId(p.id, 1);
+                  }}
+                  aria-label={`${t("ProviderSidebarMoveDown")} ${p.displayName}`}
+                  title={`${t("ProviderSidebarMoveDown")} ${p.displayName}`}
+                >
+                  ↓
+                </button>
+              </span>
               <input
                 type="checkbox"
                 className="providers-sidebar__checkbox"
@@ -292,7 +327,7 @@ export function ProvidersSidebar({
                 disabled={disabled}
                 onClick={(e) => e.stopPropagation()}
                 onChange={(e) => onToggleEnabled(p.id, e.target.checked)}
-                aria-label={`${p.displayName} enabled`}
+                aria-label={`${p.displayName} ${t("ProviderEnabled")}`}
               />
             </li>
           );

@@ -1,5 +1,5 @@
-import { act, fireEvent, render, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const tauriMocks = vi.hoisted(() => ({
   getCachedProviders: vi.fn(),
@@ -14,17 +14,25 @@ const tauriMocks = vi.hoisted(() => ({
   dismissUpdate: vi.fn(),
   openReleasePage: vi.fn(),
   setSurfaceMode: vi.fn(),
+  dismissTrayPanel: vi.fn(),
+  beginFlyoutGesture: vi.fn().mockResolvedValue(undefined),
+  endFlyoutGesture: vi.fn().mockResolvedValue(undefined),
   openSettingsWindow: vi.fn(),
   quitApp: vi.fn(),
   getWorkAreaRect: vi.fn(),
   reanchorTrayPanel: vi.fn(),
   revealTrayPanelWindow: vi.fn(),
+  flyoutStoredSize: vi.fn().mockResolvedValue(null),
+  setFlyoutSize: vi.fn().mockResolvedValue(undefined),
   openProviderDashboard: vi.fn(),
   openProviderStatusPage: vi.fn(),
   getProviderChartData: vi.fn(),
   getCurrentSurfaceState: vi.fn(),
   getLocaleStrings: vi.fn(),
   setUiLanguage: vi.fn(),
+  getDeepSeekPricingStatus: vi.fn().mockResolvedValue(null),
+  getUsageSpendSummary: vi.fn(),
+  claudeReconciliationState: vi.fn().mockResolvedValue(null),
 }));
 
 const eventMocks = vi.hoisted(() => ({
@@ -36,8 +44,12 @@ const windowMocks = vi.hoisted(() => ({
   getCurrentWindow: vi.fn(() => ({
     setSize: vi.fn().mockResolvedValue(undefined),
     close: vi.fn().mockResolvedValue(undefined),
+    scaleFactor: vi.fn().mockResolvedValue(1),
+    onResized: vi.fn().mockResolvedValue(() => {}),
+    innerSize: vi.fn().mockResolvedValue({ width: 328, height: 200 }),
   })),
   LogicalSize: vi.fn((width: number, height: number) => ({ width, height })),
+  PhysicalSize: vi.fn((width: number, height: number) => ({ width, height })),
 }));
 
 vi.mock("../lib/tauri", () => tauriMocks);
@@ -73,6 +85,7 @@ function provider(id: string, displayName: string, used = 20): ProviderUsageSnap
     providerId: id,
     displayName,
     primary: rateWindow(used),
+    selectedMetric: rateWindow(used),
     primaryLabel: "Monthly",
     secondary: null,
     modelSpecific: null,
@@ -84,6 +97,7 @@ function provider(id: string, displayName: string, used = 20): ProviderUsageSnap
     sourceLabel: "auto",
     updatedAt: "2026-05-24T00:00:00Z",
     error: null,
+    errorState: "ready",
     pace: null,
     accountOrganization: null,
     trayStatusLabel: null,
@@ -91,45 +105,85 @@ function provider(id: string, displayName: string, used = 20): ProviderUsageSnap
   };
 }
 
+function providerWithThreeQuotaWindows(
+  id: string,
+  displayName: string,
+): ProviderUsageSnapshot {
+  const snapshot = provider(id, displayName);
+  snapshot.secondary = rateWindow(35);
+  snapshot.secondaryLabel = "Weekly";
+  snapshot.tertiary = rateWindow(50);
+  snapshot.tertiaryLabel = "Monthly";
+  return snapshot;
+}
+
 function settings(overrides: Partial<SettingsSnapshot> = {}): SettingsSnapshot {
   return {
     enabledProviders: ["codex", "claude"],
     refreshIntervalSecs: 300,
+    adaptiveRefresh: false,
+    refreshAllProvidersOnMenuOpen: false,
+  lowPowerMode: false,
     startAtLogin: false,
     startMinimized: false,
     showNotifications: true,
     soundEnabled: true,
-    soundVolume: 100,
+    notificationSoundTheme: "windows",
+    notificationSoundPaths: {
+      predictiveWarning: null,
+      highUsage: null,
+      criticalUsage: null,
+      exhausted: null,
+      statusIssue: null,
+      sessionDepleted: null,
+      sessionRestored: null,
+    },
     highUsageThreshold: 70,
     criticalUsageThreshold: 90,
+    predictivePaceWarningEnabled: false,
     trayIconMode: "single",
     switcherShowsIcons: true,
     menuBarShowsHighestUsage: false,
     menuBarShowsPercent: false,
     showAsUsed: true,
-    showCreditsExtraUsage: true,
     showAllTokenAccountsInMenu: false,
-    surpriseAnimations: false,
     enableAnimations: true,
     resetTimeRelative: true,
+    showResetWhenExhausted: false,
     menuBarDisplayMode: "detailed",
+    overviewLayout: "detailed",
     hidePersonalInfo: false,
     updateChannel: "stable",
     autoDownloadUpdates: false,
     installUpdatesOnQuit: false,
     globalShortcut: "Ctrl+Shift+U",
+    codexCustomSessionsDirs: [],
     uiLanguage: "english",
     theme: "dark",
+    windowScalePercent: 125,
+    trayScalePercent: 100,
+    trayPanelAlwaysOnTop: false,
+    powertoysStatusPipeEnabled: false,
     claudeAvoidKeychainPrompts: false,
+    codexSparkUsageVisible: true,
     disableKeychainAccess: false,
-    showDebugSettings: false,
     providerMetrics: {},
     floatBarEnabled: false,
     floatBarOpacity: 80,
+    floatBarScale: 100,
     floatBarOrientation: "horizontal",
+    floatBarStyle: "floating",
     floatBarClickThrough: false,
     floatBarProviderIds: [],
     floatBarDarkText: false,
+    floatBarShowResetInline: false,
+    floatBarShowCost: false,
+    claudeDailyRoutinesUsageVisible: true,
+    claudeAllowReadingClaudeCodeCredentials: false,
+    alibabaTokenPlanRegion: "cn",
+    weeklyProgressWorkDays: null,
+    costSummaryDisplayStyle: "compact",
+    providerAccentColors: {},
     ...overrides,
   };
 }
@@ -140,9 +194,6 @@ function bootstrap(
 ): BootstrapState {
   return {
     contractVersion: "v1",
-    surfaceModes: [],
-    commands: [],
-    events: [],
     providers: catalog,
     settings: settings(settingsOverrides),
   };
@@ -154,10 +205,16 @@ function renderTrayPanel(
   catalog: ProviderCatalogEntry[] = [],
 ) {
   tauriMocks.getCachedProviders.mockResolvedValue(providers);
-  tauriMocks.getSettingsSnapshot.mockResolvedValue(settings(settingsOverrides));
+  const snapshot = settings(settingsOverrides);
+  tauriMocks.getSettingsSnapshot.mockResolvedValue(snapshot);
   return render(
     <LocaleProvider>
-      <TrayPanel state={bootstrap(settingsOverrides, catalog)} />
+      <TrayPanel
+        state={{
+          ...bootstrap(settingsOverrides, catalog),
+          settings: snapshot,
+        }}
+      />
     </LocaleProvider>,
   );
 }
@@ -172,8 +229,13 @@ describe("TrayPanel provider grid", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     eventMocks.listeners.clear();
+    tauriMocks.claudeReconciliationState.mockResolvedValue(null);
+    tauriMocks.getDeepSeekPricingStatus.mockResolvedValue(null);
+    tauriMocks.getUsageSpendSummary.mockResolvedValue({ rows: [], models: [] });
+    tauriMocks.flyoutStoredSize.mockResolvedValue(null);
     tauriMocks.refreshProviders.mockResolvedValue(undefined);
     tauriMocks.refreshProvidersIfStale.mockResolvedValue(undefined);
+    tauriMocks.dismissTrayPanel.mockResolvedValue(undefined);
     tauriMocks.reanchorTrayPanel.mockResolvedValue(undefined);
     tauriMocks.getWorkAreaRect.mockResolvedValue({
       x: 0,
@@ -186,6 +248,7 @@ describe("TrayPanel provider grid", () => {
       target: { kind: "summary" },
     });
     tauriMocks.getSettingsSnapshot.mockResolvedValue(settings());
+    tauriMocks.updateSettings.mockResolvedValue(settings());
     tauriMocks.getUpdateState.mockResolvedValue({
       status: "idle",
       version: null,
@@ -203,7 +266,23 @@ describe("TrayPanel provider grid", () => {
       usageBreakdown: [],
       localUsage: null,
     });
-    tauriMocks.getLocaleStrings.mockResolvedValue(buildBundle());
+    tauriMocks.getLocaleStrings.mockResolvedValue(
+      buildBundle({
+        ActionRefresh: "Refresh",
+        MenuAbout: "About CodexBar",
+        MenuQuit: "Quit",
+        MenuSettings: "Settings...",
+        ActionUsageDashboard: "Usage Dashboard",
+        ActionStatusPage: "Status Page",
+        PanelAllProviders: "All providers",
+        PanelAllProvidersShort: "All",
+        PanelLeftSuffix: "left",
+        PanelShowAllProviders: "Show all providers",
+        PanelShowFewerProviders: "Show fewer providers",
+        PanelUsedSuffix: "used",
+        PanelZoom: "Zoom",
+      }),
+    );
     eventMocks.listen.mockImplementation(
       (event: string, handler: (event: { payload: unknown }) => void) => {
         const listeners = eventMocks.listeners.get(event) ?? [];
@@ -212,6 +291,218 @@ describe("TrayPanel provider grid", () => {
         return Promise.resolve(() => {});
       },
     );
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("reveals regardless of the shared surface-mode snapshot (TrayPanel now runs in its own dedicated window)", async () => {
+    // TrayPanel is now hosted exclusively in the dedicated `flyout` OS
+    // window (see App.tsx's isFlyoutWindow() routing), so it must not depend
+    // on `main`'s surface-mode machine to know it's "open" — that machine
+    // can never report "trayPanel" anymore (main only holds
+    // Hidden/PopOut/Settings post-refactor). Overriding the snapshot mock to
+    // something else confirms the fixed-size restore + reveal gate
+    // (isFlyoutOpen, hardcoded true in TrayPanel.tsx) is no longer wired to
+    // useSurfaceMode() at all.
+    tauriMocks.getCurrentSurfaceState.mockResolvedValue({
+      mode: "popOut",
+      target: { kind: "dashboard" },
+    });
+
+    const { container } = renderTrayPanel([provider("claude", "Claude", 35)]);
+
+    await waitFor(() => {
+      expect(container.querySelector(".tray-panel-reveal--ready")).not.toBeNull();
+    });
+  });
+
+  it("offers an Overview share snapshot using only included spend rows", async () => {
+    tauriMocks.getUsageSpendSummary.mockResolvedValue({
+      contract: {},
+      reportingDay: "2026-09-19",
+      dashboardTimezone: "UTC",
+      rows: [
+        {
+          providerId: "codex",
+          displayName: "Codex",
+          sevenDay: 1,
+          thirtyDay: 2,
+          currency: "USD",
+          source: "local",
+          includedInOverview: true,
+        },
+        {
+          providerId: "claude",
+          displayName: "Claude",
+          sevenDay: 3,
+          thirtyDay: 4,
+          currency: "USD",
+          source: "hidden",
+          includedInOverview: false,
+        },
+      ],
+    });
+
+    renderTrayPanel([provider("codex", "Codex", 35)]);
+
+    expect(await screen.findByRole("button", { name: "UsageSpendShare" })).toBeInTheDocument();
+    expect(screen.getByText(/1 of 1 OverviewSpendProviderCoverage/)).toBeInTheDocument();
+  });
+
+  it("dismisses the tray panel on unmodified Escape", async () => {
+    const { container } = renderTrayPanel([provider("claude", "Claude", 35)]);
+
+    await waitFor(() => {
+      expect(container.querySelector(".tray-panel-reveal--ready")).not.toBeNull();
+    });
+
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    await waitFor(() => {
+      expect(tauriMocks.dismissTrayPanel).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("does not dismiss the tray panel on modified Escape", async () => {
+    const { container } = renderTrayPanel([provider("claude", "Claude", 35)]);
+
+    await waitFor(() => {
+      expect(container.querySelector(".tray-panel-reveal--ready")).not.toBeNull();
+    });
+
+    fireEvent.keyDown(window, { key: "Escape", ctrlKey: true });
+    fireEvent.keyDown(window, { key: "Escape", shiftKey: true });
+    fireEvent.keyDown(window, { key: "Escape", altKey: true });
+    fireEvent.keyDown(window, { key: "Escape", metaKey: true });
+
+    expect(tauriMocks.dismissTrayPanel).not.toHaveBeenCalled();
+  });
+
+  it("keeps the existing Ctrl+R tray shortcut", async () => {
+    const { container } = renderTrayPanel([provider("claude", "Claude", 35)]);
+
+    await waitFor(() => {
+      expect(container.querySelector(".tray-panel-reveal--ready")).not.toBeNull();
+    });
+    tauriMocks.refreshProviders.mockClear();
+
+    fireEvent.keyDown(window, { key: "r", ctrlKey: true });
+
+    await waitFor(() => {
+      expect(tauriMocks.refreshProviders).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("scopes the status-page action to the selected provider", async () => {
+    const { container } = renderTrayPanel([
+      provider("claude", "Claude", 35),
+      provider("codex", "Codex", 45),
+    ]);
+
+    await waitFor(() => {
+      expect(container.querySelector(".tray-panel-reveal--ready")).not.toBeNull();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^Claude$/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Usage Dashboard$/ }));
+    expect(tauriMocks.openProviderDashboard).toHaveBeenLastCalledWith("claude");
+    fireEvent.click(await screen.findByRole("button", { name: /^Status Page$/ }));
+    expect(tauriMocks.openProviderStatusPage).toHaveBeenLastCalledWith("claude");
+
+    fireEvent.click(screen.getByRole("button", { name: /^Codex$/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Usage Dashboard$/ }));
+    expect(tauriMocks.openProviderDashboard).toHaveBeenLastCalledWith("codex");
+    fireEvent.click(await screen.findByRole("button", { name: /^Status Page$/ }));
+    expect(tauriMocks.openProviderStatusPage).toHaveBeenLastCalledWith("codex");
+  });
+
+  it("localizes static tray panel labels in Japanese", async () => {
+    tauriMocks.getLocaleStrings.mockResolvedValue(
+      buildBundle(
+        {
+          ActionRefresh: "更新",
+          MenuAbout: "CodexBar について",
+          MenuQuit: "終了",
+          MenuSettings: "設定...",
+          PanelAllProviders: "すべてのプロバイダー",
+          PanelAllProvidersShort: "すべて",
+          PanelLatestTokens: "最新トークン",
+          PanelThirtyDayCost: "30日間のコスト",
+          PanelTopModelPrefix: "トップモデル",
+          PanelEstimatedFromLocalLogs: "ローカルログから推定",
+          PanelZoom: "ズーム",
+          UpdatedDaysAgo: "{}日前",
+        },
+        "japanese",
+      ),
+    );
+    tauriMocks.getProviderChartData.mockResolvedValue({
+      providerId: "codex",
+      costHistory: [{ date: "2026-05-24", value: 1.23 }],
+      creditsHistory: [],
+      usageBreakdown: [],
+      localUsage: {
+        todayCost: null,
+        thirtyDayCost: 1.23,
+        thirtyDayTokens: 584_000,
+        latestTokens: 1200,
+        topModel: "gpt-5.5",
+        estimateNote: "Estimated from local logs",
+        tokenCostUpdatedAtMs: 1234,
+      },
+    });
+
+    const { container } = renderTrayPanel([provider("codex", "Codex", 35)]);
+
+    await waitFor(() => {
+      expect(
+        container.querySelector('.provider-grid__item[aria-label="すべてのプロバイダー"]'),
+      ).not.toBeNull();
+    });
+    expect(container.querySelector(".provider-grid__item")?.textContent).toContain("すべて");
+    expect(screen.getByText("ズーム")).toBeInTheDocument();
+    expect(screen.getByLabelText("ズーム")).toBeInTheDocument();
+    expect(screen.getByText("更新")).toBeInTheDocument();
+    expect(screen.getByText("設定...")).toBeInTheDocument();
+    expect(screen.getByText("CodexBar について")).toBeInTheDocument();
+    expect(screen.getByText("終了")).toBeInTheDocument();
+    expect(await screen.findByText("30日間のコスト")).toBeInTheDocument();
+    expect(container.querySelector(".menu-card__subtitle")?.textContent).toContain("日前");
+    expect(screen.getByText("最新トークン")).toBeInTheDocument();
+    expect(screen.getByText("トップモデル: gpt-5.5")).toBeInTheDocument();
+    expect(screen.getByText("ローカルログから推定")).toBeInTheDocument();
+  });
+
+  it("localizes the expanded dense grid collapse label in Japanese", async () => {
+    tauriMocks.getLocaleStrings.mockResolvedValue(
+      buildBundle(
+        {
+          PanelAllProviders: "すべてのプロバイダー",
+          PanelAllProvidersShort: "すべて",
+          PanelShowAllProviders: "すべてのプロバイダーを表示",
+          PanelShowFewerProviders: "表示を減らす",
+        },
+        "japanese",
+      ),
+    );
+    const providers = TEST_PROVIDER_CATALOG.map(([id, displayName], index) =>
+      provider(id, displayName, (index * 7) % 100),
+    );
+
+    const { container } = renderTrayPanel(providers);
+
+    await waitFor(() => {
+      expect(container.querySelector(".provider-grid--compact")).not.toBeNull();
+    });
+
+    fireEvent.click(
+      container.querySelector<HTMLButtonElement>(
+        '.provider-grid__item--more[aria-label="すべてのプロバイダーを表示"]',
+      )!,
+    );
+
+    expect(await screen.findByText("表示を減らす")).toBeInTheDocument();
   });
 
   it.each([
@@ -307,6 +598,71 @@ describe("TrayPanel provider grid", () => {
         (node) => node.textContent,
       ),
     ).toEqual(["Codex", "Claude", "Cursor", "Factory", "Gemini"]);
+  });
+
+  it("keeps compact Overview limited to two quota rows when explicitly selected", async () => {
+    const { container } = renderTrayPanel(
+      [providerWithThreeQuotaWindows("codex", "Codex")],
+      { overviewLayout: "compact" },
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector(".menu-stack__item")).not.toBeNull();
+    });
+
+    expect(container.querySelectorAll(".menu-metric")).toHaveLength(2);
+  });
+
+  it("uses independent columns for a wide user-sized overview", async () => {
+    tauriMocks.flyoutStoredSize.mockResolvedValue([700, 700]);
+    const providers = [
+      provider("codex", "Codex"),
+      provider("claude", "Claude"),
+      provider("antigravity", "Antigravity"),
+      provider("copilot", "GitHub Copilot"),
+    ];
+
+    const { container } = renderTrayPanel(providers, {
+      enabledProviders: providers.map((snapshot) => snapshot.providerId),
+    });
+
+    await waitFor(() => {
+      expect(container.querySelector(".tray-panel-reveal--usersized")).not.toBeNull();
+    });
+
+    expect(
+      Array.from(container.querySelectorAll(".menu-stack__column")).map((column) =>
+        Array.from(column.querySelectorAll(".menu-stack__item")).map(
+          (item) => item.id,
+        ),
+      ),
+    ).toEqual([
+      ["card-codex", "card-antigravity"],
+      ["card-claude", "card-copilot"],
+    ]);
+    expect(container.querySelector(".menu-stack__sep")).toBeNull();
+  });
+
+  it("keeps the stacked layout when the saved flyout width is narrow", async () => {
+    vi.spyOn(window, "innerWidth", "get").mockReturnValue(700);
+    tauriMocks.flyoutStoredSize.mockResolvedValue([500, 700]);
+    const providers = [
+      provider("codex", "Codex"),
+      provider("claude", "Claude"),
+      provider("antigravity", "Antigravity"),
+      provider("copilot", "GitHub Copilot"),
+    ];
+
+    const { container } = renderTrayPanel(providers, {
+      enabledProviders: providers.map((snapshot) => snapshot.providerId),
+    });
+
+    await waitFor(() => {
+      expect(container.querySelector(".tray-panel-reveal--usersized")).not.toBeNull();
+    });
+
+    expect(container.querySelector(".menu-stack__column")).toBeNull();
+    expect(container.querySelectorAll(".menu-stack__sep")).toHaveLength(3);
   });
 
   it("collapses and expands the full provider catalog in the dense tray grid", async () => {
@@ -438,11 +794,67 @@ describe("TrayPanel provider grid", () => {
     expect(container.querySelector(".provider-grid__icon-overview")).toBeNull();
   });
 
+  it("renders the tray footer zoom slider above Refresh and persists trayScalePercent after the debounce", async () => {
+    const { container } = renderTrayPanel(
+      [provider("claude", "Claude", 35)],
+      { trayScalePercent: 120 },
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector(".menu-surface__footer-zoom")).not.toBeNull();
+    });
+
+    const footerChildren = Array.from(
+      container.querySelectorAll(".menu-surface__footer > *"),
+    );
+    const zoomIndex = footerChildren.findIndex((el) =>
+      el.classList.contains("menu-surface__footer-zoom"),
+    );
+    const refreshIndex = footerChildren.findIndex(
+      (el) => el.textContent?.includes("Refresh"),
+    );
+    expect(zoomIndex).toBeGreaterThanOrEqual(0);
+    expect(refreshIndex).toBeGreaterThan(zoomIndex);
+
+    // Slider reflects the persisted settings value.
+    const slider = container.querySelector<HTMLInputElement>(
+      ".menu-surface__footer-zoom-slider",
+    )!;
+    expect(slider).not.toBeNull();
+    expect(slider.value).toBe("120");
+    expect(slider.min).toBe("100");
+    expect(slider.max).toBe("200");
+    expect(slider.step).toBe("5");
+    expect(
+      container.querySelector(".menu-surface__footer-zoom-value")?.textContent,
+    ).toBe("120%");
+
+    fireEvent.change(slider, { target: { value: "150" } });
+
+    // Live preview: thumb and readout update immediately from local state…
+    expect(slider.value).toBe("150");
+    expect(
+      container.querySelector(".menu-surface__footer-zoom-value")?.textContent,
+    ).toBe("150%");
+
+    // …while persistence trails the ~250ms debounce (not synchronous).
+    expect(tauriMocks.updateSettings).not.toHaveBeenCalled();
+    await waitFor(() => {
+      expect(tauriMocks.updateSettings).toHaveBeenCalledWith({
+        trayScalePercent: 150,
+      });
+    });
+    expect(tauriMocks.updateSettings).toHaveBeenCalledTimes(1);
+  });
+
   it("reveals the tray panel if the native resize pass fails", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     windowMocks.getCurrentWindow.mockReturnValue({
       setSize: vi.fn().mockRejectedValue(new Error("resize failed")),
       close: vi.fn().mockResolvedValue(undefined),
+      scaleFactor: vi.fn().mockResolvedValue(1),
+      onResized: vi.fn().mockResolvedValue(() => {}),
+      innerSize: vi.fn().mockResolvedValue({ width: 328, height: 200 }),
     });
 
     const { container } = renderTrayPanel([provider("claude", "Claude", 35)]);
@@ -459,6 +871,9 @@ describe("TrayPanel provider grid", () => {
     windowMocks.getCurrentWindow.mockReturnValue({
       setSize,
       close: vi.fn().mockResolvedValue(undefined),
+      scaleFactor: vi.fn().mockResolvedValue(1),
+      onResized: vi.fn().mockResolvedValue(() => {}),
+      innerSize: vi.fn().mockResolvedValue({ width: 328, height: 200 }),
     });
 
     const { container } = renderTrayPanel([provider("claude", "Claude", 35)]);
@@ -485,6 +900,9 @@ describe("TrayPanel provider grid", () => {
     windowMocks.getCurrentWindow.mockReturnValue({
       setSize,
       close: vi.fn().mockResolvedValue(undefined),
+      scaleFactor: vi.fn().mockResolvedValue(1),
+      onResized: vi.fn().mockResolvedValue(() => {}),
+      innerSize: vi.fn().mockResolvedValue({ width: 328, height: 200 }),
     });
     const denseProviders = TEST_PROVIDER_CATALOG.slice(0, 36).map(([id, displayName]) =>
       provider(id, displayName),
@@ -506,6 +924,9 @@ describe("TrayPanel provider grid", () => {
     windowMocks.getCurrentWindow.mockReturnValue({
       setSize,
       close: vi.fn().mockResolvedValue(undefined),
+      scaleFactor: vi.fn().mockResolvedValue(1),
+      onResized: vi.fn().mockResolvedValue(() => {}),
+      innerSize: vi.fn().mockResolvedValue({ width: 328, height: 200 }),
     });
     const errorProvider = {
       ...provider("abacus", "Abacus AI", 0),
@@ -528,6 +949,50 @@ describe("TrayPanel provider grid", () => {
     await waitFor(() => {
       expect(setSize).toHaveBeenCalledWith(
         expect.objectContaining({ width: 328, height: 420 }),
+      );
+    });
+  });
+
+  it("scales the auto-fit measure by the active tray zoom before clamping (#265)", async () => {
+    const setSize = vi.fn().mockResolvedValue(undefined);
+    windowMocks.getCurrentWindow.mockReturnValue({
+      setSize,
+      close: vi.fn().mockResolvedValue(undefined),
+      scaleFactor: vi.fn().mockResolvedValue(1),
+      onResized: vi.fn().mockResolvedValue(() => {}),
+      innerSize: vi.fn().mockResolvedValue({ width: 328, height: 200 }),
+    });
+    // jsdom has no layout engine (scrollHeight always reads 0), so pin it
+    // globally to a deterministic PRE-zoom content height: TrayPanel applies
+    // `zoom: trayScale` via CSS and the hook must size the window in POST-zoom
+    // px or tall cards clip below the fold (#265).
+    const scrollHeight = vi
+      .spyOn(Element.prototype, "scrollHeight", "get")
+      .mockReturnValue(505);
+
+    const first = renderTrayPanel([provider("codex", "Codex", 61)], {
+      trayScalePercent: 150,
+    });
+
+    // 505 raw × 1.5 zoom = 757.5 → 758 rounded, + the 4px fudge = 762.
+    await waitFor(() => {
+      expect(setSize).toHaveBeenCalledWith(
+        expect.objectContaining({ width: 328, height: 762 }),
+      );
+    });
+    first.unmount();
+    setSize.mockClear();
+
+    // Same zoom, taller content: round(700 × 1.5) + 4 = 1054 exceeds the
+    // mocked work-area cap (900 - 16 = 884), so the clamp still wins.
+    scrollHeight.mockReturnValue(700);
+    renderTrayPanel([provider("codex", "Codex", 61)], {
+      trayScalePercent: 150,
+    });
+
+    await waitFor(() => {
+      expect(setSize).toHaveBeenCalledWith(
+        expect.objectContaining({ width: 328, height: 884 }),
       );
     });
   });

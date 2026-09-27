@@ -53,10 +53,10 @@ impl TokenAccountSupport {
             }),
             ProviderId::Zai => Some(TokenAccountSupport {
                 title: "API tokens",
-                subtitle: "Stored locally in token-accounts.json.",
+                subtitle: "Stored locally in token-accounts.json. Team usage can use workspace_id as organization|project.",
                 placeholder: "Paste token...",
                 injection: TokenInjection::Environment {
-                    key: "ZED_API_TOKEN".to_string(),
+                    key: "Z_AI_API_KEY".to_string(),
                 },
                 requires_manual_cookie_source: false,
                 cookie_name: None,
@@ -141,6 +141,14 @@ impl TokenAccountSupport {
                 requires_manual_cookie_source: true,
                 cookie_name: None,
             }),
+            ProviderId::ZoomMate => Some(TokenAccountSupport {
+                title: "Session tokens",
+                subtitle: "Store multiple ZoomMate Cookie headers or credits/status cURL captures.",
+                placeholder: "Cookie: ... or curl 'https://ai.zoom.us/.../credits/status' -H 'Authorization: Bearer ...'",
+                injection: TokenInjection::CookieHeader,
+                requires_manual_cookie_source: true,
+                cookie_name: None,
+            }),
             ProviderId::Mistral => Some(TokenAccountSupport {
                 title: "Session tokens",
                 subtitle: "Store multiple Mistral Cookie headers.",
@@ -167,11 +175,150 @@ impl TokenAccountSupport {
             }),
             ProviderId::CommandCode => Some(TokenAccountSupport {
                 title: "Session tokens",
-                subtitle: "Store multiple Command Code better-auth session tokens.",
-                placeholder: "better-auth.session_token value or Cookie: ...",
+                subtitle: "Store multiple Command Code Cookie headers or Better Auth values.",
+                placeholder: "Cookie: __Secure-commandcode_prod_.session_token=... or better-auth value",
                 injection: TokenInjection::CookieHeader,
                 requires_manual_cookie_source: true,
                 cookie_name: Some("__Secure-better-auth.session_token"),
+            }),
+            ProviderId::Qoder => Some(TokenAccountSupport {
+                title: "Session tokens",
+                subtitle: "Store multiple Qoder Cookie headers.",
+                placeholder: "Cookie: ...",
+                injection: TokenInjection::CookieHeader,
+                requires_manual_cookie_source: true,
+                cookie_name: None,
+            }),
+            ProviderId::CodeBuddy => Some(TokenAccountSupport {
+                title: "Session tokens",
+                subtitle: "Store CodeBuddy CN Cookie headers (from plans-usage DevTools cURL).",
+                placeholder: "Cookie: session=...; ... (or paste full Cookie header)",
+                injection: TokenInjection::CookieHeader,
+                requires_manual_cookie_source: true,
+                cookie_name: None,
+            }),
+            ProviderId::Sakana => Some(TokenAccountSupport {
+                title: "Session tokens",
+                subtitle: "Store multiple Sakana Console Cookie headers.",
+                placeholder: "Cookie: ...",
+                injection: TokenInjection::CookieHeader,
+                requires_manual_cookie_source: true,
+                cookie_name: None,
+            }),
+            ProviderId::Notion => Some(TokenAccountSupport {
+                title: "Session tokens",
+                subtitle: "Store multiple Notion Cookie headers or token_v2 values.",
+                placeholder: "Cookie: token_v2=... or paste the token_v2 value",
+                injection: TokenInjection::CookieHeader,
+                requires_manual_cookie_source: true,
+                cookie_name: Some("token_v2"),
+            }),
+            ProviderId::Replicate => Some(TokenAccountSupport {
+                title: "Session tokens",
+                subtitle: "Store multiple Replicate Cookie headers from the billing page.",
+                placeholder: "Cookie: sessionid=...; ...",
+                injection: TokenInjection::CookieHeader,
+                requires_manual_cookie_source: true,
+                cookie_name: Some("sessionid"),
+            }),
+            ProviderId::Sub2Api => Some(TokenAccountSupport {
+                title: "Group API keys",
+                subtitle: "Store multiple sub2api group API keys with labels such as Claude, Codex, or Gemini.",
+                placeholder: "sk-...",
+                injection: TokenInjection::Environment {
+                    key: "SUB2API_API_KEY".to_string(),
+                },
+                requires_manual_cookie_source: false,
+                cookie_name: None,
+            }),
+            ProviderId::DeepInfra => Some(TokenAccountSupport {
+                title: "API keys",
+                subtitle: "Store multiple DeepInfra API keys.",
+                placeholder: "API key from deepinfra.com/dash",
+                injection: TokenInjection::Environment {
+                    key: "DEEPINFRA_API_KEY".to_string(),
+                },
+                requires_manual_cookie_source: false,
+                cookie_name: None,
+            }),
+            ProviderId::HuggingFace => Some(TokenAccountSupport {
+                title: "API tokens",
+                subtitle: "Store multiple Hugging Face access tokens.",
+                placeholder: "Paste a Hugging Face access token",
+                injection: TokenInjection::Environment {
+                    key: "CODEXBAR_HUGGINGFACE_API_KEY".to_string(),
+                },
+                requires_manual_cookie_source: false,
+                cookie_name: None,
+            }),
+            ProviderId::AiAnd => Some(TokenAccountSupport {
+                title: "API keys",
+                subtitle: "Store multiple ai& API keys.",
+                placeholder: "API key from console.aiand.com",
+                injection: TokenInjection::Environment {
+                    key: "AIAND_API_KEY".to_string(),
+                },
+                requires_manual_cookie_source: false,
+                cookie_name: None,
+            }),
+            ProviderId::ZenMux => Some(TokenAccountSupport {
+                title: "API keys",
+                subtitle: "Store multiple ZenMux Management API keys.",
+                placeholder: "Management API key",
+                injection: TokenInjection::Environment {
+                    key: "ZENMUX_MANAGEMENT_API_KEY".to_string(),
+                },
+                requires_manual_cookie_source: false,
+                cookie_name: None,
+            }),
+            ProviderId::ClinePass => Some(TokenAccountSupport {
+                title: "API keys",
+                subtitle: "Store multiple ClinePass API keys.",
+                placeholder: "API key",
+                injection: TokenInjection::Environment {
+                    key: "CLINEPASS_API_KEY".to_string(),
+                },
+                requires_manual_cookie_source: false,
+                cookie_name: None,
+            }),
+            ProviderId::Neuralwatt => Some(TokenAccountSupport {
+                title: "API keys",
+                subtitle: "Store multiple Neuralwatt API keys.",
+                placeholder: "API key",
+                injection: TokenInjection::Environment {
+                    key: "NEURALWATT_API_KEY".to_string(),
+                },
+                requires_manual_cookie_source: false,
+                cookie_name: None,
+            }),
+            ProviderId::Grok => Some(TokenAccountSupport {
+                title: "Grok credentials",
+                subtitle: "Store SuperGrok bearer tokens or grok.com Cookie headers.",
+                placeholder: "Bearer token or Cookie: ...",
+                injection: TokenInjection::CookieHeader,
+                requires_manual_cookie_source: false,
+                cookie_name: None,
+            }),
+            ProviderId::Xai => Some(TokenAccountSupport {
+                title: "Management API keys",
+                subtitle: "Store multiple xAI Management API keys. Team ID is set separately under provider settings.",
+                placeholder: "xai-... Management API key from console.x.ai",
+                injection: TokenInjection::Environment {
+                    key: "XAI_MANAGEMENT_API_KEY".to_string(),
+                },
+                requires_manual_cookie_source: false,
+                cookie_name: None,
+            }),
+            // Upstream 0.45 #2271: labeled OpenRouter API keys via token accounts.
+            ProviderId::OpenRouter => Some(TokenAccountSupport {
+                title: "API keys",
+                subtitle: "Store multiple OpenRouter API keys.",
+                placeholder: "sk-or-v1-...",
+                injection: TokenInjection::Environment {
+                    key: "OPENROUTER_API_KEY".to_string(),
+                },
+                requires_manual_cookie_source: false,
+                cookie_name: None,
             }),
             ProviderId::Copilot => Some(TokenAccountSupport {
                 title: "GitHub accounts",
@@ -185,17 +332,16 @@ impl TokenAccountSupport {
             }),
             // These providers don't support token accounts
             ProviderId::Codex
+            | ProviderId::Pi
             | ProviderId::Gemini
             | ProviderId::Antigravity
             | ProviderId::Kiro
             | ProviderId::VertexAI
             | ProviderId::Kimi
             | ProviderId::KimiK2
-            | ProviderId::Synthetic
             | ProviderId::JetBrains
             | ProviderId::Warp
             | ProviderId::AzureOpenAI
-            | ProviderId::OpenRouter
             | ProviderId::NanoGPT
             | ProviderId::Infini
             | ProviderId::Perplexity
@@ -204,6 +350,7 @@ impl TokenAccountSupport {
             | ProviderId::Kilo
             | ProviderId::Bedrock
             | ProviderId::Codebuff
+            | ProviderId::CodeRabbit
             | ProviderId::DeepSeek
             | ProviderId::Windsurf
             | ProviderId::Doubao
@@ -211,11 +358,26 @@ impl TokenAccountSupport {
             | ProviderId::StepFun
             | ProviderId::Venice
             | ProviderId::OpenAIApi
-            | ProviderId::Grok
             | ProviderId::ElevenLabs
             | ProviderId::Deepgram
             | ProviderId::Groq
-            | ProviderId::LLMProxy => None,
+            | ProviderId::Helmcode
+            | ProviderId::V0
+            | ProviderId::TypeSafe
+            | ProviderId::LLMProxy
+            | ProviderId::Chutes
+            | ProviderId::LiteLLM
+            | ProviderId::Poe
+            | ProviderId::Devin
+            | ProviderId::Zed
+            | ProviderId::CrossModel
+            | ProviderId::LongCat
+            | ProviderId::Wayfinder
+            | ProviderId::QwenCloud
+            | ProviderId::Fireworks
+            | ProviderId::Meta
+            | ProviderId::Nous
+            | ProviderId::Muse => None,
         }
     }
 
@@ -227,6 +389,13 @@ impl TokenAccountSupport {
     /// Get environment override for a token
     pub fn env_override(provider: ProviderId, token: &str) -> Option<HashMap<String, String>> {
         let support = Self::for_provider(provider)?;
+        if provider == ProviderId::Grok
+            && let Some(token) = Self::normalized_grok_oauth_token(token)
+        {
+            let mut map = HashMap::new();
+            map.insert("CODEXBAR_GROK_OAUTH_TOKEN".to_string(), token);
+            return Some(map);
+        }
         match &support.injection {
             TokenInjection::Environment { key } => {
                 let mut map = HashMap::new();
@@ -267,6 +436,21 @@ impl TokenAccountSupport {
         format!("{}={}", cookie_name, trimmed)
     }
 
+    fn normalized_grok_oauth_token(token: &str) -> Option<String> {
+        let mut value = token.trim();
+        if value.len() >= 7 && value[..7].eq_ignore_ascii_case("bearer ") {
+            value = value[7..].trim();
+        }
+        if value.is_empty()
+            || value.contains('=')
+            || value.to_ascii_lowercase().starts_with("cookie:")
+            || value.to_ascii_lowercase().starts_with("xai-")
+        {
+            return None;
+        }
+        Some(value.to_string())
+    }
+
     /// Check if a token is a Claude OAuth token
     pub fn is_claude_oauth_token(token: &str) -> bool {
         let Some(trimmed) = Self::normalized_claude_oauth_token(token) else {
@@ -303,6 +487,9 @@ pub struct TokenAccount {
     pub label: String,
     /// The token/cookie value
     pub token: String,
+    /// Stable external identity supplied by the provider, when available
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_identifier: Option<String>,
     /// When this account was added (Unix timestamp in seconds)
     pub added_at: i64,
     /// When this account was last used (Unix timestamp in seconds)
@@ -317,6 +504,7 @@ impl TokenAccount {
             id: Uuid::new_v4(),
             label: label.into(),
             token: token.into(),
+            external_identifier: None,
             added_at: Utc::now().timestamp(),
             last_used: None,
         }
@@ -468,8 +656,8 @@ impl TokenAccountStore {
 
     /// Get the default storage path
     pub fn default_path() -> PathBuf {
-        directories::ProjectDirs::from("", "", "CodexBar")
-            .map(|dirs| dirs.config_dir().to_path_buf())
+        dirs::config_dir()
+            .map(|dir| dir.join("CodexBar"))
             .unwrap_or_else(|| {
                 dirs::home_dir()
                     .unwrap_or_else(|| PathBuf::from("."))
@@ -604,8 +792,62 @@ mod tests {
         assert!(TokenAccountSupport::is_supported(ProviderId::Claude));
         assert!(TokenAccountSupport::is_supported(ProviderId::Cursor));
         assert!(TokenAccountSupport::is_supported(ProviderId::Copilot));
+        assert!(TokenAccountSupport::is_supported(ProviderId::OpenRouter));
+        assert!(TokenAccountSupport::is_supported(ProviderId::Grok));
         assert!(!TokenAccountSupport::is_supported(ProviderId::Codex));
         assert!(!TokenAccountSupport::is_supported(ProviderId::Gemini));
+    }
+
+    #[test]
+    fn grok_token_accounts_route_bearer_and_cookie_credentials() {
+        let bearer =
+            TokenAccountSupport::env_override(ProviderId::Grok, "Bearer oauth-token").unwrap();
+        assert_eq!(
+            bearer.get("CODEXBAR_GROK_OAUTH_TOKEN").map(String::as_str),
+            Some("oauth-token")
+        );
+        assert!(TokenAccountSupport::env_override(ProviderId::Grok, "Cookie: sso=abc").is_none());
+        assert_eq!(
+            TokenAccountSupport::normalized_cookie_header(ProviderId::Grok, "Cookie: sso=abc"),
+            "Cookie: sso=abc"
+        );
+    }
+
+    #[test]
+    fn openrouter_token_accounts_inject_api_key_env() {
+        let support = TokenAccountSupport::for_provider(ProviderId::OpenRouter).unwrap();
+        assert_eq!(support.title, "API keys");
+        assert_eq!(support.placeholder, "sk-or-v1-...");
+        assert!(!support.requires_manual_cookie_source);
+        match &support.injection {
+            TokenInjection::Environment { key } => assert_eq!(key, "OPENROUTER_API_KEY"),
+            other => panic!("expected environment injection, got {other:?}"),
+        }
+
+        let mut data = ProviderAccountData::new();
+        data.add_account(TokenAccount::new("Personal", "sk-or-v1-personal"));
+        data.add_account(TokenAccount::new("Work", "sk-or-v1-work"));
+        data.set_active(1);
+
+        let active = data.active_account().unwrap();
+        assert_eq!(active.label, "Work");
+        let env = TokenAccountSupport::env_override(ProviderId::OpenRouter, &active.token).unwrap();
+        assert_eq!(
+            env.get("OPENROUTER_API_KEY").map(String::as_str),
+            Some("sk-or-v1-work")
+        );
+
+        let override_data =
+            TokenAccountOverride::from_account(ProviderId::OpenRouter, active.clone());
+        assert_eq!(
+            override_data
+                .env_override
+                .as_ref()
+                .and_then(|m| m.get("OPENROUTER_API_KEY"))
+                .map(String::as_str),
+            Some("sk-or-v1-work")
+        );
+        assert!(override_data.cookie_header.is_none());
     }
 
     #[test]

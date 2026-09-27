@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import type {
   ProviderUsageSnapshot,
   RefreshCompletePayload,
+  RefreshStartedPayload,
 } from "../types/bridge";
 import {
   getCachedProviders,
@@ -23,6 +24,11 @@ export interface UseProvidersOptions {
    * freshness, while still receiving cached data and live provider events.
    */
   refreshOnMount?: boolean;
+  /**
+   * When true, the mount refresh bypasses stale-cache checks and refreshes all
+   * enabled providers. Used by the tray/menu "refresh on open" setting.
+   */
+  forceRefreshOnMount?: boolean;
 }
 
 export interface UseProvidersResult {
@@ -30,6 +36,7 @@ export interface UseProvidersResult {
   providers: ProviderUsageSnapshot[];
   /** True while a refresh cycle is in progress. */
   isRefreshing: boolean;
+  refreshingProviderIds: ReadonlySet<string>;
   /** Trigger a manual refresh. No-op if already refreshing. */
   refresh: () => void;
   /** Summary from the last completed refresh cycle, if any. */
@@ -52,7 +59,9 @@ export interface UseProvidersResult {
  */
 export function useProviders(options: UseProvidersOptions = {}): UseProvidersResult {
   const [providers, setProviders] = useState<ProviderUsageSnapshot[]>([]);
-  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [refreshingProviderIds, setRefreshingProviderIds] = useState<Set<string>>(
+    new Set(),
+  );
   const [lastRefresh, setLastRefresh] = useState<RefreshCompletePayload | null>(
     null,
   );
@@ -60,6 +69,9 @@ export function useProviders(options: UseProvidersOptions = {}): UseProvidersRes
   const refreshingRef = useRef(false);
   const pendingSnapshotsRef = useRef<Map<string, ProviderUsageSnapshot>>(new Map());
   const flushTimerRef = useRef<number | undefined>(undefined);
+  const resetRefreshTimerRef = useRef<number | undefined>(undefined);
+  const settingsReloadEpochRef = useRef(0);
+  const settingsReloadingRef = useRef(false);
 
   const mergeSnapshots = useCallback((snapshots: ProviderUsageSnapshot[]) => {
     if (snapshots.length === 0) return;
@@ -91,17 +103,16 @@ export function useProviders(options: UseProvidersOptions = {}): UseProvidersRes
 
   const queueSnapshot = useCallback((snapshot: ProviderUsageSnapshot) => {
     pendingSnapshotsRef.current.set(snapshot.providerId, snapshot);
-    if (flushTimerRef.current !== undefined) return;
+    if (settingsReloadingRef.current || flushTimerRef.current !== undefined) return;
     flushTimerRef.current = window.setTimeout(flushPendingSnapshots, 80);
   }, [flushPendingSnapshots]);
 
   const refresh = useCallback(() => {
     if (refreshingRef.current) return;
     refreshingRef.current = true;
-    setIsRefreshing(true);
     refreshProviders().catch(() => {
       refreshingRef.current = false;
-      setIsRefreshing(false);
+      setRefreshingProviderIds(new Set());
     });
   }, []);
 
@@ -109,9 +120,14 @@ export function useProviders(options: UseProvidersOptions = {}): UseProvidersRes
     let cancelled = false;
 
     // Load existing cache first.
+    const initialEpoch = settingsReloadEpochRef.current;
     getCachedProviders()
       .then((cached) => {
-        if (!cancelled && cached.length > 0) {
+        if (
+          !cancelled &&
+          initialEpoch === settingsReloadEpochRef.current &&
+          cached.length > 0
+        ) {
           mergeSnapshots(cached);
         }
       })
@@ -125,14 +141,44 @@ export function useProviders(options: UseProvidersOptions = {}): UseProvidersRes
     const unlistenUpdated = listen<ProviderUsageSnapshot>(
       "provider-updated",
       (event) => {
-        if (!cancelled) queueSnapshot(event.payload);
+        if (!cancelled) {
+          queueSnapshot(event.payload);
+          setRefreshingProviderIds(
+            (current) =>
+              new Set(
+                [...current].filter((id) => id !== event.payload.providerId),
+              ),
+          );
+        }
       },
     );
 
-    const unlistenStarted = listen("refresh-started", () => {
+    const unlistenSettings = listen("settings-changed", () => {
+      const epoch = ++settingsReloadEpochRef.current;
+      settingsReloadingRef.current = true;
+      if (flushTimerRef.current !== undefined) {
+        window.clearTimeout(flushTimerRef.current);
+        flushTimerRef.current = undefined;
+      }
+      pendingSnapshotsRef.current.clear();
+      getCachedProviders()
+        .then((cached) => {
+          if (!cancelled && epoch === settingsReloadEpochRef.current) {
+            mergeSnapshots(cached);
+          }
+        })
+        .finally(() => {
+          if (!cancelled && epoch === settingsReloadEpochRef.current) {
+            settingsReloadingRef.current = false;
+            flushPendingSnapshots();
+          }
+        });
+    });
+
+    const unlistenStarted = listen<RefreshStartedPayload>("refresh-started", (event) => {
       if (!cancelled) {
         refreshingRef.current = true;
-        setIsRefreshing(true);
+        setRefreshingProviderIds(new Set(event.payload.providerIds));
       }
     });
 
@@ -140,9 +186,9 @@ export function useProviders(options: UseProvidersOptions = {}): UseProvidersRes
       "refresh-complete",
       (event) => {
         if (!cancelled) {
-          flushPendingSnapshots();
+          if (!settingsReloadingRef.current) flushPendingSnapshots();
           refreshingRef.current = false;
-          setIsRefreshing(false);
+          setRefreshingProviderIds(new Set());
           setLastRefresh(event.payload);
         }
       },
@@ -151,10 +197,13 @@ export function useProviders(options: UseProvidersOptions = {}): UseProvidersRes
     let initialRefreshTimer: number | undefined;
 
     const runInitialRefresh = () => {
-      refreshProvidersIfStale().catch(() => {
+      const refreshPromise = options.forceRefreshOnMount
+        ? refreshProviders()
+        : refreshProvidersIfStale();
+      refreshPromise.catch(() => {
         if (!cancelled) {
           refreshingRef.current = false;
-          setIsRefreshing(false);
+          setRefreshingProviderIds(new Set());
         }
       });
     };
@@ -171,6 +220,8 @@ export function useProviders(options: UseProvidersOptions = {}): UseProvidersRes
 
     return () => {
       cancelled = true;
+      settingsReloadEpochRef.current += 1;
+      settingsReloadingRef.current = false;
       if (initialRefreshTimer !== undefined) {
         window.clearTimeout(initialRefreshTimer);
       }
@@ -178,23 +229,71 @@ export function useProviders(options: UseProvidersOptions = {}): UseProvidersRes
         window.clearTimeout(flushTimerRef.current);
         flushTimerRef.current = undefined;
       }
+      if (resetRefreshTimerRef.current !== undefined) {
+        window.clearTimeout(resetRefreshTimerRef.current);
+        resetRefreshTimerRef.current = undefined;
+      }
       pendingSnapshotsRef.current.clear();
       unlistenUpdated.then((fn) => fn());
+      unlistenSettings.then((fn) => fn());
       unlistenStarted.then((fn) => fn());
       unlistenComplete.then((fn) => fn());
     };
   }, [
+    options.forceRefreshOnMount,
     options.initialRefreshDelayMs,
     options.refreshOnMount,
     flushPendingSnapshots,
     mergeSnapshots,
     queueSnapshot,
-    refresh,
   ]);
+
+  useEffect(() => {
+    if (resetRefreshTimerRef.current !== undefined) {
+      window.clearTimeout(resetRefreshTimerRef.current);
+      resetRefreshTimerRef.current = undefined;
+    }
+
+    const now = Date.now();
+    let nextReset: number | undefined;
+    for (const provider of providers) {
+      const candidates = [
+        provider.primary.resetsAt,
+        provider.secondary?.resetsAt,
+        provider.modelSpecific?.resetsAt,
+        provider.tertiary?.resetsAt,
+        ...(provider.extraRateWindows ?? []).map((extra) => extra.window.resetsAt),
+        provider.cost?.resetsAt,
+      ];
+      for (const value of candidates) {
+        if (!value) continue;
+        const time = Date.parse(value);
+        if (Number.isFinite(time) && time > now && (nextReset === undefined || time < nextReset)) {
+          nextReset = time;
+        }
+      }
+    }
+
+    if (nextReset === undefined) return;
+
+    const delay = Math.max(5_000, nextReset - now + 1_000);
+    resetRefreshTimerRef.current = window.setTimeout(() => {
+      resetRefreshTimerRef.current = undefined;
+      refresh();
+    }, delay);
+
+    return () => {
+      if (resetRefreshTimerRef.current !== undefined) {
+        window.clearTimeout(resetRefreshTimerRef.current);
+        resetRefreshTimerRef.current = undefined;
+      }
+    };
+  }, [providers, refresh]);
 
   return {
     providers,
-    isRefreshing,
+    isRefreshing: refreshingProviderIds.size > 0,
+    refreshingProviderIds,
     refresh,
     lastRefresh,
     hasCachedData: providers.length > 0,

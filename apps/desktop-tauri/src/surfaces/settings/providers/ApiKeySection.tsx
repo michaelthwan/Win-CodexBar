@@ -2,9 +2,11 @@ import { useCallback, useEffect, useState } from "react";
 import {
   getApiKeyProviders,
   getApiKeys,
+  openProviderDashboard,
   removeApiKey,
   setApiKey,
 } from "../../../lib/tauri";
+import { useLocale } from "../../../hooks/useLocale";
 import type {
   ApiKeyInfoBridge,
   ApiKeyProviderInfoBridge,
@@ -20,6 +22,7 @@ interface Props {
  * to provider state instead of in a separate tab.
  */
 export function ApiKeySection({ providerId }: Props) {
+  const { t } = useLocale();
   const [info, setInfo] = useState<ApiKeyProviderInfoBridge | null>(null);
   const [saved, setSaved] = useState<ApiKeyInfoBridge | null>(null);
   const [loaded, setLoaded] = useState(false);
@@ -67,7 +70,7 @@ export function ApiKeySection({ providerId }: Props) {
   if (!info && error) {
     return (
       <section className="provider-detail-section">
-        <h4>API Key</h4>
+        <h4>{t("ApiKeyTitle")}</h4>
         <div className="settings-status settings-status--error">{error}</div>
       </section>
     );
@@ -111,7 +114,7 @@ export function ApiKeySection({ providerId }: Props) {
 
   return (
     <section className="provider-detail-section">
-      <h4>API Key</h4>
+      <h4>{t("ApiKeyTitle")}</h4>
 
       {error && (
         <div className="settings-status settings-status--error">{error}</div>
@@ -125,7 +128,7 @@ export function ApiKeySection({ providerId }: Props) {
                 {saved ? (
                   <>
                     <span className="credential-card__badge credential-card__badge--set">
-                      Configured
+                      {t("KeySet")}
                     </span>
                     <span className="credential-card__masked">
                       {saved.maskedKey}
@@ -136,12 +139,12 @@ export function ApiKeySection({ providerId }: Props) {
                       </span>
                     )}
                     <span className="credential-card__date">
-                      Saved {saved.savedAt}
+                      {t("LastUpdated")} {saved.savedAt}
                     </span>
                   </>
                 ) : (
                   <span className="credential-card__badge credential-card__badge--unset">
-                    Not set
+                    {t("ApiKeyNotSet")}
                   </span>
                 )}
               </span>
@@ -149,6 +152,7 @@ export function ApiKeySection({ providerId }: Props) {
             <div className="credential-card__actions">
               {!editing && (
                 <button
+                  type="button"
                   className="credential-btn"
                   disabled={busy}
                   onClick={() => {
@@ -157,16 +161,17 @@ export function ApiKeySection({ providerId }: Props) {
                     setEditLabel(saved?.label ?? "");
                   }}
                 >
-                  {saved ? "Update" : "Add Key"}
+                  {saved ? t("ApiKeyUpdate") : t("AddKey")}
                 </button>
               )}
               {saved && !editing && (
                 <button
+                  type="button"
                   className="credential-btn credential-btn--danger"
                   disabled={busy}
                   onClick={() => void handleRemove()}
                 >
-                  Remove
+                  {t("Remove")}
                 </button>
               )}
             </div>
@@ -177,14 +182,17 @@ export function ApiKeySection({ providerId }: Props) {
           )}
 
           {info.dashboardUrl && !editing && (
-            <a
+            <button
+              type="button"
               className="credential-card__link"
-              href={info.dashboardUrl}
-              target="_blank"
-              rel="noopener noreferrer"
+              onClick={() =>
+                void openProviderDashboard(providerId).catch((err: unknown) =>
+                  setError(err instanceof Error ? err.message : String(err)),
+                )
+              }
             >
-              Open dashboard ↗
-            </a>
+              {t("OpenProviderDashboard").replace("{}", info.displayName)} ↗
+            </button>
           )}
 
           {editing && (
@@ -192,7 +200,7 @@ export function ApiKeySection({ providerId }: Props) {
               <input
                 type="password"
                 className="text-input credential-card__input"
-                placeholder="Paste API key…"
+                placeholder={t("PasteApiKeyHere")}
                 autoComplete="off"
                 value={editValue}
                 onChange={(e) => setEditValue(e.target.value)}
@@ -201,20 +209,22 @@ export function ApiKeySection({ providerId }: Props) {
               <input
                 type="text"
                 className="text-input credential-card__input credential-card__input--label"
-                placeholder="Label (optional)"
+                placeholder={t("ApiKeyLabelOptional")}
                 value={editLabel}
                 onChange={(e) => setEditLabel(e.target.value)}
                 disabled={busy}
               />
               <div className="credential-card__edit-actions">
                 <button
+                  type="button"
                   className="credential-btn credential-btn--primary"
                   disabled={busy || !editValue.trim()}
                   onClick={() => void handleSave()}
                 >
-                  Save
+                  {t("Save")}
                 </button>
                 <button
+                  type="button"
                   className="credential-btn"
                   disabled={busy}
                   onClick={() => {
@@ -223,7 +233,7 @@ export function ApiKeySection({ providerId }: Props) {
                     setEditLabel("");
                   }}
                 >
-                  Cancel
+                  {t("Cancel")}
                 </button>
               </div>
             </div>

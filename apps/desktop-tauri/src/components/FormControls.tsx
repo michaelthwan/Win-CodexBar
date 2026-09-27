@@ -6,11 +6,13 @@ export function Toggle({
   checked,
   onChange,
   label,
+  ariaLabel,
   disabled,
 }: {
   checked: boolean;
   onChange: (v: boolean) => void;
   label?: string;
+  ariaLabel?: string;
   disabled?: boolean;
 }) {
   const input = (
@@ -18,6 +20,7 @@ export function Toggle({
       type="checkbox"
       className="toggle"
       checked={checked}
+      aria-label={ariaLabel}
       disabled={disabled}
       onChange={(e) => onChange(e.target.checked)}
     />
@@ -38,21 +41,23 @@ export function Select({
   options,
   onChange,
   disabled,
+  ariaLabel,
+  minWidth,
 }: {
   value: string;
   options: { value: string; label: string }[];
   onChange: (v: string) => void;
   disabled?: boolean;
+  ariaLabel?: string;
+  minWidth?: number;
 }) {
-  const selectedLabel = options.find((option) => option.value === value)?.label ?? value;
-  const width = Math.min(128, Math.max(48, Math.ceil(selectedLabel.length * 6.8) + 18));
-
   return (
     <select
       className="select"
-      style={{ width }}
+      style={{ minWidth }}
       value={value}
       disabled={disabled}
+      aria-label={ariaLabel}
       onChange={(e) => onChange(e.target.value)}
     >
       {options.map((o) => (
@@ -71,6 +76,7 @@ export function NumberInput({
   step,
   onChange,
   disabled,
+  ariaLabel,
 }: {
   value: number;
   min?: number;
@@ -78,6 +84,7 @@ export function NumberInput({
   step?: number;
   onChange: (v: number) => void;
   disabled?: boolean;
+  ariaLabel?: string;
 }) {
   return (
     <input
@@ -88,33 +95,13 @@ export function NumberInput({
       max={max}
       step={step}
       disabled={disabled}
+      aria-label={ariaLabel}
       onChange={(e) => {
-        const n = Number(e.target.value);
+        const raw = e.target.value;
+        if (raw === "") return;
+        const n = Number(raw);
         if (!Number.isNaN(n)) onChange(n);
       }}
-    />
-  );
-}
-
-export function TextInput({
-  value,
-  placeholder,
-  onChange,
-  disabled,
-}: {
-  value: string;
-  placeholder?: string;
-  onChange: (v: string) => void;
-  disabled?: boolean;
-}) {
-  return (
-    <input
-      type="text"
-      className="text-input"
-      value={value}
-      placeholder={placeholder}
-      disabled={disabled}
-      onChange={(e) => onChange(e.target.value)}
     />
   );
 }

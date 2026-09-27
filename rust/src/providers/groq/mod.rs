@@ -75,8 +75,9 @@ impl GroqProvider {
                 is_primary: false,
                 dashboard_url: Some("https://console.groq.com/settings/metrics"),
                 status_page_url: Some("https://status.groq.com"),
+                tertiary_label_key: None,
             },
-            client: Client::builder()
+            client: crate::core::credentialed_http_client_builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
@@ -180,7 +181,7 @@ impl Provider for GroqProvider {
 fn api_base_url() -> Url {
     std::env::var("GROQ_API_URL")
         .ok()
-        .and_then(|raw| Url::parse(raw.trim()).ok())
+        .and_then(|raw| crate::providers::validated_https_url(&raw, "Groq API").ok())
         .unwrap_or_else(|| Url::parse(GROQ_API_BASE).expect("static Groq URL is valid"))
 }
 

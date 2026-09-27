@@ -1,5 +1,8 @@
 // Public positioning API — consumed by the shell and tested here.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "window positioner types reserved for future window management integration"
+)]
 
 /// A rectangle in physical pixels (monitor work area or icon bounds).
 #[derive(Debug, Clone, Copy)]
@@ -28,7 +31,10 @@ fn physical_panel_size(panel_size: &PanelSize, scale_factor: f64) -> (i32, i32) 
         1.0
     };
 
+    // Physical size is rounded to whole pixels before truncation.
+    #[expect(clippy::cast_possible_truncation, reason = "whole units by design")]
     let width = ((panel_size.width as f64) * scale_factor).round().max(1.0) as i32;
+    #[expect(clippy::cast_possible_truncation, reason = "whole units by design")]
     let height = ((panel_size.height as f64) * scale_factor).round().max(1.0) as i32;
     (width, height)
 }
@@ -43,7 +49,16 @@ fn clamp_to_work_area(
     let (pw, ph) = physical_panel_size(panel_size, scale_factor);
     let min_x = monitor_rect.x + MARGIN;
     let min_y = monitor_rect.y + MARGIN;
+    // Monitor dimensions are physical pixels, bounded well below i32::MAX.
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "monitor pixel dimensions fit in i32"
+    )]
     let max_x = (monitor_rect.x + monitor_rect.width as i32 - pw - MARGIN).max(min_x);
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "monitor pixel dimensions fit in i32"
+    )]
     let max_y = (monitor_rect.y + monitor_rect.height as i32 - ph - MARGIN).max(min_y);
 
     (target_x.clamp(min_x, max_x), target_y.clamp(min_y, max_y))
@@ -58,6 +73,11 @@ fn calculate_anchored_position(
     open_above: bool,
 ) -> (i32, i32) {
     let (pw, ph) = physical_panel_size(panel_size, scale_factor);
+    // Tray icon widths are tens of pixels, far below i32::MAX.
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "tray icon pixel dimensions fit in i32"
+    )]
     let anchor_x = icon_rect.x + (icon_rect.width as i32) / 2;
     let target_x = anchor_x - pw / 2;
     let target_y = if open_above {
@@ -83,35 +103,57 @@ pub fn clamp_position_to_work_area(
 ///
 /// Placement rules:
 /// - Horizontally centered on the icon, clamped to the monitor work area.
+/// - Left/right taskbars bottom-align the panel to the work area.
 /// - If the icon is in the bottom half of the monitor (bottom taskbar), the
 ///   panel opens *above* the icon. Otherwise it opens *below*.
 pub fn calculate_panel_position(
     icon_rect: &Rect,
-    monitor_rect: &Rect,
+    monitor_bounds: &Rect,
+    work_area: &Rect,
     panel_size: &PanelSize,
     scale_factor: f64,
 ) -> (i32, i32) {
-    let my = monitor_rect.y;
-    let mh = monitor_rect.height as i32;
+    let my = work_area.y;
+    // Work-area and icon dimensions are physical pixels, bounded well below i32::MAX.
+    #[expect(clippy::cast_possible_wrap, reason = "pixel dimensions fit in i32")]
+    let mh = work_area.height as i32;
 
+    #[expect(clippy::cast_possible_wrap, reason = "pixel dimensions fit in i32")]
     let icon_cy = icon_rect.y + (icon_rect.height as i32) / 2;
     let monitor_cy = my + mh / 2;
 
     let open_above = icon_cy > monitor_cy;
+    // Icon bounds are physical pixels, bounded well below i32::MAX.
+    #[expect(clippy::cast_possible_wrap, reason = "pixel dimensions fit in i32")]
     let anchor_y = if open_above {
         icon_rect.y
     } else {
         icon_rect.y + icon_rect.height as i32
     };
 
-    calculate_anchored_position(
+    let position = calculate_anchored_position(
         icon_rect,
-        monitor_rect,
+        work_area,
         panel_size,
         scale_factor,
         anchor_y,
         open_above,
-    )
+    );
+    // Monitor and work-area widths are physical pixels, bounded well below i32::MAX.
+    #[expect(clippy::cast_possible_wrap, reason = "pixel dimensions fit in i32")]
+    let bounds_right = monitor_bounds.x + monitor_bounds.width as i32;
+    #[expect(clippy::cast_possible_wrap, reason = "pixel dimensions fit in i32")]
+    let work_right = work_area.x + work_area.width as i32;
+
+    if work_area.x > monitor_bounds.x || work_right < bounds_right {
+        let (_, ph) = physical_panel_size(panel_size, scale_factor);
+        // Work-area height is a physical pixel count, bounded well below i32::MAX.
+        #[expect(clippy::cast_possible_wrap, reason = "pixel dimensions fit in i32")]
+        let work_height = work_area.height as i32;
+        (position.0, work_area.y + work_height - ph - MARGIN)
+    } else {
+        position
+    }
 }
 
 /// Position for shortcut-triggered opening: 22 % from left, vertically centred.
@@ -123,9 +165,20 @@ pub fn calculate_shortcut_position(
     let (pw, ph) = physical_panel_size(panel_size, scale_factor);
     let mx = monitor_rect.x;
     let my = monitor_rect.y;
+    // Monitor dimensions are physical pixels, bounded well below i32::MAX.
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "monitor pixel dimensions fit in i32"
+    )]
     let mw = monitor_rect.width as i32;
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "monitor pixel dimensions fit in i32"
+    )]
     let mh = monitor_rect.height as i32;
 
+    // Shortcut offset is truncated to a whole pixel by design.
+    #[expect(clippy::cast_possible_truncation, reason = "whole units by design")]
     let x = mx + ((mw as f64) * 0.22) as i32;
     let y = my + (mh - ph) / 2;
 
@@ -152,7 +205,16 @@ pub fn calculate_popout_position(
     let (pw, ph) = physical_panel_size(panel_size, scale_factor);
     let mx = monitor_rect.x;
     let my = monitor_rect.y;
+    // Monitor dimensions are physical pixels, bounded well below i32::MAX.
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "monitor pixel dimensions fit in i32"
+    )]
     let mw = monitor_rect.width as i32;
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "monitor pixel dimensions fit in i32"
+    )]
     let mh = monitor_rect.height as i32;
 
     let (target_x, target_y) = if let Some(icon_rect) = icon_rect {
@@ -222,7 +284,8 @@ mod tests {
             width: 24,
             height: 24,
         };
-        let (_, y) = calculate_panel_position(&icon, &hd_monitor(), &panel(), 1.0);
+        let monitor = hd_monitor();
+        let (_, y) = calculate_panel_position(&icon, &monitor, &monitor, &panel(), 1.0);
         assert!(y < icon.y, "panel should sit above the icon");
     }
 
@@ -234,9 +297,10 @@ mod tests {
             width: 24,
             height: 24,
         };
-        let (_, y) = calculate_panel_position(&icon, &hd_monitor(), &panel(), 1.0);
+        let monitor = hd_monitor();
+        let (_, y) = calculate_panel_position(&icon, &monitor, &monitor, &panel(), 1.0);
         assert!(
-            y >= icon.y + icon.height as i32,
+            y >= icon.y + i32::try_from(icon.height).unwrap(),
             "panel should sit below the icon"
         );
     }
@@ -249,7 +313,8 @@ mod tests {
             width: 24,
             height: 24,
         };
-        let (x, _) = calculate_panel_position(&icon, &hd_monitor(), &panel(), 1.0);
+        let monitor = hd_monitor();
+        let (x, _) = calculate_panel_position(&icon, &monitor, &monitor, &panel(), 1.0);
         let icon_cx = icon.x + 12;
         let panel_cx = x + 210;
         assert!(
@@ -267,7 +332,8 @@ mod tests {
             width: 24,
             height: 24,
         };
-        let (x, _) = calculate_panel_position(&icon, &hd_monitor(), &panel(), 1.0);
+        let monitor = hd_monitor();
+        let (x, _) = calculate_panel_position(&icon, &monitor, &monitor, &panel(), 1.0);
         assert!(x >= MARGIN, "panel must not exceed left margin");
     }
 
@@ -279,9 +345,10 @@ mod tests {
             width: 24,
             height: 24,
         };
-        let (x, _) = calculate_panel_position(&icon, &hd_monitor(), &panel(), 1.0);
+        let monitor = hd_monitor();
+        let (x, _) = calculate_panel_position(&icon, &monitor, &monitor, &panel(), 1.0);
         assert!(
-            x + panel().width as i32 + MARGIN <= 1920,
+            x + i32::try_from(panel().width).unwrap() + MARGIN <= 1920,
             "panel must not exceed right margin"
         );
     }
@@ -294,7 +361,8 @@ mod tests {
             width: 24,
             height: 24,
         };
-        let (_, y) = calculate_panel_position(&icon, &hd_monitor(), &panel(), 1.0);
+        let monitor = hd_monitor();
+        let (_, y) = calculate_panel_position(&icon, &monitor, &monitor, &panel(), 1.0);
         assert!(y >= MARGIN, "panel must not exceed top margin");
     }
 
@@ -312,8 +380,56 @@ mod tests {
             width: 24,
             height: 24,
         };
-        let (_, y) = calculate_panel_position(&icon, &work_area, &panel(), 1.0);
+        let monitor = hd_monitor();
+        let (_, y) = calculate_panel_position(&icon, &monitor, &work_area, &panel(), 1.0);
         assert_eq!(y, work_area.y + MARGIN);
+    }
+
+    #[test]
+    fn left_taskbar_bottom_aligns_panel() {
+        let monitor = hd_monitor();
+        let work_area = Rect {
+            x: 40,
+            y: 0,
+            width: 1880,
+            height: 1080,
+        };
+        let icon = Rect {
+            x: 8,
+            y: 1048,
+            width: 24,
+            height: 24,
+        };
+
+        let (_, y) = calculate_panel_position(&icon, &monitor, &work_area, &panel(), 1.0);
+
+        assert_eq!(y, 1080 - 560 - MARGIN);
+    }
+
+    #[test]
+    fn high_dpi_right_taskbar_bottom_aligns_panel() {
+        let monitor = Rect {
+            x: 0,
+            y: 0,
+            width: 3840,
+            height: 2160,
+        };
+        let work_area = Rect {
+            x: 0,
+            y: 0,
+            width: 3760,
+            height: 2160,
+        };
+        let icon = Rect {
+            x: 3808,
+            y: 2128,
+            width: 24,
+            height: 24,
+        };
+
+        let (_, y) = calculate_panel_position(&icon, &monitor, &work_area, &panel(), 2.0);
+
+        assert_eq!(y, 2160 - (560 * 2) - MARGIN);
     }
 
     #[test]
@@ -330,9 +446,12 @@ mod tests {
             width: 24,
             height: 24,
         };
-        let (x, _) = calculate_panel_position(&icon, &monitor, &panel(), 1.0);
+        let (x, _) = calculate_panel_position(&icon, &monitor, &monitor, &panel(), 1.0);
         assert!(x >= monitor.x + MARGIN);
-        assert!(x + panel().width as i32 + MARGIN <= monitor.x + monitor.width as i32);
+        assert!(
+            x + i32::try_from(panel().width).unwrap() + MARGIN
+                <= monitor.x + i32::try_from(monitor.width).unwrap()
+        );
     }
 
     #[test]
@@ -343,8 +462,9 @@ mod tests {
             width: 24,
             height: 24,
         };
-        let (x1, y1) = calculate_panel_position(&icon, &hd_monitor(), &panel(), 1.0);
-        let (x2, y2) = calculate_panel_position(&icon, &hd_monitor(), &panel(), 2.0);
+        let monitor = hd_monitor();
+        let (x1, y1) = calculate_panel_position(&icon, &monitor, &monitor, &panel(), 1.0);
+        let (x2, y2) = calculate_panel_position(&icon, &monitor, &monitor, &panel(), 2.0);
         assert!(
             x2 < x1,
             "higher scale should shift the panel left to fit its physical width"
@@ -361,6 +481,8 @@ mod tests {
     fn shortcut_position_22_pct_from_left() {
         let monitor = hd_monitor();
         let (x, _) = calculate_shortcut_position(&monitor, &panel(), 1.0);
+        // 1920 * 0.22 = 422.4 — a constant that fits i32.
+        #[expect(clippy::cast_possible_truncation, reason = "constant offset fits i32")]
         let expected_x = (1920.0 * 0.22) as i32;
         assert_eq!(x, expected_x);
     }
@@ -382,9 +504,15 @@ mod tests {
         };
         let (x, y) = calculate_shortcut_position(&monitor, &panel(), 1.0);
         assert!(x >= MARGIN);
-        assert!(x + panel().width as i32 + MARGIN <= monitor.width as i32);
+        assert!(
+            x + i32::try_from(panel().width).unwrap() + MARGIN
+                <= i32::try_from(monitor.width).unwrap()
+        );
         assert!(y >= MARGIN);
-        assert!(y + panel().height as i32 + MARGIN <= monitor.height as i32);
+        assert!(
+            y + i32::try_from(panel().height).unwrap() + MARGIN
+                <= i32::try_from(monitor.height).unwrap()
+        );
     }
 
     // --- visible-surface popout tests ---
@@ -410,7 +538,8 @@ mod tests {
             height: 24,
         };
 
-        let (panel_x, _) = calculate_panel_position(&icon, &standard_monitor(), &panel(), 1.0);
+        let monitor = standard_monitor();
+        let (panel_x, _) = calculate_panel_position(&icon, &monitor, &monitor, &panel(), 1.0);
         let (popout_x, _) =
             calculate_popout_position(Some(&icon), &standard_monitor(), &panel(), 1.0);
 

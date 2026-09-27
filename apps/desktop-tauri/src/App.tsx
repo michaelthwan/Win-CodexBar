@@ -1,14 +1,22 @@
 import { Suspense, lazy, useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { checkForUpdates, getBootstrapState, getSettingsSnapshot, setSurfaceMode } from "./lib/tauri";
+import {
+  checkForUpdates,
+  downloadUpdate,
+  getBootstrapState,
+  getSettingsSnapshot,
+  setSurfaceMode,
+} from "./lib/tauri";
 import { useSurfaceSnapshot } from "./hooks/useSurfaceSnapshot";
 import { useTheme } from "./hooks/useTheme";
+import { useLocale } from "./hooks/useLocale";
 import TrayPanel from "./surfaces/TrayPanel";
 import { FLOATBAR_WINDOW_LABEL } from "./floatbar/api";
 import { LocaleProvider } from "./i18n/LocaleProvider";
 import type { BootstrapState, ThemePreference } from "./types/bridge";
 import type { SurfaceSnapshot } from "./hooks/useSurfaceSnapshot";
+import { useDeepSeekPricingStatus } from "./hooks/useDeepSeekPricingStatus";
 
 const Settings = lazy(() => import("./surfaces/Settings"));
 const PopOutPanel = lazy(() => import("./surfaces/PopOutPanel"));
@@ -28,6 +36,11 @@ function isFloatBarWindow(): boolean {
   return getCurrentWebviewWindow().label === FLOATBAR_WINDOW_LABEL;
 }
 
+/** True when running inside the detached flyout ("Pop Out Dashboard") window. */
+function isFlyoutWindow(): boolean {
+  return getCurrentWebviewWindow().label === "flyout";
+}
+
 /** Parse the initial Settings tab from the URL query string. */
 function initialSettingsTab(): string {
   const params = new URLSearchParams(window.location.search);
@@ -43,12 +56,14 @@ export default function App() {
 }
 
 function AppInner() {
+  const { t } = useLocale();
   const surface = useSurfaceSnapshot();
   const [state, setState] = useState<BootstrapState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [themePreference, setThemePreference] = useState<ThemePreference>("dark");
 
   useTheme(themePreference);
+  useDeepSeekPricingStatus();
 
   const reloadBootstrapState = useCallback(
     () => getBootstrapState(),
@@ -76,15 +91,21 @@ function AppInner() {
     // Fire-and-forget update checks after the first paint so startup/tray open
     // is not competing with network work.
     const updateTimer = window.setTimeout(() => {
-      checkForUpdates().catch(() => {});
+      Promise.all([checkForUpdates(), getSettingsSnapshot()])
+        .then(([update, settings]) => {
+          if (settings.autoDownloadUpdates && update.canDownload) {
+            void downloadUpdate().catch(() => {});
+          }
+        })
+        .catch(() => {});
     }, 2_000);
 
     // Listen for user-registered global shortcut events from the
     // `register_global_shortcut` command. The persistent shortcut (bound via
-    // shortcut_bridge::plugin) already toggles the tray panel natively, so
-    // this listener is a no-op fallback for ad-hoc capture-mode registrations.
+    // shortcut_bridge::plugin) already opens the PopOut dashboard natively;
+    // this listener is the fallback for ad-hoc capture-mode registrations.
     const unlistenPromise = listen<string>("global-shortcut-triggered", () => {
-      void setSurfaceMode("trayPanel", { kind: "summary" }).catch(() => {});
+      void setSurfaceMode("popOut", { kind: "dashboard" }).catch(() => {});
     });
 
     const unlistenSettingsChangePromise = isSettingsWindow()
@@ -129,7 +150,7 @@ function AppInner() {
     return (
       <main className="shell">
         <section className="panel error">
-          <h2>Bootstrap failed</h2>
+          <h2>{t("BootstrapFailed")}</h2>
           <p>{error}</p>
         </section>
       </main>
@@ -140,8 +161,8 @@ function AppInner() {
     return (
       <main className="shell">
         <section className="panel">
-          <h2>Loading shell contract…</h2>
-          <p>Waiting for the Rust bridge to describe providers, surfaces, and settings.</p>
+          <h2>{t("LoadingShellContract")}</h2>
+          <p>{t("LoadingShellContractHint")}</p>
         </section>
       </main>
     );
@@ -159,6 +180,13 @@ function AppInner() {
         <FloatBar state={state} />
       </Suspense>
     );
+  }
+
+  // Detached flyout ("Pop Out Dashboard") window — render TrayPanel directly.
+  // TrayPanel is statically imported (not lazy), so no Suspense boundary is
+  // needed here, unlike the other detached-window branches above.
+  if (isFlyoutWindow()) {
+    return <TrayPanel state={state} />;
   }
 
   return <SurfaceRouter surface={surface} state={state} />;

@@ -3,6 +3,10 @@
 //! Fetches usage data by scraping the Ollama settings page
 //! Uses session cookies from browser or manual input
 
+mod cookies;
+
+use cookies::*;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use regex_lite::Regex;
@@ -18,8 +22,9 @@ use crate::settings::ApiKeys;
 /// Ollama settings page URL
 const OLLAMA_SETTINGS_URL: &str = "https://ollama.com/settings";
 const OLLAMA_TAGS_URL: &str = "https://ollama.com/api/tags";
-const OLLAMA_COOKIE_DOMAIN: &str = "ollama.com";
-const OLLAMA_SESSION_COOKIE_NAME: &str = "__Secure-session";
+const OLLAMA_VALIDATION_URL: &str = "https://ollama.com/api/web_search";
+const OLLAMA_MONTHLY_WINDOW_MINUTES: u32 = 30 * 24 * 60;
+const OLLAMA_MONTHLY_USAGE_LABEL: &str = "Monthly usage";
 
 /// Ollama provider
 pub struct OllamaProvider {
@@ -48,107 +53,97 @@ impl OllamaProvider {
                 is_primary: false,
                 dashboard_url: Some("https://ollama.com/settings"),
                 status_page_url: None,
+                tertiary_label_key: None,
             },
         }
     }
 
     /// Fetch usage by scraping ollama.com/settings
     async fn fetch_usage_web(&self, ctx: &FetchContext) -> Result<UsageSnapshot, ProviderError> {
-        let cookie_header = self.resolve_cookie_header(ctx)?;
+        let cookies = resolve_cookie_source(ctx)?;
 
-        let client = reqwest::Client::builder()
+        let client = crate::core::credentialed_http_client_builder()
             .timeout(std::time::Duration::from_secs(ctx.web_timeout))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| ProviderError::Other(e.to_string()))?;
-
-        let mut current_url =
+        let start_url =
             Url::parse(OLLAMA_SETTINGS_URL).map_err(|e| ProviderError::Other(e.to_string()))?;
-        let mut resp = None;
 
-        for _ in 0..5 {
-            let mut request = client
-                .get(current_url.clone())
-                .header(
-                    "Accept",
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                )
-                .header(
-                    "User-Agent",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
-                );
-
-            if should_attach_ollama_cookie(&current_url) {
-                request = request.header("Cookie", &cookie_header);
-            }
-
-            let response = request.send().await?;
-            if response.status().is_redirection() {
-                let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
-                    return Err(ProviderError::Other(
-                        "Ollama redirect missing Location header".to_string(),
-                    ));
-                };
-                let location = location
-                    .to_str()
-                    .map_err(|e| ProviderError::Other(e.to_string()))?;
-                let next_url = current_url
-                    .join(location)
-                    .map_err(|e| ProviderError::Other(e.to_string()))?;
-                if is_ollama_login_url(&next_url) {
-                    return Err(ProviderError::AuthRequired);
+        match fetch_settings_html_at(&client, &cookies, start_url.clone()).await {
+            Ok(html) => {
+                // Only cache non-manual browser/validated sessions for reuse.
+                if ctx.manual_cookie_header.is_none() {
+                    cache_validated_session_cookie(&cookies);
                 }
-                if !should_attach_ollama_cookie(&next_url) {
-                    return Err(ProviderError::AuthRequired);
-                }
-                current_url = next_url;
-                continue;
+                self.parse_usage_html(&html)
             }
-            resp = Some(response);
-            break;
+            Err(ProviderError::AuthRequired) if ctx.manual_cookie_header.is_none() => {
+                // Cached/imported session expired — clear and re-import once.
+                invalidate_cached_session_cookie();
+                let fresh = resolve_browser_cookie_header(true)?
+                    .map(OllamaCookieSource::Manual)
+                    .ok_or(ProviderError::AuthRequired)?;
+                let html = fetch_settings_html_at(&client, &fresh, start_url).await?;
+                cache_validated_session_cookie(&fresh);
+                self.parse_usage_html(&html)
+            }
+            Err(err) => Err(err),
         }
-
-        let Some(resp) = resp else {
-            return Err(ProviderError::Other(
-                "Ollama returned too many redirects".to_string(),
-            ));
-        };
-
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-            || resp.status() == reqwest::StatusCode::FORBIDDEN
-        {
-            return Err(ProviderError::AuthRequired);
-        }
-
-        // Check for redirect to login page
-        if is_ollama_login_url(resp.url()) {
-            return Err(ProviderError::AuthRequired);
-        }
-
-        if !resp.status().is_success() {
-            return Err(ProviderError::Other(format!(
-                "Ollama returned status {}",
-                resp.status()
-            )));
-        }
-
-        let html = resp
-            .text()
-            .await
-            .map_err(|e| ProviderError::Other(e.to_string()))?;
-
-        self.parse_usage_html(&html)
     }
 
     async fn fetch_usage_api(&self, ctx: &FetchContext) -> Result<UsageSnapshot, ProviderError> {
         let api_key = Self::resolve_api_key(ctx).ok_or(ProviderError::AuthRequired)?;
-        let client = reqwest::Client::builder()
+        let client = crate::core::credentialed_http_client_builder()
             .timeout(std::time::Duration::from_secs(ctx.web_timeout.max(1)))
             .build()
             .map_err(|e| ProviderError::Other(e.to_string()))?;
+
+        let validation_url =
+            Url::parse(OLLAMA_VALIDATION_URL).map_err(|e| ProviderError::Other(e.to_string()))?;
+        let tags_url =
+            Url::parse(OLLAMA_TAGS_URL).map_err(|e| ProviderError::Other(e.to_string()))?;
+        Self::fetch_usage_api_at(&client, &api_key, validation_url, tags_url).await
+    }
+
+    async fn fetch_usage_api_at(
+        client: &reqwest::Client,
+        api_key: &str,
+        validation_url: Url,
+        tags_url: Url,
+    ) -> Result<UsageSnapshot, ProviderError> {
+        let api_key = clean_secret(Some(api_key)).ok_or(ProviderError::AuthRequired)?;
+        if !crate::core::is_same_origin(&validation_url, &tags_url) {
+            return Err(ProviderError::Other(
+                "Ollama API endpoints must share an origin.".to_string(),
+            ));
+        }
+
+        let validation = client
+            .post(validation_url)
+            .bearer_auth(&api_key)
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .header("User-Agent", "CodexBar/1.0")
+            .body(r#"{"query":""}"#)
+            .send()
+            .await?;
+        match validation.status() {
+            reqwest::StatusCode::OK | reqwest::StatusCode::BAD_REQUEST => {}
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+                return Err(ollama_api_key_error());
+            }
+            status => {
+                return Err(ProviderError::Other(format!(
+                    "Ollama API validation returned status {}",
+                    status.as_u16()
+                )));
+            }
+        }
+
         let response = client
-            .get(OLLAMA_TAGS_URL)
-            .bearer_auth(api_key)
+            .get(tags_url)
+            .bearer_auth(&api_key)
             .header("Accept", "application/json")
             .header("User-Agent", "CodexBar/1.0")
             .send()
@@ -158,7 +153,7 @@ impl OllamaProvider {
         match status {
             reqwest::StatusCode::OK => Self::parse_api_tags(&bytes),
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
-                Err(ProviderError::AuthRequired)
+                Err(ollama_api_key_error())
             }
             _ => Err(ProviderError::Other(format!(
                 "Ollama API returned status {status}"
@@ -214,88 +209,61 @@ impl OllamaProvider {
             Some(format!("{} cloud models available", response.models.len()));
         Ok(UsageSnapshot::new(primary).with_login_method("API key"))
     }
+}
 
-    fn normalize_cookie_header(input: &str) -> Option<String> {
-        let mut header = input.trim();
-        if header.is_empty() {
-            return None;
-        }
+/// Pure decision helper for the Ollama session reuse path (unit-tested).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OllamaSessionAction {
+    UseCached,
+    ReimportBrowser,
+}
 
-        if header
-            .get(.."cookie:".len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("cookie:"))
-        {
-            header = header["cookie:".len()..].trim();
-        }
-
-        if header.is_empty() {
-            return None;
-        }
-
-        if header.contains('=') {
-            Some(header.to_string())
-        } else {
-            Some(format!("{OLLAMA_SESSION_COOKIE_NAME}={header}"))
-        }
+fn ollama_session_action(
+    has_cached_validated: bool,
+    auth_failed: bool,
+    force_reimport: bool,
+) -> OllamaSessionAction {
+    if force_reimport || auth_failed || !has_cached_validated {
+        OllamaSessionAction::ReimportBrowser
+    } else {
+        OllamaSessionAction::UseCached
     }
+}
 
-    /// Resolve cookie header from manual cookies, browser import, or context
-    fn resolve_cookie_header(&self, ctx: &FetchContext) -> Result<String, ProviderError> {
-        // Check manual cookie header first
-        if let Some(ref cookie) = ctx.manual_cookie_header
-            && let Some(header) = Self::normalize_cookie_header(cookie)
-        {
-            return Ok(header);
-        }
-
-        // Try browser cookie extraction
-        use crate::browser::cookies::get_cookie_header;
-        match get_cookie_header(OLLAMA_COOKIE_DOMAIN) {
-            Ok(header) if !header.is_empty() => {
-                // Validate that we have a recognized session cookie
-                const SESSION_COOKIE_NAMES: &[&str] = &[
-                    "session",
-                    "__Secure-session",
-                    "ollama_session",
-                    "__Host-ollama_session",
-                    "__Secure-next-auth.session-token",
-                    "next-auth.session-token",
-                ];
-                let has_session = SESSION_COOKIE_NAMES
-                    .iter()
-                    .any(|name| header.contains(name));
-                if has_session {
-                    Ok(header)
-                } else {
-                    Err(ProviderError::NoCookies)
-                }
-            }
-            _ => Err(ProviderError::NoCookies),
-        }
-    }
-
+impl OllamaProvider {
     /// Parse usage data from the Ollama settings HTML page
     fn parse_usage_html(&self, html: &str) -> Result<UsageSnapshot, ProviderError> {
         // Check if we're signed out
         if html.contains("Sign in")
             && !html.contains("Cloud Usage")
+            && !html.contains("Included usage")
+            && !html.contains(OLLAMA_MONTHLY_USAGE_LABEL)
             && !html.contains("Session usage")
         {
             return Err(ProviderError::AuthRequired);
         }
 
+        let monthly_block = self.parse_usage_block(
+            &[OLLAMA_MONTHLY_USAGE_LABEL],
+            html,
+            Some(OLLAMA_MONTHLY_WINDOW_MINUTES),
+        );
         let session_block =
             self.parse_usage_block(&["Session usage", "Hourly usage"], html, Some(5 * 60));
         let weekly_block = self.parse_usage_block(&["Weekly usage"], html, Some(7 * 24 * 60));
 
-        if session_block.is_none() && weekly_block.is_none() {
+        if monthly_block.is_none() && session_block.is_none() && weekly_block.is_none() {
             return Err(ProviderError::Parse(
                 "Could not find usage data on Ollama settings page".to_string(),
             ));
         }
 
-        let primary = rate_window_from_usage_block(session_block.as_ref());
+        let primary =
+            rate_window_from_usage_block(monthly_block.as_ref().or(session_block.as_ref()));
         let mut usage = UsageSnapshot::new(primary);
+        if monthly_block.is_some() {
+            usage = usage.with_primary_label("Monthly");
+        }
 
         // Parse plan name
         if let Some(plan) = self.parse_plan_name(html) {
@@ -340,6 +308,15 @@ impl OllamaProvider {
                     });
                 }
 
+                if let Some(val) = parse_dollar_used_percent(window) {
+                    return Some(UsageBlock {
+                        used_percent: val,
+                        window_minutes,
+                        resets_at: parse_first_datetime(window),
+                        reset_description: parse_reset_description(window),
+                    });
+                }
+
                 // Try "width: XX%" pattern (progress bar CSS)
                 let width_re = Regex::new(r"width:\s*(\d+(?:\.\d+)?)%").ok()?;
                 if let Some(caps) = width_re.captures(window)
@@ -357,12 +334,23 @@ impl OllamaProvider {
         None
     }
 
-    /// Parse plan name from "Cloud Usage" section
+    /// Parse plan name from the current "Included usage" or legacy "Cloud Usage" section.
     fn parse_plan_name(&self, html: &str) -> Option<String> {
-        let re = Regex::new(r#"Cloud Usage\s*</span>\s*<span[^>]*>([^<]+)</span>"#).ok()?;
-        re.captures(html)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().trim().to_string())
+        for pattern in [
+            r#"Included usage\s*</span\s*>\s*<span[^>]*>([^<]+)</span"#,
+            r#"Cloud Usage\s*</span>\s*<span[^>]*>([^<]+)</span>"#,
+        ] {
+            let re = Regex::new(pattern).ok()?;
+            if let Some(plan) = re
+                .captures(html)
+                .and_then(|caps| caps.get(1))
+                .map(|m| m.as_str().trim().to_string())
+                .filter(|value| !value.is_empty())
+            {
+                return Some(plan);
+            }
+        }
+        None
     }
 
     /// Parse account email from the page
@@ -393,10 +381,12 @@ impl Provider for OllamaProvider {
 
         match ctx.source_mode {
             SourceMode::Auto => {
-                if Self::has_api_key(ctx)
-                    && let Ok(usage) = self.fetch_usage_api(ctx).await
-                {
-                    return Ok(ProviderFetchResult::new(usage, "api"));
+                if Self::has_api_key(ctx) {
+                    match self.fetch_usage_api(ctx).await {
+                        Ok(usage) => return Ok(ProviderFetchResult::new(usage, "api")),
+                        Err(error) if error.is_transport_failure() => return Err(error),
+                        Err(_) => {}
+                    }
                 }
                 let usage = self.fetch_usage_web(ctx).await?;
                 Ok(ProviderFetchResult::new(usage, "web"))
@@ -422,6 +412,10 @@ impl Provider for OllamaProvider {
     fn supports_cli(&self) -> bool {
         false
     }
+
+    fn retains_last_good_on_transport_failure(&self) -> bool {
+        true
+    }
 }
 
 fn clean_secret(raw: Option<&str>) -> Option<String> {
@@ -438,13 +432,33 @@ fn clean_secret(raw: Option<&str>) -> Option<String> {
 }
 
 fn usage_block_end(tail: &str, current_label: &str) -> Option<usize> {
-    ["Session usage", "Hourly usage", "Weekly usage"]
-        .iter()
-        .filter(|label| **label != current_label)
-        .filter_map(|label| tail.get(current_label.len()..)?.find(label))
-        .map(|idx| idx + current_label.len())
-        .min()
-        .map(|idx| idx.min(4000))
+    [
+        OLLAMA_MONTHLY_USAGE_LABEL,
+        "Session usage",
+        "Hourly usage",
+        "Weekly usage",
+    ]
+    .iter()
+    .filter(|label| **label != current_label)
+    .filter_map(|label| tail.get(current_label.len()..)?.find(label))
+    .map(|idx| idx + current_label.len())
+    .min()
+    .map(|idx| idx.min(4000))
+}
+
+/// Convert included dollar credits to quota utilization, not a spend estimate.
+fn parse_dollar_used_percent(text: &str) -> Option<f64> {
+    let amount = r"([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)";
+    let pattern = format!(r"(?i)\$\s*{amount}\s+of\s+\$\s*{amount}\s+used");
+    let re = Regex::new(&pattern).ok()?;
+    let caps = re.captures(text)?;
+    let used = caps.get(1)?.as_str().replace(',', "").parse::<f64>().ok()?;
+    let limit = caps.get(2)?.as_str().replace(',', "").parse::<f64>().ok()?;
+    if !used.is_finite() || !limit.is_finite() || limit <= 0.0 {
+        return None;
+    }
+    let percent = used / limit * 100.0;
+    percent.is_finite().then_some(percent)
 }
 
 fn rate_window_from_usage_block(block: Option<&UsageBlock>) -> RateWindow {
@@ -483,63 +497,238 @@ fn strip_html_entities(value: &str) -> String {
         .replace("&#x2F;", "/")
 }
 
-fn should_attach_ollama_cookie(url: &Url) -> bool {
-    url.scheme() == "https"
-        && url
-            .host_str()
-            .is_some_and(|host| host.eq_ignore_ascii_case(OLLAMA_COOKIE_DOMAIN))
+async fn fetch_settings_html_at(
+    client: &reqwest::Client,
+    source: &OllamaCookieSource,
+    start_url: Url,
+) -> Result<String, ProviderError> {
+    let mut current_url = start_url;
+
+    for _ in 0..5 {
+        let mut request = client
+            .get(current_url.clone())
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+            );
+        if let Some(cookie_header) = source.header_for_url(&current_url) {
+            request = request.header("Cookie", cookie_header);
+        }
+
+        let response = request.send().await?;
+        if response.status().is_redirection() {
+            let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+                return Err(ProviderError::Other(
+                    "Ollama redirect missing Location header".to_string(),
+                ));
+            };
+            let location = location
+                .to_str()
+                .map_err(|e| ProviderError::Other(e.to_string()))?;
+            let next_url = current_url
+                .join(location)
+                .map_err(|e| ProviderError::Other(e.to_string()))?;
+            if is_ollama_sign_in_redirect(&next_url)
+                || !crate::core::is_same_origin(&current_url, &next_url)
+            {
+                return Err(ProviderError::AuthRequired);
+            }
+            current_url = next_url;
+            continue;
+        }
+
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            || response.status() == reqwest::StatusCode::FORBIDDEN
+            || is_ollama_sign_in_redirect(response.url())
+        {
+            return Err(ProviderError::AuthRequired);
+        }
+        if !response.status().is_success() {
+            return Err(ProviderError::Other(format!(
+                "Ollama returned status {}",
+                response.status()
+            )));
+        }
+        return response
+            .text()
+            .await
+            .map_err(|e| ProviderError::Other(e.to_string()));
+    }
+
+    Err(ProviderError::Other(
+        "Ollama returned too many redirects".to_string(),
+    ))
 }
 
-fn is_ollama_login_url(url: &Url) -> bool {
-    let path = url.path().to_ascii_lowercase();
-    path.contains("/login") || path.contains("/signin")
+fn ollama_api_key_error() -> ProviderError {
+    ProviderError::Other("Ollama API key is invalid or revoked.".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::LastGoodFailurePolicy;
 
-    #[test]
-    fn normalizes_raw_ollama_session_cookie_value() {
+    #[tokio::test]
+    async fn settings_fetch_follows_same_origin_redirects() {
+        let mut server = mockito::Server::new_async().await;
+        let first = server
+            .mock("GET", "/settings")
+            .with_status(302)
+            .with_header("location", "/settings/account")
+            .create_async()
+            .await;
+        let second = server
+            .mock("GET", "/settings/account")
+            .with_status(200)
+            .with_body("<html>usage</html>")
+            .create_async()
+            .await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        let html = fetch_settings_html_at(
+            &client,
+            &OllamaCookieSource::Manual("__Secure-session=test".to_string()),
+            Url::parse(&format!("{}/settings", server.url())).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        first.assert_async().await;
+        second.assert_async().await;
+        assert_eq!(html, "<html>usage</html>");
+    }
+
+    #[tokio::test]
+    async fn settings_fetch_stops_before_following_signin_or_workos_redirects() {
+        for location in [
+            "https://signin.ollama.com/?client_id=test",
+            "https://auth.workos.com/user_management/authorize?client_id=test",
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let first = server
+                .mock("GET", "/settings")
+                .with_status(302)
+                .with_header("location", location)
+                .create_async()
+                .await;
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+
+            let error = fetch_settings_html_at(
+                &client,
+                &OllamaCookieSource::Manual("__Secure-session=test".to_string()),
+                Url::parse(&format!("{}/settings", server.url())).unwrap(),
+            )
+            .await
+            .unwrap_err();
+
+            first.assert_async().await;
+            assert!(matches!(error, ProviderError::AuthRequired));
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_fetch_reports_redirect_exhaustion() {
+        let mut server = mockito::Server::new_async().await;
+        let redirect = server
+            .mock("GET", "/settings")
+            .expect(5)
+            .with_status(302)
+            .with_header("location", "/settings")
+            .create_async()
+            .await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        let error = fetch_settings_html_at(
+            &client,
+            &OllamaCookieSource::Manual("__Secure-session=test".to_string()),
+            Url::parse(&format!("{}/settings", server.url())).unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+        redirect.assert_async().await;
+        assert_eq!(error.to_string(), "Ollama returned too many redirects");
+    }
+
+    #[tokio::test]
+    async fn validates_trimmed_key_before_fetching_public_model_catalog() {
+        let mut server = mockito::Server::new_async().await;
+        let validation = server
+            .mock("POST", "/api/web_search")
+            .match_header("authorization", "Bearer ollama-key")
+            .match_header("content-type", "application/json")
+            .match_body(r#"{"query":""}"#)
+            .with_status(400)
+            .create_async()
+            .await;
+        let catalog = server
+            .mock("GET", "/api/tags")
+            .match_header("authorization", "Bearer ollama-key")
+            .with_status(200)
+            .with_body(r#"{"models":[{"name":"gpt-oss"}]}"#)
+            .create_async()
+            .await;
+        let client = reqwest::Client::new();
+
+        let snapshot = OllamaProvider::fetch_usage_api_at(
+            &client,
+            "  ollama-key  ",
+            Url::parse(&format!("{}/api/web_search", server.url())).unwrap(),
+            Url::parse(&format!("{}/api/tags", server.url())).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        validation.assert_async().await;
+        catalog.assert_async().await;
+        assert_eq!(snapshot.login_method.as_deref(), Some("API key"));
+    }
+
+    #[tokio::test]
+    async fn rejects_unproven_validation_responses_before_catalog_fetch() {
+        let mut server = mockito::Server::new_async().await;
+        let validation = server
+            .mock("POST", "/api/web_search")
+            .with_status(422)
+            .create_async()
+            .await;
+        let catalog = server
+            .mock("GET", "/api/tags")
+            .expect(0)
+            .with_status(200)
+            .create_async()
+            .await;
+        let client = reqwest::Client::new();
+
+        let error = OllamaProvider::fetch_usage_api_at(
+            &client,
+            "ollama-key",
+            Url::parse(&format!("{}/api/web_search", server.url())).unwrap(),
+            Url::parse(&format!("{}/api/tags", server.url())).unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+        validation.assert_async().await;
+        catalog.assert_async().await;
         assert_eq!(
-            OllamaProvider::normalize_cookie_header("abc123"),
-            Some("__Secure-session=abc123".to_string())
+            error.to_string(),
+            "Ollama API validation returned status 422"
         );
-    }
-
-    #[test]
-    fn preserves_full_cookie_header() {
-        assert_eq!(
-            OllamaProvider::normalize_cookie_header("__Secure-session=abc123; aid=device"),
-            Some("__Secure-session=abc123; aid=device".to_string())
-        );
-    }
-
-    #[test]
-    fn strips_cookie_header_prefix() {
-        assert_eq!(
-            OllamaProvider::normalize_cookie_header("Cookie: __Secure-session=abc123"),
-            Some("__Secure-session=abc123".to_string())
-        );
-    }
-
-    #[test]
-    fn ignores_empty_cookie_input() {
-        assert_eq!(OllamaProvider::normalize_cookie_header("   "), None);
-        assert_eq!(OllamaProvider::normalize_cookie_header("Cookie:   "), None);
-    }
-
-    #[test]
-    fn only_attaches_web_cookie_to_https_ollama_urls() {
-        assert!(should_attach_ollama_cookie(
-            &Url::parse("https://ollama.com/settings").unwrap()
-        ));
-        assert!(!should_attach_ollama_cookie(
-            &Url::parse("http://ollama.com/settings").unwrap()
-        ));
-        assert!(!should_attach_ollama_cookie(
-            &Url::parse("https://example.com/settings").unwrap()
-        ));
     }
 
     #[test]
@@ -568,6 +757,58 @@ mod tests {
     }
 
     #[test]
+    fn api_auth_error_names_invalid_or_revoked_key() {
+        assert_eq!(
+            ollama_api_key_error().to_string(),
+            "Ollama API key is invalid or revoked."
+        );
+    }
+
+    #[test]
+    fn preserves_legacy_ollama_session_and_weekly_payloads() {
+        let provider = OllamaProvider::new();
+        let snapshot = provider
+            .parse_usage_html(
+                r#"
+                    <span>Cloud Usage</span><span>Free</span>
+                    <section>Session usage <span>42% used</span></section>
+                    <section>Weekly usage <span>84% used</span></section>
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(snapshot.primary.used_percent, 42.0);
+        assert_eq!(snapshot.primary.window_minutes, Some(5 * 60));
+        assert_eq!(snapshot.primary_label, None);
+        assert_eq!(snapshot.secondary.unwrap().used_percent, 84.0);
+        assert_eq!(snapshot.login_method.as_deref(), Some("Free"));
+    }
+
+    #[test]
+    fn parses_monthly_included_credits_and_keeps_weekly_window() {
+        let provider = OllamaProvider::new();
+        let snapshot = provider
+            .parse_usage_html(
+                r#"
+                    <span>Included usage</span><span>Pro</span>
+                    <section>Monthly usage <span>$7.50 of $60 used</span>
+                        <time>2026-09-30T00:00:00Z</time></section>
+                    <section>Weekly usage <span>25% used</span></section>
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(snapshot.primary.used_percent, 12.5);
+        assert_eq!(
+            snapshot.primary.window_minutes,
+            Some(OLLAMA_MONTHLY_WINDOW_MINUTES)
+        );
+        assert_eq!(snapshot.primary_label.as_deref(), Some("Monthly"));
+        assert_eq!(snapshot.secondary.unwrap().used_percent, 25.0);
+        assert_eq!(snapshot.login_method.as_deref(), Some("Pro"));
+    }
+
+    #[test]
     fn parses_ollama_usage_blocks_with_window_bounds() {
         let provider = OllamaProvider::new();
         let html = r#"
@@ -585,5 +826,40 @@ mod tests {
         assert_eq!(session.reset_description.as_deref(), Some("resets in 2h"));
         assert_eq!(weekly.used_percent, 84.0);
         assert!(weekly.resets_at.is_some());
+    }
+
+    #[test]
+    fn session_action_reuses_cached_until_auth_fails() {
+        assert_eq!(
+            ollama_session_action(true, false, false),
+            OllamaSessionAction::UseCached
+        );
+        assert_eq!(
+            ollama_session_action(true, true, false),
+            OllamaSessionAction::ReimportBrowser
+        );
+        assert_eq!(
+            ollama_session_action(false, false, false),
+            OllamaSessionAction::ReimportBrowser
+        );
+        assert_eq!(
+            ollama_session_action(true, false, true),
+            OllamaSessionAction::ReimportBrowser
+        );
+    }
+
+    #[test]
+    fn transport_policy_replaces_free_form_wrappers() {
+        let provider = OllamaProvider::new();
+        assert_eq!(
+            provider.last_good_failure_policy_for_error(&ProviderError::Timeout),
+            LastGoodFailurePolicy::Preserve
+        );
+        assert_eq!(
+            provider.last_good_failure_policy_for_error(&ProviderError::Other(
+                "Network error: arbitrary wrapper".to_string(),
+            )),
+            LastGoodFailurePolicy::Replace
+        );
     }
 }

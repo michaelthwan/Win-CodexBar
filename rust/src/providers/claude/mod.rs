@@ -1,25 +1,122 @@
 //! Claude provider implementation
 
+pub mod accounts;
 mod admin_api;
+pub mod claude_swap;
+mod cli_reset;
 mod oauth;
+pub mod quota_history;
+pub mod reset_observations;
+mod scoped_weekly;
 mod web_api;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use regex_lite::Regex;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 use std::process::{Command as StdCommand, Stdio};
+use std::sync::LazyLock;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::cli::tty_runner::{TtyCommandOptions, TtyCommandRunner};
 use crate::core::{
-    FetchContext, Provider, ProviderError, ProviderFetchResult, ProviderId, ProviderMetadata,
-    RateWindow, SourceMode, UsageSnapshot,
+    FetchContext, LastGoodFailurePolicy, Provider, ProviderError, ProviderFetchResult, ProviderId,
+    ProviderMetadata, RateWindow, SourceMode, UsageSnapshot,
 };
 
 use admin_api::ClaudeAdminApiFetcher;
+#[cfg(test)]
+use cli_reset::parse_claude_reset_date_in_system_zone;
+use cli_reset::{
+    extract_cli_scoped_weekly_limits, normalized_for_label_search, parse_claude_reset_date,
+    parse_percent_line, starts_next_usage_section,
+};
+
+// ── Upstream 0.50.1 #2516: CLI usage-result cache ────────────────────────────
+//
+// When token rotation revokes OAuth access, the auto path falls back to the
+// CLI. To avoid hammering the CLI probe on every poll, cache the last
+// successful CLI result for 15 minutes. The cache is only consulted when
+// OAuth returned `OAuthRevoked` (revoked, not merely expired) so normal
+// refresh cycles are unaffected.
+const CLI_RESULT_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+
+struct CachedCliResult {
+    result: ProviderFetchResult,
+    cached_at: Instant,
+}
+
+static CLI_RESULT_CACHE: LazyLock<Mutex<Option<CachedCliResult>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+fn clear_account_caches(credential_path: &std::path::Path) {
+    if let Ok(mut cache) = CLI_RESULT_CACHE.lock() {
+        *cache = None;
+    }
+    oauth::clear_account_cache(credential_path);
+}
+
+/// Store a successful CLI fetch result in the 15-minute cache.
+fn cache_cli_result(result: ProviderFetchResult) {
+    if let Ok(mut guard) = CLI_RESULT_CACHE.lock() {
+        *guard = Some(CachedCliResult {
+            result,
+            cached_at: Instant::now(),
+        });
+    }
+}
+
+/// Return a cached CLI result if it is still within the TTL. Used when
+/// revoked OAuth prevents a live fetch and the CLI should not be re-probed.
+fn cached_cli_result() -> Option<ProviderFetchResult> {
+    let Ok(guard) = CLI_RESULT_CACHE.lock() else {
+        return None;
+    };
+    guard
+        .as_ref()
+        .filter(|entry| entry.cached_at.elapsed() <= CLI_RESULT_CACHE_TTL)
+        .map(|entry| {
+            let mut result = entry.result.clone();
+            // A retained payload is useful for display, but cannot prove that
+            // the current fetch reached Claude CLI successfully.
+            result.has_successful_claude_cli_quota = false;
+            result
+        })
+}
+
+/// Whether the OAuth source failed with a revocation (not just expiry).
+/// Revoked tokens should reuse the working CLI fallback; expired/missing
+/// tokens should NOT block the normal refresh path.
+fn is_oauth_revoked_error(error: &ProviderError) -> bool {
+    matches!(error, ProviderError::OAuthRevoked(_))
+}
 pub use oauth::ClaudeOAuthFetcher;
 pub use web_api::ClaudeWebApiFetcher;
+
+/// Recovery guidance for a Claude web request blocked by a Cloudflare challenge.
+pub const CLOUDFLARE_CHALLENGE_MESSAGE: &str = concat!(
+    "claude.ai is behind a Cloudflare challenge, often caused by VPN or datacenter networks. ",
+    "Re-authenticating will not help. Switch Claude Usage source to OAuth in Settings ",
+    "(Usage credits balance will be unavailable), or try a different network."
+);
+
+/// Whether the user explicitly consented to reading (and refreshing) Claude
+/// Code's own credentials. Upstream #2634/#2745: without consent the
+/// file/keyring sources stay closed and refreshed tokens are never rotated
+/// into Claude Code's storage; Auto then falls back to labeled
+/// reduced-fidelity CLI usage.
+pub(crate) fn claude_code_consent() -> bool {
+    crate::settings::Settings::load().claude_allow_reading_claude_code_credentials
+}
+
+/// Return the identity of the credential that can authorize a Claude CLI
+/// resume. The OAuth module applies the same consent boundary as its fetcher.
+pub fn auto_resume_identity() -> Option<String> {
+    oauth::auto_resume_identity()
+}
 
 /// Claude provider implementation
 pub struct ClaudeProvider {
@@ -43,6 +140,7 @@ impl ClaudeProvider {
                 is_primary: true,
                 dashboard_url: Some("https://claude.ai/settings/usage"),
                 status_page_url: Some("https://status.claude.com/"),
+                tertiary_label_key: None,
             },
             web_fetcher: ClaudeWebApiFetcher::new(),
             oauth_fetcher: ClaudeOAuthFetcher::new(),
@@ -56,6 +154,26 @@ impl Default for ClaudeProvider {
         Self::new()
     }
 }
+
+fn claude_plan_label(tier: &str) -> String {
+    let normalized = tier.to_lowercase();
+    if normalized.contains("claude_max_5x") || normalized.contains("claude_max_5") {
+        "Claude Max 5x".to_string()
+    } else if normalized.contains("claude_max_20x") || normalized.contains("claude_max_20") {
+        "Claude Max 20x".to_string()
+    } else {
+        match normalized.as_str() {
+            "free" => "Claude Free".to_string(),
+            "pro" | "claude_pro" => "Claude Pro".to_string(),
+            "max" => "Claude Max".to_string(),
+            "team" => "Claude Team".to_string(),
+            "enterprise" => "Claude Enterprise".to_string(),
+            _ => format!("Claude ({})", tier),
+        }
+    }
+}
+
+const CLAUDE_PROBE_SESSION_ID_FILE: &str = ".codexbar-session-id";
 
 fn claude_usage_probe_dir() -> Result<std::path::PathBuf, ProviderError> {
     let base = dirs::data_local_dir()
@@ -71,6 +189,62 @@ fn claude_usage_probe_dir() -> Result<std::path::PathBuf, ProviderError> {
         ))
     })?;
     Ok(dir)
+}
+
+/// Persist and reuse one probe session id so repeated `/usage` PTY launches do
+/// not register a fresh empty Claude account session each refresh (upstream #2263).
+fn load_or_create_probe_session_id(probe_dir: &std::path::Path) -> String {
+    let path = probe_dir.join(CLAUDE_PROBE_SESSION_ID_FILE);
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        let trimmed = raw.trim();
+        if uuid::Uuid::parse_str(trimmed).is_ok() {
+            return trimmed.to_ascii_lowercase();
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string().to_ascii_lowercase();
+    if let Err(err) = std::fs::write(&path, &id) {
+        tracing::debug!(error = %err, "failed to persist Claude probe session id");
+    }
+    id
+}
+
+/// Claude treats `--session-id` as create-only when a local transcript JSONL
+/// already exists for that id. Clear probe-dir jsonl leftovers before reuse.
+fn cleanup_probe_session_jsonl(probe_dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(probe_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            // Best-effort cleanup: a locked or missing probe file just stays.
+            let _removed = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Arguments shared by every Claude CLI `/usage` probe.
+///
+/// The remote-control startup hook can otherwise change the interactive
+/// session before the usage command is collected. Keep this override in one
+/// helper so future CLI probe paths cannot silently omit it.
+fn claude_usage_settings_args() -> [String; 2] {
+    [
+        "--settings".to_string(),
+        r#"{"remoteControlAtStartup":false}"#.to_string(),
+    ]
+}
+
+fn claude_probe_launch_args(session_id: &str) -> Vec<String> {
+    let mut args = vec![
+        "--setting-sources".to_string(),
+        "user".to_string(),
+        "--allowed-tools".to_string(),
+        String::new(),
+    ];
+    args.extend(claude_usage_settings_args());
+    args.extend(["--session-id".to_string(), session_id.to_string()]);
+    args
 }
 
 struct ClaudePtyProbeOptions {
@@ -124,7 +298,7 @@ async fn run_claude_trust_preflight(
 }
 
 fn resolve_claude_cli_path() -> Result<std::path::PathBuf, ProviderError> {
-    which_claude().ok_or_else(|| {
+    locate_claude_binary().ok_or_else(|| {
         ProviderError::NotInstalled(
             "Claude CLI not found. Install from https://docs.claude.ai/claude-code".to_string(),
         )
@@ -163,7 +337,7 @@ fn claude_cli_auth_error(lowered: &str) -> Option<ProviderError> {
         return Some(ProviderError::AuthRequired);
     }
     if lowered.contains("token expired") || lowered.contains("token_expired") {
-        return Some(ProviderError::OAuth(
+        return Some(ProviderError::OAuthExpired(
             "Token expired. Run `claude login` to refresh.".to_string(),
         ));
     }
@@ -206,14 +380,28 @@ fn claude_cli_environment_error(lowered: &str) -> Option<ProviderError> {
     None
 }
 
+/// Environment overrides for passive Claude CLI PTY probes.
+fn claude_passive_probe_env(
+    mut base: std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    // Passive status/usage probes must not mutate or update the user's Claude CLI installation.
+    base.insert("NO_COLOR".to_string(), "1".to_string());
+    base.insert("DISABLE_AUTOUPDATER".to_string(), "1".to_string());
+    base
+}
+
 async fn run_claude_pty_probe(
     claude_path: std::path::PathBuf,
     working_directory: std::path::PathBuf,
     probe: ClaudePtyProbeOptions,
 ) -> Result<String, ProviderError> {
     tokio::task::spawn_blocking(move || {
-        let mut env = TtyCommandRunner::enriched_environment();
-        env.insert("NO_COLOR".to_string(), "1".to_string());
+        // Keep ownership in the worker: cancelling the async refresh does not
+        // stop spawn_blocking or its CLI process from rotating credentials.
+        let _account_operation = accounts::CREDENTIAL_OPERATION.blocking_lock();
+        cleanup_probe_session_jsonl(&working_directory);
+        let session_id = load_or_create_probe_session_id(&working_directory);
+        let env = claude_passive_probe_env(TtyCommandRunner::enriched_environment());
 
         let mut options = TtyCommandOptions::new()
             .with_timeout(probe.timeout_secs)
@@ -221,7 +409,7 @@ async fn run_claude_pty_probe(
             .with_script_char_delay(probe.script_char_delay_secs)
             .with_script_line_delay(probe.script_line_delay_secs)
             .with_working_directory(working_directory)
-            .with_extra_args(vec!["--setting-sources".to_string(), "user".to_string()]);
+            .with_extra_args(claude_probe_launch_args(&session_id));
         if let Some(idle) = probe.idle_timeout_secs {
             options = options.with_idle_timeout(idle);
         }
@@ -242,14 +430,58 @@ async fn run_claude_pty_probe(
     })
 }
 
+fn last_good_failure_policy_for_error(error: &str) -> LastGoodFailurePolicy {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("credentials not found")
+        || (lower.contains("run") && lower.contains("claude") && lower.contains("authenticate"))
+        || (lower.contains("not installed") && lower.contains("claude"))
+        || (lower.contains("subscription") && lower.contains("unavailable"))
+    {
+        return LastGoodFailurePolicy::Replace;
+    }
+    if lower.contains(&CLOUDFLARE_CHALLENGE_MESSAGE.to_ascii_lowercase()) {
+        return LastGoodFailurePolicy::PreserveOnceThenSurface;
+    }
+    if lower.contains("parse error")
+        || lower.contains("empty output")
+        || lower.contains("missing current session")
+        || lower.contains("treated /usage as a normal prompt")
+        || lower.contains("local activity stats")
+        || lower.contains("could not parse")
+        || error.eq_ignore_ascii_case("timeout")
+        || lower.contains("timed out")
+    {
+        return LastGoodFailurePolicy::Preserve;
+    }
+    if lower.contains("unauthorized")
+        || lower.contains("authentication required")
+        || lower.contains("auth required")
+    {
+        return LastGoodFailurePolicy::PreserveOnce;
+    }
+    LastGoodFailurePolicy::Replace
+}
+
 #[async_trait]
 impl Provider for ClaudeProvider {
+    fn manual_cookie_precedes_token_account(&self) -> bool {
+        true
+    }
+
+    fn automatic_metric_prioritizes_exhausted_window(&self) -> bool {
+        false
+    }
+
     fn id(&self) -> ProviderId {
         ProviderId::Claude
     }
 
     fn metadata(&self) -> &ProviderMetadata {
         &self.metadata
+    }
+
+    fn retains_last_good_on_transport_failure(&self) -> bool {
+        true
     }
 
     async fn fetch_usage(&self, ctx: &FetchContext) -> Result<ProviderFetchResult, ProviderError> {
@@ -292,8 +524,30 @@ impl Provider for ClaudeProvider {
         true
     }
 
+    fn owns_browser_cookie_resolution(&self) -> bool {
+        true
+    }
+
+    fn last_good_failure_policy(&self, error: &str) -> LastGoodFailurePolicy {
+        last_good_failure_policy_for_error(error)
+    }
+
     fn detect_version(&self) -> Option<String> {
         detect_claude_version()
+    }
+    /// Claude's CLI-presence probe (`resolve_claude_cli_path`) raises
+    /// `NotInstalled` when the `claude` binary itself is missing — an
+    /// installation gap, not a credential problem — so it surfaces as an
+    /// offline local runtime (matching the pre-backend classifier's
+    /// treatment of CLI-presence failures). Message-scoped so any future
+    /// credential-flavored `NotInstalled` keeps the default mapping.
+    fn error_state_kind(&self, error: &ProviderError) -> crate::core::ProviderStateKind {
+        match error {
+            ProviderError::NotInstalled(msg) if msg.contains("CLI not found") => {
+                crate::core::ProviderStateKind::LocalRuntimeOffline
+            }
+            _ => error.state_kind(),
+        }
     }
 }
 
@@ -304,26 +558,54 @@ impl ClaudeProvider {
     ) -> Result<ProviderFetchResult, ProviderError> {
         let mut failures = Vec::new();
 
-        if let Some(result) = self.try_auto_admin_api(ctx, &mut failures).await {
+        if let Some(result) = self.try_auto_admin_api(ctx, &mut failures).await? {
             return Ok(result);
         }
 
         if let Some(result) =
-            record_auto_source(&mut failures, "Web", self.fetch_via_web(ctx).await)
+            record_auto_source(&mut failures, "Web", self.fetch_via_web(ctx).await)?
         {
             return Ok(result);
         }
 
-        if let Some(result) =
-            record_auto_source(&mut failures, "OAuth", self.fetch_via_oauth(ctx).await)
-        {
+        // Upstream 0.50.1 #2516: track whether OAuth failed with a revocation.
+        let oauth_result = self.fetch_via_oauth(ctx).await;
+        let oauth_revoked = oauth_result
+            .as_ref()
+            .err()
+            .is_some_and(is_oauth_revoked_error);
+        if let Some(result) = record_auto_source(&mut failures, "OAuth", oauth_result)? {
             return Ok(result);
         }
 
-        if let Some(result) =
-            record_auto_source(&mut failures, "CLI", self.fetch_via_cli(ctx).await)
+        // When OAuth was revoked (not just expired), reuse a cached CLI result
+        // if still within the 15-minute TTL to avoid re-probing the CLI.
+        if oauth_revoked && let Some(cached) = cached_cli_result() {
+            tracing::debug!("Claude OAuth revoked; returning cached CLI result (15-min cache)");
+            return Ok(cached);
+        }
+
+        if let Some(mut result) =
+            record_auto_source(&mut failures, "CLI", self.fetch_via_cli(ctx).await)?
         {
+            // Without consent for reading Claude Code credentials, label the
+            // CLI fallback as reduced fidelity.
+            if !claude_code_consent() {
+                result.source_label = "cli (reduced fidelity)".to_string();
+            }
+            // Cache the CLI result when OAuth was revoked so subsequent polls
+            // within the TTL reuse it without re-probing.
+            if oauth_revoked {
+                cache_cli_result(result.clone());
+            }
             return Ok(result);
+        }
+
+        // Upstream 0.50.1 #2516: when all live sources fail, keep the
+        // last-known quota visible (stale) instead of blanking the UI.
+        if let Some(cached) = cached_cli_result() {
+            tracing::debug!("All Claude live sources failed; returning stale cached CLI result");
+            return Ok(cached);
         }
 
         Err(claude_auto_fetch_error(failures))
@@ -333,13 +615,11 @@ impl ClaudeProvider {
         &self,
         ctx: &FetchContext,
         failures: &mut Vec<(&'static str, ProviderError)>,
-    ) -> Option<ProviderFetchResult> {
-        self.admin_fetcher
-            .has_credentials(ctx)
-            .then_some(async { self.fetch_via_admin_api(ctx).await })?
-            .await
-            .map_err(|error| failures.push(("Admin API", error)))
-            .ok()
+    ) -> Result<Option<ProviderFetchResult>, ProviderError> {
+        if !self.admin_fetcher.has_credentials(ctx) {
+            return Ok(None);
+        }
+        record_auto_source(failures, "Admin API", self.fetch_via_admin_api(ctx).await)
     }
 
     async fn fetch_via_oauth(
@@ -397,7 +677,11 @@ impl ClaudeProvider {
             return Err(error);
         }
 
-        self.parse_cli_output(&combined)
+        let mut result = self.parse_cli_output(&combined)?;
+        if let Some(identity) = auto_resume_identity() {
+            result = result.with_account_identity(identity);
+        }
+        Ok(mark_live_claude_cli_result(result))
     }
 
     /// Parse Claude CLI /usage output
@@ -426,7 +710,6 @@ impl ClaudeProvider {
         // Parse session percent: "X% used" or "X% left"
         let mut session_percent: Option<f64> = None;
         let mut weekly_percent: Option<f64> = None;
-        let mut opus_percent: Option<f64> = None;
 
         // Look for "Current session" section
         if let Some(session_pct) = extract_percent_near_label(&clean, "current session") {
@@ -440,13 +723,6 @@ impl ClaudeProvider {
             weekly_percent = Some(weekly_pct);
         }
 
-        // Look for Opus/Sonnet specific
-        if let Some(opus_pct) = extract_percent_near_label(&clean, "opus") {
-            opus_percent = Some(opus_pct);
-        } else if let Some(sonnet_pct) = extract_percent_near_label(&clean, "sonnet") {
-            opus_percent = Some(sonnet_pct);
-        }
-
         // Fallback: collect all percentages in order
         if session_percent.is_none() {
             let all_percents = extract_all_percents(&clean);
@@ -456,14 +732,10 @@ impl ClaudeProvider {
             if all_percents.len() > 1 && weekly_percent.is_none() {
                 weekly_percent = Some(all_percents[1]);
             }
-            if all_percents.len() > 2 && opus_percent.is_none() {
-                opus_percent = Some(all_percents[2]);
-            }
         }
 
         if session_percent.is_none()
             && weekly_percent.is_none()
-            && opus_percent.is_none()
             && !is_exhausted_short_form(&clean_lower)
         {
             return Err(ProviderError::Parse(
@@ -485,6 +757,8 @@ impl ClaudeProvider {
             None
         };
         let session_reset = session_reset.or(short_form_reset);
+        let now = Utc::now();
+        let scoped_weekly_limits = extract_cli_scoped_weekly_limits(&clean, now);
 
         if session_percent.is_none() && is_exhausted_short_form(&clean_lower) {
             session_percent = Some(100.0);
@@ -495,7 +769,9 @@ impl ClaudeProvider {
         let primary = RateWindow::with_details(
             session_used,
             Some(300), // 5 hour session window
-            None,      // Could parse reset time
+            session_reset
+                .as_deref()
+                .and_then(|reset| parse_claude_reset_date(reset, now, Some(300))),
             session_reset,
         );
 
@@ -505,15 +781,16 @@ impl ClaudeProvider {
             let secondary = RateWindow::with_details(
                 weekly_used,
                 Some(10080), // weekly (7 * 24 * 60)
-                None,
+                weekly_reset
+                    .as_deref()
+                    .and_then(|reset| parse_claude_reset_date(reset, now, Some(10080))),
                 weekly_reset,
             );
             usage = usage.with_secondary(secondary);
         }
 
-        if let Some(opus_used) = opus_percent {
-            let model_specific = RateWindow::with_details(opus_used, Some(10080), None, None);
-            usage = usage.with_model_specific(model_specific);
+        for limit in scoped_weekly_limits {
+            usage.extra_rate_windows.push(limit);
         }
 
         if let Some(method) = login_method {
@@ -530,12 +807,31 @@ impl ClaudeProvider {
     }
 }
 
+fn has_real_claude_quota_window(usage: &UsageSnapshot) -> bool {
+    let is_real = |window: &RateWindow| !window.is_informational && window.used_percent.is_finite();
+    is_real(&usage.primary) || usage.secondary.as_ref().is_some_and(is_real)
+}
+
+fn mark_live_claude_cli_result(mut result: ProviderFetchResult) -> ProviderFetchResult {
+    if has_real_claude_quota_window(&result.usage) {
+        result.has_successful_claude_cli_quota = true;
+    }
+    result
+}
+
 fn record_auto_source(
     failures: &mut Vec<(&'static str, ProviderError)>,
     source: &'static str,
     result: Result<ProviderFetchResult, ProviderError>,
-) -> Option<ProviderFetchResult> {
-    result.map_err(|error| failures.push((source, error))).ok()
+) -> Result<Option<ProviderFetchResult>, ProviderError> {
+    match result {
+        Ok(result) => Ok(Some(result)),
+        Err(error) if error.is_transport_failure() => Err(error),
+        Err(error) => {
+            failures.push((source, error));
+            Ok(None)
+        }
+    }
 }
 
 fn claude_auto_fetch_error(failures: Vec<(&'static str, ProviderError)>) -> ProviderError {
@@ -566,8 +862,15 @@ fn should_fallback_from_claude_cli_error(error: &ProviderError) -> bool {
     }
 }
 
-/// Try to find the claude CLI binary
-fn which_claude() -> Option<std::path::PathBuf> {
+/// Locate the Claude CLI for shell integrations that need to reopen a session.
+pub fn locate_claude_binary() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("CLAUDE_BINARY")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        return Some(path);
+    }
+
     #[cfg(windows)]
     {
         let candidates = [
@@ -651,7 +954,7 @@ fn find_windows_claude_in_path() -> Option<std::path::PathBuf> {
 
 /// Detect the version of the claude CLI
 fn detect_claude_version() -> Option<String> {
-    let claude_path = which_claude()?;
+    let claude_path = locate_claude_binary()?;
 
     #[cfg(windows)]
     const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -665,16 +968,10 @@ fn detect_claude_version() -> Option<String> {
 
     if output.status.success() {
         let version_str = String::from_utf8_lossy(&output.stdout);
-        extract_version(&version_str)
+        super::extract_semver(&version_str)
     } else {
         None
     }
-}
-
-/// Extract version number from a string like "claude 1.2.3"
-fn extract_version(s: &str) -> Option<String> {
-    let re = regex_lite::Regex::new(r"(\d+(?:\.\d+)+)").ok()?;
-    re.find(s).map(|m| m.as_str().to_string())
 }
 
 /// Strip ANSI escape codes from text
@@ -766,32 +1063,6 @@ fn extract_percent_near_label(text: &str, label: &str) -> Option<f64> {
     None
 }
 
-/// Parse a line containing "X% used", "X% left", "X% remaining", etc.
-/// Returns the percentage as used (converts "left" to used)
-fn parse_percent_line(line: &str) -> Option<f64> {
-    // Match patterns like "45% used", "55% left", "55% remaining", or "12.5% available".
-    let re =
-        Regex::new(r"(\d{1,3}(?:\.\d+)?)\s*%\s*(used|spent|consumed|left|remaining|available)")
-            .ok()?;
-
-    if let Some(caps) = re.captures(&line.to_lowercase())
-        && let Some(value_match) = caps.get(1)
-        && let Some(kind_match) = caps.get(2)
-    {
-        let value: f64 = value_match.as_str().parse().ok()?;
-        let kind = kind_match.as_str();
-
-        // Convert to "used" percentage
-        if matches!(kind, "left" | "remaining" | "available") {
-            Some((100.0 - value).max(0.0))
-        } else {
-            Some(value.min(100.0))
-        }
-    } else {
-        None
-    }
-}
-
 /// Extract all percentages from text in order
 fn extract_all_percents(text: &str) -> Vec<f64> {
     let re = match Regex::new(
@@ -819,18 +1090,6 @@ fn extract_all_percents(text: &str) -> Vec<f64> {
     }
 
     results
-}
-
-fn normalized_for_label_search(text: &str) -> String {
-    text.chars()
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(|c| c.to_lowercase())
-        .collect()
-}
-
-fn starts_next_usage_section(line: &str, current_label: &str) -> bool {
-    let normalized = normalized_for_label_search(line);
-    normalized.starts_with("current") && !normalized.contains(current_label)
 }
 
 fn is_exhausted_short_form(clean_lower: &str) -> bool {
@@ -930,7 +1189,62 @@ fn clean_plan_name(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{DateTime, Utc};
+    use std::collections::HashMap;
+
     use super::*;
+
+    #[test]
+    fn passive_probe_env_disables_autoupdater_and_color() {
+        let env = claude_passive_probe_env(HashMap::new());
+        assert_eq!(
+            env.get("DISABLE_AUTOUPDATER").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(env.get("NO_COLOR").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn probe_session_id_is_reused_from_probe_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = load_or_create_probe_session_id(dir.path());
+        let second = load_or_create_probe_session_id(dir.path());
+        assert_eq!(first, second);
+        assert!(uuid::Uuid::parse_str(&first).is_ok());
+        let args = claude_probe_launch_args(&first);
+        // Positional structure only: the settings pair is pinned once by
+        // `claude_usage_settings_args` being the sole composer.
+        assert_eq!(
+            args[..4],
+            ["--setting-sources", "user", "--allowed-tools", ""]
+        );
+        assert_eq!(args[4], claude_usage_settings_args()[0]);
+        assert_eq!(args[5], claude_usage_settings_args()[1]);
+        assert_eq!(args[6], "--session-id");
+        assert_eq!(args[7], first);
+    }
+
+    #[test]
+    fn usage_probe_settings_disable_remote_control_startup() {
+        assert_eq!(
+            claude_usage_settings_args(),
+            [
+                "--settings".to_string(),
+                r#"{"remoteControlAtStartup":false}"#.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn probe_session_jsonl_cleanup_removes_transcript_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl = dir.path().join("session.jsonl");
+        std::fs::write(&jsonl, "{}").unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "x").unwrap();
+        cleanup_probe_session_jsonl(dir.path());
+        assert!(!jsonl.exists());
+        assert!(dir.path().join("keep.txt").exists());
+    }
 
     #[test]
     fn parses_current_cli_usage_screen() {
@@ -1037,9 +1351,110 @@ Status   Config   Usage
 
         let sonnet = result
             .usage
-            .model_specific
+            .extra_rate_windows
+            .iter()
+            .find(|window| window.id == "claude-weekly-scoped-sonnet")
             .expect("sonnet usage should be present");
-        assert_eq!(sonnet.used_percent, 1.0);
+        assert_eq!(sonnet.window.used_percent, 1.0);
+    }
+
+    #[test]
+    fn parses_all_cli_model_scoped_weekly_limits() {
+        let provider = ClaudeProvider::new();
+        let output = r#"
+Current session
+10% used
+Resets 12pm (America/Bogota)
+
+Current week (all models)
+20% used
+Resets Apr 3, 2pm (America/Bogota)
+
+Current week (Sonnet only)
+30% used
+Resets Apr 4, 2pm (America/Bogota)
+
+Current week (Opus only)
+40% used
+Resets Apr 5, 2pm (America/Bogota)
+"#;
+
+        let result = provider.parse_cli_output(output).expect("should parse");
+
+        assert_eq!(result.usage.extra_rate_windows.len(), 2);
+        assert_eq!(
+            result.usage.extra_rate_windows[0].id,
+            "claude-weekly-scoped-sonnet"
+        );
+        assert_eq!(result.usage.extra_rate_windows[0].title, "Sonnet only");
+        assert_eq!(result.usage.extra_rate_windows[0].window.used_percent, 30.0);
+        assert_eq!(
+            result.usage.extra_rate_windows[1].id,
+            "claude-weekly-scoped-opus"
+        );
+        assert!(result.usage.model_specific.is_none());
+    }
+
+    #[test]
+    fn scoped_weekly_parser_handles_non_ascii_labels_and_reset_prefixes() {
+        let now = "2026-04-02T18:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let limits = extract_cli_scoped_weekly_limits(
+            "Current week (A€€)\n10% used\nİResets Apr 3 at 2pm (America/Bogota)",
+            now,
+        );
+
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].title, "A€€");
+        assert_eq!(
+            limits[0].window.resets_at,
+            Some("2026-04-03T19:00:00Z".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn resolves_cli_reset_occurrences_in_the_reported_timezone() {
+        let now = "2026-04-02T18:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        assert_eq!(
+            parse_claude_reset_date("Resets Apr 3, 2027, 2pm (America/Bogota)", now, None),
+            Some("2027-04-03T19:00:00Z".parse().unwrap())
+        );
+        assert_eq!(
+            parse_claude_reset_date("Resets Apr 3, 2pm (America/Bogota)", now, None),
+            Some("2026-04-03T19:00:00Z".parse().unwrap())
+        );
+        assert_eq!(
+            parse_claude_reset_date("Resets 12pm (America/Bogota)", now, None),
+            Some("2026-04-03T17:00:00Z".parse().unwrap())
+        );
+        assert_eq!(
+            parse_claude_reset_date("ResetsApr3at2pm(America/Bogota)", now, None),
+            Some("2026-04-03T19:00:00Z".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn timezone_less_resets_use_the_supplied_system_zone() {
+        let now = "2026-03-07T18:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        assert_eq!(
+            parse_claude_reset_date_in_system_zone(
+                "Resets Mar 8 at 3:30am",
+                now,
+                None,
+                "America/New_York".parse().unwrap(),
+            ),
+            Some("2026-03-08T07:30:00Z".parse().unwrap())
+        );
+        assert_eq!(
+            parse_claude_reset_date_in_system_zone(
+                "Resets Mar 8 at 3:30am (America/Los_Angeles)",
+                now,
+                None,
+                "America/New_York".parse().unwrap(),
+            ),
+            Some("2026-03-08T10:30:00Z".parse().unwrap())
+        );
     }
 
     #[test]
@@ -1074,14 +1489,15 @@ ResetsFeb12at1:29pm(Asia/Calcutta)
                 .used_percent,
             4.0
         );
-        assert_eq!(
-            result
-                .usage
-                .model_specific
-                .expect("sonnet usage should be present")
-                .used_percent,
-            1.0
-        );
+        let sonnet = result
+            .usage
+            .extra_rate_windows
+            .iter()
+            .find(|window| window.id == "claude-weekly-scoped-sonnet")
+            .expect("sonnet usage should be present");
+        assert_eq!(result.usage.extra_rate_windows.len(), 1);
+        assert_eq!(sonnet.title, "Sonnet only");
+        assert_eq!(sonnet.window.used_percent, 1.0);
     }
 
     #[test]
@@ -1155,6 +1571,21 @@ Resets Dec 24 at 3:59pm (Europe/Paris)
             err.to_string(),
             "Claude usage failed from all configured sources. OAuth: OAuth error: token expired; Web: No cookies available for web API; CLI: Parse error: Empty output from Claude CLI"
         );
+    }
+
+    #[test]
+    fn transient_transport_failure_stops_auto_fallback_and_preserves_last_good() {
+        let provider = ClaudeProvider::new();
+        assert!(provider.retains_last_good_on_transport_failure());
+        assert_eq!(
+            provider.last_good_failure_policy_for_error(&ProviderError::Timeout),
+            LastGoodFailurePolicy::Preserve
+        );
+
+        let mut failures = Vec::new();
+        let result = record_auto_source(&mut failures, "Web", Err(ProviderError::Timeout));
+        assert!(matches!(result, Err(ProviderError::Timeout)));
+        assert!(failures.is_empty());
     }
 
     #[test]
@@ -1236,5 +1667,122 @@ Active days: 2/10              Longest streak: 1 day
             .expect_err("should reject ANSI-spaced local activity stats");
 
         assert!(matches!(err, ProviderError::Other(_)));
+    }
+
+    // ── Upstream 0.50.1 #2516: revoked vs missing OAuth ────────────────────────
+
+    #[test]
+    fn oauth_revoked_error_is_detected() {
+        assert!(is_oauth_revoked_error(&ProviderError::OAuthRevoked(
+            "revoked".to_string()
+        )));
+        assert!(!is_oauth_revoked_error(&ProviderError::OAuth(
+            "expired".to_string()
+        )));
+        assert!(!is_oauth_revoked_error(&ProviderError::AuthRequired));
+    }
+
+    #[test]
+    fn cli_result_cache_round_trips() {
+        let mut result = ProviderFetchResult::new(UsageSnapshot::new(RateWindow::new(42.0)), "cli");
+        result.has_successful_claude_cli_quota = true;
+        cache_cli_result(result.clone());
+        let cached = cached_cli_result().expect("cached result within TTL");
+        assert!((cached.usage.primary.used_percent - 42.0).abs() < 0.01);
+        assert_eq!(cached.source_label, "cli");
+        assert!(!cached.has_successful_claude_cli_quota);
+    }
+
+    #[test]
+    fn cli_quota_without_credential_identity_cannot_prove_account_action() {
+        let provider = ClaudeProvider::new();
+        let result = provider
+            .parse_cli_output("Current session\n25% used\nCurrent week (all models)\n40% used")
+            .expect("CLI quota should parse");
+        let result = mark_live_claude_cli_result(result);
+
+        assert!(result.usage.account_email.is_none());
+        assert!(result.has_successful_claude_cli_quota);
+    }
+
+    #[test]
+    fn non_cli_fetch_result_does_not_prove_account_action() {
+        let result = ProviderFetchResult::new(UsageSnapshot::new(RateWindow::new(42.0)), "oauth");
+
+        assert!(!result.has_successful_claude_cli_quota);
+    }
+    #[test]
+    fn cli_presence_maps_to_local_runtime_offline() {
+        assert_eq!(
+            ClaudeProvider::new().error_state_kind(&ProviderError::NotInstalled(
+                "Claude CLI not found. Install from https://docs.claude.ai/claude-code".to_string(),
+            )),
+            crate::core::ProviderStateKind::LocalRuntimeOffline
+        );
+        // Other error kinds keep their default classification.
+        assert_eq!(
+            ClaudeProvider::new().error_state_kind(&ProviderError::AuthRequired),
+            crate::core::ProviderStateKind::NeedsAuthentication
+        );
+    }
+
+    #[test]
+    fn oauth_rate_limit_is_not_sign_in_required() {
+        let error = ProviderError::OAuthTransient(
+            "OAuth error: Claude OAuth usage endpoint is rate limited. Retrying in about 1s; credentials were preserved."
+                .to_string(),
+        );
+        assert_eq!(
+            ClaudeProvider::new().error_state_kind(&error),
+            crate::core::ProviderStateKind::Unknown
+        );
+        assert_eq!(
+            ClaudeProvider::new().last_good_failure_policy_for_error(&error),
+            LastGoodFailurePolicy::Preserve
+        );
+    }
+
+    #[test]
+    fn oauth_refresh_cooldown_is_not_sign_in_required() {
+        let error = ProviderError::OAuthTransient(
+            "Claude OAuth token expired and token refresh is cooling down after a failed attempt. Please retry shortly, or run `claude login`."
+                .to_string(),
+        );
+        assert_eq!(
+            ClaudeProvider::new().error_state_kind(&error),
+            crate::core::ProviderStateKind::Unknown
+        );
+        assert_eq!(
+            ClaudeProvider::new().last_good_failure_policy_for_error(&error),
+            LastGoodFailurePolicy::Preserve
+        );
+    }
+
+    #[test]
+    fn missing_oauth_credentials_still_require_sign_in() {
+        let error = ProviderError::OAuth(
+            "Claude OAuth credentials not found. Run `claude` to authenticate.".to_string(),
+        );
+        assert_eq!(
+            ClaudeProvider::new().error_state_kind(&error),
+            crate::core::ProviderStateKind::NeedsAuthentication
+        );
+        assert_eq!(
+            last_good_failure_policy_for_error(&error.to_string()),
+            LastGoodFailurePolicy::Replace
+        );
+    }
+
+    #[test]
+    fn untyped_oauth_rate_limit_text_is_not_transient() {
+        let error = ProviderError::OAuth("OAuth API returned rate limited".to_string());
+        assert_eq!(
+            ClaudeProvider::new().error_state_kind(&error),
+            crate::core::ProviderStateKind::NeedsAuthentication
+        );
+        assert_eq!(
+            ClaudeProvider::new().last_good_failure_policy_for_error(&error),
+            LastGoodFailurePolicy::Replace
+        );
     }
 }

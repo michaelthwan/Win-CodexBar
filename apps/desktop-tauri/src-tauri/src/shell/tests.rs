@@ -3,15 +3,18 @@ use super::geometry::{
     MonitorPlacement, inferred_tray_anchor_rect, inferred_tray_panel_position_for_monitor,
     surface_panel_size, tray_anchor_rect,
 };
-use super::position::visible_surface_position_for_mode_with_fallbacks;
+use super::position::{
+    remembered_panel_size, remembered_surface_position_with_monitors,
+    visible_surface_position_for_mode_with_fallbacks,
+};
 use super::transition::{
     SurfaceSnapshot, TransitionResolution, hidden_surface_snapshot,
     monitor_for_preserved_visible_position, reclamp_preserved_visible_position,
     recovery_snapshot_for_failed_transition, resolve_transition_position,
     resolve_transition_request, restore_recovery_surface, restore_surface_snapshot,
-    should_hide_tray_panel_on_toggle, should_synthesize_default_position,
+    should_force_tray_panel_reveal, should_synthesize_default_position,
 };
-use super::window::{hide_to_tray_state, prepare_hide_to_tray_if_current};
+use super::window::{logical_size_from_geometry, prepare_hide_to_tray_if_current};
 
 use crate::state::AppState;
 use crate::surface::{SurfaceMode, SurfaceTransition};
@@ -25,7 +28,7 @@ fn hide_to_tray_resets_hidden_target_to_summary() {
         tab: "about".into(),
     };
 
-    hide_to_tray_state(&mut state);
+    let _ = super::window::prepare_hide_to_tray_if_current(&mut state, |_| true);
 
     assert_eq!(state.surface_machine.current(), SurfaceMode::Hidden);
     assert_eq!(state.current_target, SurfaceTarget::Summary);
@@ -57,17 +60,86 @@ fn conditional_hide_to_tray_leaves_non_matching_surface_alone() {
     assert_eq!(state.current_target, SurfaceTarget::Dashboard);
 }
 
+// The old `tray_toggle_hides_only_when_panel_window_is_visible` test (which
+// exercised `should_hide_tray_panel_on_toggle`) was removed here along with
+// its subject function: the tray-icon left-click toggle for the shared
+// `main` window's TrayPanel state no longer exists — the flyout is its own
+// dedicated window now (see `shell::flyout_window::toggle_with_blur_consume`
+// and its own test module in flyout_window.rs).
+
 #[test]
-fn tray_toggle_hides_only_when_panel_window_is_visible() {
-    assert!(should_hide_tray_panel_on_toggle(
+fn tray_reveal_fallback_only_for_hidden_tray_panel() {
+    assert!(should_force_tray_panel_reveal(
         SurfaceMode::TrayPanel,
-        true
+        false,
+        Some((328, 776)),
     ));
-    assert!(!should_hide_tray_panel_on_toggle(
+    assert!(!should_force_tray_panel_reveal(
         SurfaceMode::TrayPanel,
-        false
+        true,
+        Some((328, 776)),
     ));
-    assert!(!should_hide_tray_panel_on_toggle(SurfaceMode::Hidden, true));
+    assert!(!should_force_tray_panel_reveal(
+        SurfaceMode::Hidden,
+        false,
+        Some((16, 16)),
+    ));
+}
+
+#[test]
+fn tray_reveal_fallback_recovers_tiny_shell_window() {
+    assert!(should_force_tray_panel_reveal(
+        SurfaceMode::TrayPanel,
+        true,
+        Some((16, 16)),
+    ));
+}
+
+#[test]
+fn tray_show_grace_is_based_on_actual_show_time() {
+    let mut state = AppState::new();
+    let shown_at = std::time::Instant::now();
+
+    state.mark_tray_panel_shown(shown_at);
+
+    assert!(state.was_tray_panel_recently_shown(
+        shown_at + std::time::Duration::from_millis(20),
+        std::time::Duration::from_millis(500),
+    ));
+    assert!(!state.was_tray_panel_recently_shown(
+        shown_at + std::time::Duration::from_millis(500),
+        std::time::Duration::from_millis(500),
+    ));
+}
+
+#[test]
+fn immediate_tray_click_consumes_blur_dismissal() {
+    let mut state = AppState::new();
+    let dismissed_at = std::time::Instant::now();
+
+    state.mark_blur_dismissed(dismissed_at);
+
+    assert!(state.take_recent_blur_dismissal(
+        dismissed_at + std::time::Duration::from_millis(20),
+        std::time::Duration::from_millis(250),
+    ));
+    assert!(!state.take_recent_blur_dismissal(
+        dismissed_at + std::time::Duration::from_millis(20),
+        std::time::Duration::from_millis(250),
+    ));
+}
+
+#[test]
+fn later_tray_click_does_not_consume_expired_blur_dismissal() {
+    let mut state = AppState::new();
+    let dismissed_at = std::time::Instant::now();
+
+    state.mark_blur_dismissed(dismissed_at);
+
+    assert!(!state.take_recent_blur_dismissal(
+        dismissed_at + std::time::Duration::from_millis(251),
+        std::time::Duration::from_millis(250),
+    ));
 }
 
 #[test]
@@ -356,6 +428,70 @@ fn visible_surface_position_falls_back_to_current_monitor_without_available_moni
 }
 
 #[test]
+fn visible_surface_position_without_anchor_prefers_primary_over_offview_current_monitor() {
+    // Regression: the hidden main window is parked on a secondary monitor at
+    // negative coordinates (real machine: DISPLAY5 at x -2048..0). With no tray
+    // anchor (right-click menu / proof launch), the surface must open on the
+    // primary (tray/taskbar) monitor — not the off-view secondary, which is the
+    // "Pop Out Dashboard does nothing" bug.
+    let offview_current = MonitorPlacement {
+        bounds: Rect {
+            x: -2048,
+            y: 0,
+            width: 2048,
+            height: 1152,
+        },
+        work_area: Rect {
+            x: -2048,
+            y: 0,
+            width: 2048,
+            height: 1104,
+        },
+        scale_factor: 1.0,
+    };
+    let primary = MonitorPlacement {
+        bounds: Rect {
+            x: 0,
+            y: 0,
+            width: 3413,
+            height: 1440,
+        },
+        work_area: Rect {
+            x: 0,
+            y: 0,
+            width: 3413,
+            height: 1392,
+        },
+        scale_factor: 1.0,
+    };
+
+    let position = visible_surface_position_for_mode_with_fallbacks(
+        SurfaceMode::PopOut,
+        Some(&[offview_current, primary]),
+        None,                             // no tray anchor
+        Some(offview_current),            // hidden main window parked off-view
+        Some(((-1288, 8), (1024, 1088))), // last bounds also off-view
+        Some(primary),
+    )
+    .expect("should resolve a position");
+
+    // Must land on the primary monitor (x >= 0), never the negative secondary.
+    assert!(
+        position.0 >= 0,
+        "expected on primary monitor, got {position:?}"
+    );
+    assert_eq!(
+        position,
+        window_positioner::calculate_popout_position(
+            Some(&inferred_tray_anchor_rect(&primary)),
+            &primary.work_area,
+            &surface_panel_size(SurfaceMode::PopOut),
+            primary.scale_factor,
+        )
+    );
+}
+
+#[test]
 fn visible_surface_position_anchor_lookup_uses_monitor_bounds() {
     let anchor_monitor = MonitorPlacement {
         bounds: Rect {
@@ -524,6 +660,54 @@ fn inferred_tray_anchor_supports_top_taskbar_layouts() {
 }
 
 #[test]
+fn inferred_tray_anchor_supports_left_taskbar_layouts() {
+    let monitor = MonitorPlacement {
+        bounds: Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        },
+        work_area: Rect {
+            x: 40,
+            y: 0,
+            width: 1880,
+            height: 1080,
+        },
+        scale_factor: 1.0,
+    };
+
+    let anchor = inferred_tray_anchor_rect(&monitor);
+
+    assert_eq!(anchor.x, 8);
+    assert_eq!(anchor.y, 1048);
+}
+
+#[test]
+fn inferred_tray_anchor_supports_right_taskbar_layouts() {
+    let monitor = MonitorPlacement {
+        bounds: Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        },
+        work_area: Rect {
+            x: 0,
+            y: 0,
+            width: 1880,
+            height: 1080,
+        },
+        scale_factor: 1.0,
+    };
+
+    let anchor = inferred_tray_anchor_rect(&monitor);
+
+    assert_eq!(anchor.x, 1888);
+    assert_eq!(anchor.y, 1048);
+}
+
+#[test]
 fn inferred_tray_panel_position_uses_tray_style_corner_fallback() {
     let monitor = MonitorPlacement {
         bounds: Rect {
@@ -552,6 +736,7 @@ fn inferred_tray_panel_position_uses_tray_style_corner_fallback() {
                 width: 24,
                 height: 24,
             },
+            &monitor.bounds,
             &monitor.work_area,
             &super::geometry::tray_panel_size(),
             monitor.scale_factor,
@@ -658,7 +843,7 @@ fn visible_recovery_propagates_visibility_errors() {
         target: SurfaceTarget::Summary,
     };
 
-    let err = restore_recovery_surface(&recovery, |_| Err("show failed".into()))
+    let err = restore_recovery_surface(&recovery, |_, _| Err("show failed".into()))
         .expect_err("visible recovery should fail when properties are not restored");
 
     assert_eq!(err, "show failed");
@@ -672,7 +857,8 @@ fn hidden_recovery_reapplies_hidden_properties() {
     };
 
     let mut applied_hidden = false;
-    let restored = restore_recovery_surface(&recovery, |properties| {
+    let restored = restore_recovery_surface(&recovery, |mode, properties| {
+        assert_eq!(mode, SurfaceMode::Hidden);
         applied_hidden = !properties.visible;
         Ok(())
     });
@@ -690,4 +876,82 @@ fn hidden_surface_snapshot_matches_non_visible_shell_state() {
             target: SurfaceTarget::Summary,
         }
     );
+}
+
+#[test]
+fn remembered_popout_position_clamps_using_stored_size() {
+    let monitor = MonitorPlacement {
+        bounds: Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 800,
+        },
+        work_area: Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 800,
+        },
+        scale_factor: 1.0,
+    };
+    let stored = crate::geometry_store::StoredGeometry {
+        x: 900,
+        y: 700,
+        width: Some(600),
+        height: Some(500),
+    };
+
+    let position =
+        remembered_surface_position_with_monitors(SurfaceMode::PopOut, stored, &[monitor], None);
+
+    assert_eq!(position, Some((392, 292)));
+}
+
+#[test]
+fn remembered_panel_size_uses_stored_popout_size() {
+    let stored = crate::geometry_store::StoredGeometry {
+        x: 0,
+        y: 0,
+        width: Some(640),
+        height: Some(720),
+    };
+
+    let size = remembered_panel_size(SurfaceMode::PopOut, stored);
+
+    assert_eq!(size.width, 640);
+    assert_eq!(size.height, 720);
+}
+
+#[test]
+fn popout_layout_size_uses_remembered_logical_geometry() {
+    let props = SurfaceMode::PopOut.window_properties();
+    let stored = crate::geometry_store::StoredGeometry {
+        x: 0,
+        y: 0,
+        width: Some(640),
+        height: Some(720),
+    };
+
+    let size = logical_size_from_geometry(SurfaceMode::PopOut, &props, Some(stored));
+
+    assert_eq!(size, (640.0, 720.0));
+}
+
+#[test]
+fn tray_panel_layout_uses_remembered_size() {
+    // The "Pop Out Dashboard" flyout now honors the user's remembered SIZE.
+    // (Position is still re-anchored above the tray via default_surface_position,
+    // which ignores the stored x/y — only the size is taken from geometry.)
+    let props = SurfaceMode::TrayPanel.window_properties();
+    let stored = crate::geometry_store::StoredGeometry {
+        x: 0,
+        y: 0,
+        width: Some(640),
+        height: Some(720),
+    };
+
+    let size = logical_size_from_geometry(SurfaceMode::TrayPanel, &props, Some(stored));
+
+    assert_eq!(size, (640.0, 720.0));
 }

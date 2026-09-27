@@ -159,7 +159,10 @@ impl InfiniClient {
 }
 
 #[cfg(test)]
-#[allow(clippy::items_after_test_module)]
+#[allow(
+    clippy::items_after_test_module,
+    reason = "test module is defined before helper functions that support it"
+)]
 mod tests {
     use super::*;
 
@@ -301,6 +304,7 @@ impl InfiniProvider {
                 is_primary: false,
                 dashboard_url: Some("https://cloud.infini-ai.com"),
                 status_page_url: None,
+                tertiary_label_key: None,
             },
             client: InfiniClient::new(api_key),
         }

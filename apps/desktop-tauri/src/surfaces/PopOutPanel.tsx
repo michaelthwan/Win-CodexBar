@@ -1,19 +1,19 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { getCurrentWindow, LogicalPosition, LogicalSize } from "@tauri-apps/api/window";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import type { BootstrapState, ProviderUsageSnapshot } from "../types/bridge";
-import { setSurfaceMode, openSettingsWindow, quitApp as quitApplication } from "../lib/tauri";
+import { openFlyoutWindow, openSettingsWindow, quitApp as quitApplication, reorderProviders } from "../lib/tauri";
 import { useProviders } from "../hooks/useProviders";
 import { useSettings } from "../hooks/useSettings";
 import { useUpdateState } from "../hooks/useUpdateState";
 import { useLocale } from "../hooks/useLocale";
 import MenuCard from "../components/MenuCard";
+import PopOutTitleBar from "../components/PopOutTitleBar";
 import MenuSurface, {
   MenuEmpty,
   type MenuFooterRow,
 } from "../components/MenuSurface";
 import UpdateBanner from "../components/UpdateBanner";
-import ProviderGrid, { prioritizeProviders } from "../components/ProviderGrid";
-import { DEMO_ENABLED, DEMO_PROVIDERS } from "../lib/demoProviders";
+import ProviderGrid from "../components/ProviderGrid";
 import { orderProviderSnapshots } from "../lib/providerOrder";
 
 /**
@@ -29,25 +29,48 @@ export default function PopOutPanel({
   providerId?: string;
 }) {
   const {
-    providers: realProviders,
+    providers,
     isRefreshing,
+    refreshingProviderIds,
     refresh,
     hasCachedData,
   } = useProviders();
-  const providers = DEMO_ENABLED ? DEMO_PROVIDERS : realProviders;
   const { settings } = useSettings(state.settings);
   const { updateState, checkNow, download, apply, dismiss, openRelease } =
     useUpdateState();
   const { t } = useLocale();
 
   const sorted = useMemo(() => {
-    return orderProviderSnapshots(providers, state.providers, settings.enabledProviders);
-  }, [providers, settings.enabledProviders, state.providers]);
+    return orderProviderSnapshots(
+      providers,
+      state.providers,
+      settings.enabledProviders,
+      settings.providerOrder,
+    );
+  }, [providers, settings.enabledProviders, settings.providerOrder, state.providers]);
   const [selectedProviderId, setSelectedProviderId] = useState<string | null>(
     providerId ?? null,
   );
   const [gridExpanded, setGridExpanded] = useState(false);
   const cardRefs = useRef(new Map<string, HTMLDivElement>());
+  const windowScale = useMemo(() => {
+    const scalePercent = Number(settings.windowScalePercent);
+    return (
+      Math.min(250, Math.max(100, Number.isFinite(scalePercent) ? scalePercent : 100)) / 100
+    );
+  }, [settings.windowScalePercent]);
+
+  // Scale the dashboard via the webview's native zoom (like a browser's Ctrl-+):
+  // it reflows content at the real window width, so the side-by-side cards keep
+  // filling the window at any scale — unlike CSS `zoom`, which overflows. The
+  // main window is shared with the tray surface, so reset zoom to 1 on unmount.
+  useEffect(() => {
+    const webview = getCurrentWebviewWindow();
+    void webview.setZoom(windowScale).catch(() => {});
+    return () => {
+      void webview.setZoom(1).catch(() => {});
+    };
+  }, [windowScale]);
 
   useEffect(() => {
     setSelectedProviderId(providerId ?? null);
@@ -57,7 +80,7 @@ export default function PopOutPanel({
     () => {
       if (selectedProviderId === null) {
         if (sorted.length + 1 > 32 && !gridExpanded) {
-          return prioritizeProviders(sorted, null).slice(0, 4);
+          return sorted.slice(0, 4);
         }
         return sorted;
       }
@@ -74,29 +97,8 @@ export default function PopOutPanel({
   const handleGridClick = useCallback((nextProviderId: string | null) => {
     setSelectedProviderId(nextProviderId);
   }, []);
-
-  useEffect(() => {
-    const win = getCurrentWindow();
-    const screenWidth = window.screen.availWidth || window.innerWidth || 420;
-    const screenHeight = window.screen.availHeight || window.innerHeight || 680;
-    const width = Math.max(320, Math.min(420, screenWidth - 16));
-    // Leave room for native borders/title bars on Windows; the body scrolls.
-    const height = Math.max(320, Math.min(680, screenHeight - 88));
-    const screenOrigin = window.screen as Screen & {
-      availLeft?: number;
-      availTop?: number;
-    };
-    const left = screenOrigin.availLeft ?? 0;
-    const top = screenOrigin.availTop ?? 0;
-
-    void win.setSize(new LogicalSize(width, height)).then(() =>
-      win.setPosition(
-        new LogicalPosition(
-          left + Math.max(8, screenWidth - width - 8),
-          top + 8,
-        ),
-      ),
-    ).catch(() => {});
+  const handleReorder = useCallback((orderedIds: string[]) => {
+    void reorderProviders(orderedIds).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -141,7 +143,11 @@ export default function PopOutPanel({
     openSettingsWindow("general");
   }, []);
   const goTray = useCallback(() => {
-    setSurfaceMode("trayPanel", { kind: "summary" });
+    // The flyout ("Pop Out Dashboard") is now its own dedicated OS window
+    // rather than a state of the shared `main` window's surface-mode
+    // machine, so "back to tray" opens it directly instead of switching
+    // `main`'s mode.
+    void openFlyoutWindow().catch(() => {});
   }, []);
   const openAbout = useCallback(() => {
     openSettingsWindow("about");
@@ -156,8 +162,8 @@ export default function PopOutPanel({
 
   const footerRows: MenuFooterRow[] = [
     { icon: "⚙", label: t("TooltipSettings"), shortcut: "Ctrl+,", onClick: openSettings },
-    { icon: "ℹ", label: "About CodexBar", onClick: openAbout },
-    { icon: "✕", label: "Quit", shortcut: "Ctrl+Q", onClick: quitApp },
+    { icon: "ℹ", label: t("MenuAbout"), onClick: openAbout },
+    { icon: "✕", label: t("MenuQuit"), shortcut: "Ctrl+Q", onClick: quitApp },
   ];
 
   // Keyboard shortcuts
@@ -194,27 +200,25 @@ export default function PopOutPanel({
     />
   );
 
-  if (sorted.length === 0) {
-    return (
-      <MenuSurface
-        variant="popout"
-        onRefresh={refresh}
-        isRefreshing={isRefreshing}
-        actions={headerActions}
-        banner={banner}
-        footerRows={footerRows}
-      >
-        <MenuEmpty
-          isLoading={isRefreshing && !hasCachedData}
-          onSettings={openSettings}
-        />
-      </MenuSurface>
-    );
-  }
-
-  return (
+  const surface = sorted.length === 0 ? (
     <MenuSurface
       variant="popout"
+      titleBar={<PopOutTitleBar />}
+      onRefresh={refresh}
+      isRefreshing={isRefreshing}
+      actions={headerActions}
+      banner={banner}
+      footerRows={footerRows}
+    >
+      <MenuEmpty
+        isLoading={isRefreshing && !hasCachedData}
+        onSettings={openSettings}
+      />
+    </MenuSurface>
+  ) : (
+    <MenuSurface
+      variant="popout"
+      titleBar={<PopOutTitleBar />}
       onRefresh={refresh}
       isRefreshing={isRefreshing}
       actions={headerActions}
@@ -229,6 +233,7 @@ export default function PopOutPanel({
         expanded={gridExpanded}
         onExpandedChange={setGridExpanded}
         onSelect={handleGridClick}
+        onReorder={handleReorder}
       />
       <div className="provider-grid__divider" />
       <div className="menu-stack">
@@ -247,15 +252,29 @@ export default function PopOutPanel({
             >
               <MenuCard
                 provider={p}
-                hideEmail={settings.hidePersonalInfo}
-                resetTimeRelative={settings.resetTimeRelative}
-                showAsUsed={settings.showAsUsed}
-                compactMetrics={selectedProviderId === null}
+                isRefreshing={refreshingProviderIds.has(p.providerId)}
+                display={{
+                  hideEmail: settings.hidePersonalInfo,
+                  resetTimeRelative: settings.resetTimeRelative,
+                  showResetWhenExhausted: settings.showResetWhenExhausted,
+                  showPace: settings.showPace ?? true,
+                  showAsUsed: settings.showAsUsed,
+                  compactOverview:
+                    selectedProviderId === null && settings.overviewLayout !== "detailed",
+                  costSummaryDisplayStyle: settings.costSummaryDisplayStyle,
+                }}
+                accentColor={settings.providerAccentColors[p.providerId]}
               />
             </div>
           </Fragment>
         ))}
       </div>
     </MenuSurface>
+  );
+
+  return (
+    <div className="popout-scale-shell">
+      {surface}
+    </div>
   );
 }

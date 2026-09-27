@@ -7,10 +7,10 @@ A Windows port of [CodexBar](https://github.com/steipete/CodexBar) - a system tr
 ## Features
 
 - **System Tray Icon** - Color-coded usage indicator with incident badges
-- **Multiple Providers** - Support for 41 AI providers:
+- **Multiple Providers** - Support for 40 AI providers:
   - Codex, Claude, Cursor, Factory, Gemini, Copilot, Antigravity, z.ai
   - MiniMax, Kiro, Vertex AI, Augment, OpenCode, OpenCode Go, Kimi, Kimi K2
-  - Amp, Warp, Ollama, OpenRouter, Synthetic, JetBrains AI, Alibaba
+  - Amp, Warp, Ollama, OpenRouter, JetBrains AI, Alibaba
   - NanoGPT, Infini, Perplexity, Abacus AI, Mistral, Kilo, AWS Bedrock, Codebuff, DeepSeek, Windsurf
   - Manus, Xiaomi MiMo, Doubao, Command Code, Crof, StepFun, Venice, OpenAI API
 - **Usage Notifications** - Windows toast alerts when usage hits thresholds
@@ -62,7 +62,7 @@ npm run tauri:build
 ### GUI Mode (System Tray)
 
 ```powershell
-codexbar-desktop-tauri.exe
+codexbar.exe
 ```
 
 This launches the system tray application:
@@ -73,7 +73,7 @@ This launches the system tray application:
 - Use the Cookies, API Keys, or provider account sections to recover credentials if status stops updating
 - Use the About button for version info
 
-On Windows Remote Desktop sessions, CodexBar now exits with a direct error dialog instead of crashing with renderer errors. Use the local Windows desktop session for the native UI, or run CLI commands like `codexbar usage -p claude` while connected over RDP.
+On Windows Remote Desktop sessions, CodexBar now exits with a direct error dialog instead of crashing with renderer errors. Use the local Windows desktop session for the native UI, or run installed CLI commands like `codexbar-cli usage -p claude` while connected over RDP.
 
 ### CLI Mode
 
@@ -154,7 +154,6 @@ Each provider has different authentication methods:
 | Warp | API key |
 | Ollama | Browser cookies |
 | OpenRouter | API key |
-| Synthetic | API key |
 | JetBrains AI | Local IDE config |
 | Alibaba | API key / browser cookies |
 | NanoGPT | API key |

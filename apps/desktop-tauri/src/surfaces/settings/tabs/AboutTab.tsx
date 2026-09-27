@@ -4,23 +4,27 @@ import { useUpdateState } from "../../../hooks/useUpdateState";
 import { getAppInfo, openExternalUrl } from "../../../lib/tauri";
 import { Field, Select, Toggle } from "../../../components/FormControls";
 import type { AppInfoBridge, UpdateChannel } from "../../../types/bridge";
-import type { TabProps } from "../../Settings";
+import type { LocaleKey } from "../../../i18n/keys";
+import type { TabProps } from "../settingsTabs";
 import codexbarIcon from "../../../assets/codexbar-icon.png";
 
-const ABOUT_LINKS = [
+const REPO_URL = "https://github.com/nesszer/Win-CodexBar";
+const SUBMIT_ISSUE_URL = `${REPO_URL}/issues/new?labels=bug&template=bug_report.yml`;
+
+const ABOUT_LINKS: ReadonlyArray<{ labelKey: LocaleKey; url: string }> = [
   {
-    label: "GitHub",
-    url: "https://github.com/Finesssee/Win-CodexBar",
+    labelKey: "AboutLinkGitHub",
+    url: REPO_URL,
   },
   {
-    label: "Website",
+    labelKey: "AboutLinkWebsite",
     url: "https://codexbar.app",
   },
   {
-    label: "Original Project",
+    labelKey: "AboutLinkOriginalProject",
     url: "https://github.com/steipete/CodexBar",
   },
-] as const;
+];
 
 export default function AboutTab({ settings, set, saving }: TabProps) {
   const { t } = useLocale();
@@ -49,7 +53,7 @@ export default function AboutTab({ settings, set, saving }: TabProps) {
   if (!appInfo) {
     return (
       <section className="settings-section">
-        <p className="settings-section__hint">Loading…</p>
+        <p className="settings-section__hint">{t("AboutLoading")}</p>
       </section>
     );
   }
@@ -58,14 +62,19 @@ export default function AboutTab({ settings, set, saving }: TabProps) {
     updateState.status === "checking" ||
     updateState.status === "downloading";
 
+  // Copyright is split into two keys so the brand link can render inline
+  // between them, avoiding any Fluent placeholder syntax.
+  const copyrightBefore = t("AboutCopyrightBefore");
+  const copyrightAfter = t("AboutCopyrightAfter");
+
   return (
     <section className="settings-section about-section">
       <div className="about-header">
-        <img className="about-icon" src={codexbarIcon} alt="CodexBar" />
+        <img className="about-icon" src={codexbarIcon} alt={t("AppName")} />
         <div className="about-title-block">
           <h2 className="about-title">{appInfo.name}</h2>
           <p className="about-version">
-            Version {appInfo.version}
+            {t("Version")} {appInfo.version}
             {appInfo.buildNumber !== "dev" && ` (${appInfo.buildNumber})`}
           </p>
           <p className="about-tagline">{appInfo.tagline}</p>
@@ -80,11 +89,22 @@ export default function AboutTab({ settings, set, saving }: TabProps) {
             className="about-link"
             onClick={() => openAboutLink(link.url)}
           >
-            {link.label}
+            {t(link.labelKey)}
           </button>
         ))}
       </div>
-      {linkError && <p className="about-update-msg">Error: {linkError}</p>}
+      <button
+        type="button"
+        className="about-link"
+        onClick={() => openAboutLink(SUBMIT_ISSUE_URL)}
+      >
+        {t("SubmitIssue")}
+      </button>
+      {linkError && (
+        <p className="about-update-msg">
+          {t("ErrorPrefix")} {linkError}
+        </p>
+      )}
 
       <div className="about-divider" />
 
@@ -121,30 +141,35 @@ export default function AboutTab({ settings, set, saving }: TabProps) {
 
       <div className="about-actions">
         <button
+          type="button"
           className="credential-btn credential-btn--primary"
           disabled={isBusy}
           onClick={handleCheck}
         >
           {updateState.status === "checking"
-            ? "Checking…"
-            : "Check for Updates…"}
+            ? t("AboutChecking")
+            : t("AboutCheckForUpdates")}
         </button>
 
         {updateState.status === "available" && (
           <div className="about-update-row">
             <span className="about-update-msg">
-              Update {updateState.version} available
+              {t("UpdateAvailableMessage").replace(
+                "{}",
+                updateState.version ?? "",
+              )}
             </span>
             {updateState.canDownload ? (
               <button
+                type="button"
                 className="credential-btn credential-btn--primary"
                 onClick={download}
               >
-                Download
+                {t("BannerDownloadButton")}
               </button>
             ) : (
-              <button className="credential-btn" onClick={openRelease}>
-                View Release
+              <button type="button" className="credential-btn" onClick={openRelease}>
+                {t("BannerViewRelease")}
               </button>
             )}
           </div>
@@ -152,7 +177,7 @@ export default function AboutTab({ settings, set, saving }: TabProps) {
 
         {updateState.status === "downloading" && (
           <span className="about-update-msg">
-            Downloading…
+            {t("UpdateDownloading")}
             {updateState.progress != null &&
               ` ${Math.round(updateState.progress * 100)}%`}
           </span>
@@ -160,17 +185,18 @@ export default function AboutTab({ settings, set, saving }: TabProps) {
 
         {updateState.status === "ready" && (
           <div className="about-update-row">
-            <span className="about-update-msg">Update ready to install</span>
+            <span className="about-update-msg">{t("UpdateReady")}</span>
             {updateState.canApply ? (
               <button
+                type="button"
                 className="credential-btn credential-btn--primary"
                 onClick={apply}
               >
-                Install &amp; Restart
+                {t("BannerInstallRestart")}
               </button>
             ) : (
-              <button className="credential-btn" onClick={openRelease}>
-                View Release
+              <button type="button" className="credential-btn" onClick={openRelease}>
+                {t("BannerViewRelease")}
               </button>
             )}
           </div>
@@ -178,25 +204,25 @@ export default function AboutTab({ settings, set, saving }: TabProps) {
 
         {updateState.status === "error" && (
           <span className="about-update-msg">
-            Error: {updateState.error}
+            {t("ErrorPrefix")} {updateState.error}
           </span>
         )}
 
         {updateState.status === "idle" && hasChecked && (
-          <span className="about-update-msg">You&apos;re up to date!</span>
+          <span className="about-update-msg">{t("AboutUpToDate")}</span>
         )}
       </div>
 
       <p className="about-copyright">
-        Windows port by NessZerra. Based on{" "}
+        {copyrightBefore}{" "}
         <button
           type="button"
           className="about-link about-link--inline"
           onClick={() => openAboutLink("https://github.com/steipete/CodexBar")}
         >
-          CodexBar
-        </button>{" "}
-        by steipete. MIT License.
+          {t("AppName")}
+        </button>
+        {" "}{copyrightAfter}
       </p>
     </section>
   );

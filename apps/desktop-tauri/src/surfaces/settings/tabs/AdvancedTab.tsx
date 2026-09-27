@@ -1,16 +1,102 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useLocale } from "../../../hooks/useLocale";
 import {
+  getSafeDiagnostics,
   registerGlobalShortcut,
   unregisterGlobalShortcut,
 } from "../../../lib/tauri";
 import { ShortcutCapture } from "../../../components/ShortcutCapture";
 import { Field, Toggle } from "../../../components/FormControls";
-import type { TabProps } from "../../Settings";
+import type { TabProps } from "../settingsTabs";
+
+function formatCodexSessionsDirs(paths: string[]): string {
+  return paths.join("; ");
+}
+
+function parseCodexSessionsDirs(value: string): string[] {
+  return value
+    .split(/[;\n]/)
+    .map((path) => path.trim())
+    .filter(Boolean);
+}
+
+function parseSshHosts(value: string): string[] {
+  return value.split(/[,\n]/).map((host) => host.trim()).filter(Boolean);
+}
 
 export default function AdvancedTab({ settings, set, saving }: TabProps) {
   const { t } = useLocale();
   const [shortcutError, setShortcutError] = useState<string | null>(null);
+  const [diagnosticsStatus, setDiagnosticsStatus] = useState<string | null>(
+    null,
+  );
+  const [codexDirsDraft, setCodexDirsDraft] = useState(() =>
+    formatCodexSessionsDirs(settings.codexCustomSessionsDirs),
+  );
+  const [sshHostsDraft, setSshHostsDraft] = useState(() =>
+    (settings.agentSessionSshHosts ?? []).join(", "),
+  );
+  const [proxyUrlDraft, setProxyUrlDraft] = useState(() =>
+    settings.httpProxyUrl ?? "",
+  );
+  const [proxyUsernameDraft, setProxyUsernameDraft] = useState(() =>
+    settings.httpProxyUsername ?? "",
+  );
+  const [proxyPasswordDraft, setProxyPasswordDraft] = useState(() =>
+    settings.httpProxyPassword ?? "",
+  );
+
+  const copyDiagnostics = useCallback(async () => {
+    try {
+      const text = await getSafeDiagnostics();
+      await navigator.clipboard.writeText(text);
+      setDiagnosticsStatus(t("DiagnosticsCopied"));
+    } catch (error) {
+      setDiagnosticsStatus(`${t("DiagnosticsCopyFailed")} ${String(error)}`);
+    }
+  }, [t]);
+
+  const commitCodexDirs = useCallback(() => {
+    set({ codexCustomSessionsDirs: parseCodexSessionsDirs(codexDirsDraft) });
+  }, [codexDirsDraft, set]);
+
+  useEffect(() => {
+    if (!saving) {
+      setCodexDirsDraft(formatCodexSessionsDirs(settings.codexCustomSessionsDirs));
+    }
+  }, [saving, settings.codexCustomSessionsDirs]);
+
+  useEffect(() => {
+    if (!saving) setSshHostsDraft((settings.agentSessionSshHosts ?? []).join(", "));
+  }, [saving, settings.agentSessionSshHosts]);
+
+  useEffect(() => {
+    if (!saving) setProxyUrlDraft(settings.httpProxyUrl ?? "");
+  }, [saving, settings.httpProxyUrl]);
+
+  useEffect(() => {
+    if (!saving) setProxyUsernameDraft(settings.httpProxyUsername ?? "");
+  }, [saving, settings.httpProxyUsername]);
+
+  useEffect(() => {
+    if (!saving) setProxyPasswordDraft(settings.httpProxyPassword ?? "");
+  }, [saving, settings.httpProxyPassword]);
+
+  const commitProxyUrl = useCallback(() => {
+    const next = proxyUrlDraft.trim();
+    if (next !== (settings.httpProxyUrl ?? "")) set({ httpProxyUrl: next });
+  }, [proxyUrlDraft, set, settings.httpProxyUrl]);
+
+  const commitProxyUsername = useCallback(() => {
+    const next = proxyUsernameDraft.trim();
+    if (next !== (settings.httpProxyUsername ?? "")) set({ httpProxyUsername: next });
+  }, [proxyUsernameDraft, set, settings.httpProxyUsername]);
+
+  const commitProxyPassword = useCallback(() => {
+    if (proxyPasswordDraft !== (settings.httpProxyPassword ?? "")) {
+      set({ httpProxyPassword: proxyPasswordDraft });
+    }
+  }, [proxyPasswordDraft, set, settings.httpProxyPassword]);
 
   const commitShortcut = useCallback(
     async (accelerator: string) => {
@@ -34,6 +120,7 @@ export default function AdvancedTab({ settings, set, saving }: TabProps) {
       setShortcutError(err instanceof Error ? err.message : String(err));
     }
   }, [set]);
+
 
   return (
     <>
@@ -59,36 +146,72 @@ export default function AdvancedTab({ settings, set, saving }: TabProps) {
         <p className="settings-section__hint">{t("ShortcutRecordingHint")}</p>
       </section>
 
-      {/* ── Debug ────────────────────────────────────────────────── */}
+      {/* -- Codex local logs -------------------------------------- */}
       <section className="settings-section">
-        <h3 className="settings-section__title">{t("SectionDebug")}</h3>
+        <h3 className="settings-section__title settings-section__title--bold">
+          {t("CodexLocalLogsTitle")}
+        </h3>
+        <p className="settings-section__caption">
+          {t("CodexLocalLogsCaption")}
+        </p>
         <div className="settings-section__group">
           <Field
-            label={t("ShowDebugSettingsLabel")}
-            description={t("ShowDebugSettingsHelper")}
-            leading
+            label={t("CodexLogPathsLabel")}
+            description={t("CodexLogPathsHelper")}
           >
-            <Toggle
-              checked={settings.showDebugSettings}
+            <input
+              type="text"
+              className="text-input"
+              value={codexDirsDraft}
+              placeholder={String.raw`\\wsl.localhost\<distro>\home\<user>\.codex`}
               disabled={saving}
-              onChange={(v) => set({ showDebugSettings: v })}
-            />
-          </Field>
-          <Field
-            label={t("SurpriseAnimationsLabel")}
-            description={t("SurpriseAnimationsHelper")}
-            leading
-          >
-            <Toggle
-              checked={settings.surpriseAnimations}
-              disabled={saving}
-              onChange={(v) => set({ surpriseAnimations: v })}
+              onChange={(event) => setCodexDirsDraft(event.target.value)}
+              onBlur={commitCodexDirs}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.currentTarget.blur();
+                }
+              }}
             />
           </Field>
         </div>
       </section>
 
-      {/* ── Privacy ──────────────────────────────────────────────── */}
+      {/* -- Privacy ----------------------------------------------- */}
+      <section className="settings-section">
+        <h3 className="settings-section__title">{t("AgentSessionsTitle")}</h3>
+        <div className="settings-section__group">
+          <Field
+            label={t("AgentSessionsEnableLabel")}
+            description={t("AgentSessionsEnableHelper")}
+            leading
+          >
+            <Toggle
+              checked={settings.agentSessionsEnabled ?? false}
+              disabled={saving}
+              onChange={(v) => set({ agentSessionsEnabled: v })}
+            />
+          </Field>
+          <Field
+            label={t("AgentSessionsSshHostsLabel")}
+            description={t("AgentSessionsSshHostsHelper")}
+          >
+            <input
+              type="text"
+              className="text-input"
+              value={sshHostsDraft}
+              disabled={saving || !settings.agentSessionsEnabled}
+              onChange={(event) => setSshHostsDraft(event.target.value)}
+              onBlur={() => set({ agentSessionSshHosts: parseSshHosts(sshHostsDraft) })}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") event.currentTarget.blur();
+              }}
+            />
+          </Field>
+        </div>
+      </section>
+
+      {/* -- Privacy ----------------------------------------------- */}
       <section className="settings-section">
         <h3 className="settings-section__title">{t("PrivacyTitle")}</h3>
         <div className="settings-section__group">
@@ -104,6 +227,114 @@ export default function AdvancedTab({ settings, set, saving }: TabProps) {
             />
           </Field>
         </div>
+      </section>
+
+      {/* -- Local integrations ----------------------------------- */}
+      <section className="settings-section">
+        <h3 className="settings-section__title">
+          {t("SectionLocalIntegrations")}
+        </h3>
+        <div className="settings-section__group">
+          <Field
+            label={t("PowerToysPipeLabel")}
+            description={t("PowerToysPipeHelper")}
+            leading
+          >
+            <Toggle
+              checked={settings.powertoysStatusPipeEnabled}
+              disabled={saving}
+              onChange={(v) => set({ powertoysStatusPipeEnabled: v })}
+            />
+          </Field>
+        </div>
+      </section>
+
+      {/* -- Network proxy ---------------------------------------- */}
+      <section className="settings-section">
+        <h3 className="settings-section__title">{t("NetworkProxyTitle")}</h3>
+        <p className="settings-section__caption">{t("NetworkProxyCaption")}</p>
+        <div className="settings-section__group">
+          <Field
+            label={t("NetworkProxyEnableLabel")}
+            description={t("NetworkProxyEnableHelper")}
+            leading
+          >
+            <Toggle
+              checked={settings.httpProxyEnabled ?? false}
+              disabled={saving}
+              onChange={(v) => set({ httpProxyEnabled: v })}
+            />
+          </Field>
+          <Field
+            label={t("NetworkProxyUrlLabel")}
+            description={t("NetworkProxyUrlHelper")}
+          >
+            <input
+              type="text"
+              className="text-input"
+              value={proxyUrlDraft}
+              placeholder="http://127.0.0.1:7890"
+              aria-label={t("NetworkProxyUrlLabel")}
+              disabled={saving || !settings.httpProxyEnabled}
+              onChange={(event) => setProxyUrlDraft(event.target.value)}
+              onBlur={commitProxyUrl}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") event.currentTarget.blur();
+              }}
+            />
+          </Field>
+          <Field label={t("NetworkProxyUserLabel")}>
+            <input
+              type="text"
+              className="text-input"
+              value={proxyUsernameDraft}
+              autoComplete="off"
+              disabled={saving || !settings.httpProxyEnabled}
+              onChange={(event) => setProxyUsernameDraft(event.target.value)}
+              onBlur={commitProxyUsername}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") event.currentTarget.blur();
+              }}
+            />
+          </Field>
+          <Field
+            label={t("NetworkProxyPasswordLabel")}
+            description={t("NetworkProxyPasswordHelper")}
+          >
+            <input
+              type="password"
+              className="text-input"
+              value={proxyPasswordDraft}
+              autoComplete="new-password"
+              disabled={saving || !settings.httpProxyEnabled}
+              onChange={(event) => setProxyPasswordDraft(event.target.value)}
+              onBlur={commitProxyPassword}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") event.currentTarget.blur();
+              }}
+            />
+          </Field>
+        </div>
+      </section>
+
+      {/* -- External hooks --------------------------------------- */}
+      <section className="settings-section">
+        <h3 className="settings-section__title">{t("HooksTitle")}</h3>
+        <p className="settings-section__caption">{t("HooksCaption")}</p>
+        <div className="settings-section__group">
+          <Field
+            label={t("HooksEnableLabel")}
+            description={t("HooksEnableHelper")}
+            leading
+          >
+            <Toggle
+              checked={settings.hooksEnabled ?? false}
+              disabled={saving}
+              onChange={(v) => set({ hooksEnabled: v })}
+            />
+          </Field>
+        </div>
+        <p className="settings-section__hint">{t("HooksConfigPathHint")}</p>
       </section>
 
       {/* ── Keychain access ──────────────────────────────────────── */}
@@ -138,6 +369,25 @@ export default function AdvancedTab({ settings, set, saving }: TabProps) {
               onChange={(v) => set({ claudeAvoidKeychainPrompts: v })}
             />
           </Field>
+        </div>
+      </section>
+
+      {/* ── Diagnostics ──────────────────────────────────────────── */}
+      <section className="settings-section">
+        <h3 className="settings-section__title settings-section__title--bold">
+          {t("DiagnosticsSectionHeading")}
+        </h3>
+        <div className="settings-section__group">
+          <button
+            type="button"
+            className="credential-btn"
+            onClick={() => void copyDiagnostics()}
+          >
+            {t("DiagnosticsCopyButton")}
+          </button>
+          {diagnosticsStatus && (
+            <p className="settings-section__hint">{diagnosticsStatus}</p>
+          )}
         </div>
       </section>
     </>

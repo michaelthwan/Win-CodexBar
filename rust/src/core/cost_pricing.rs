@@ -1,13 +1,22 @@
-//! Cost Usage Pricing
-//!
-//! Model-specific token pricing for Codex (OpenAI) and Claude (Anthropic) models.
-//! Supports tiered pricing for models with token thresholds.
+//! Cost usage pricing — model-specific token pricing for Codex (OpenAI) and Claude (Anthropic).
 
-#![allow(dead_code)]
-
+use super::codex_routed_pricing;
+use super::models_dev_pricing;
+use chrono::NaiveDate;
 use std::collections::HashMap;
 use std::sync::LazyLock;
-
+#[path = "cost_pricing/claude.rs"]
+mod claude_pricing;
+#[path = "cost_pricing/codex.rs"]
+mod codex_pricing;
+pub(crate) use claude_pricing::ClaudePricingResolution;
+/// Whole-request Codex rates for input above the model context threshold.
+#[derive(Debug, Clone, Copy)]
+pub struct CodexLongContextRates {
+    pub input_cost_per_token: f64,
+    pub output_cost_per_token: f64,
+    pub cache_read_input_cost_per_token: f64,
+}
 /// Codex (OpenAI) model pricing
 #[derive(Debug, Clone, Copy)]
 pub struct CodexPricing {
@@ -19,8 +28,9 @@ pub struct CodexPricing {
     pub cache_read_input_cost_per_token: f64,
     /// Optional display label override (e.g. "Research Preview")
     pub display_label: Option<&'static str>,
+    /// Whole-request rates above the Codex long-context threshold.
+    pub long_context: Option<CodexLongContextRates>,
 }
-
 /// Claude (Anthropic) model pricing with optional tiered pricing
 #[derive(Debug, Clone, Copy)]
 pub struct ClaudePricing {
@@ -56,6 +66,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 1e-5,
             cache_read_input_cost_per_token: 1.25e-7,
             display_label: None,
+            long_context: None,
         },
     );
     m.insert(
@@ -65,6 +76,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 1e-5,
             cache_read_input_cost_per_token: 1.25e-7,
             display_label: None,
+            long_context: None,
         },
     );
     m.insert(
@@ -74,6 +86,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 2e-6,
             cache_read_input_cost_per_token: 2.5e-8,
             display_label: None,
+            long_context: None,
         },
     );
     m.insert(
@@ -83,6 +96,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 4e-7,
             cache_read_input_cost_per_token: 5e-9,
             display_label: None,
+            long_context: None,
         },
     );
     m.insert(
@@ -92,6 +106,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 1.2e-4,
             cache_read_input_cost_per_token: 1.5e-5,
             display_label: None,
+            long_context: None,
         },
     );
     m.insert(
@@ -101,6 +116,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 1e-5,
             cache_read_input_cost_per_token: 1.25e-7,
             display_label: None,
+            long_context: None,
         },
     );
     m.insert(
@@ -110,6 +126,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 1e-5,
             cache_read_input_cost_per_token: 1.25e-7,
             display_label: None,
+            long_context: None,
         },
     );
     m.insert(
@@ -119,6 +136,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 1e-5,
             cache_read_input_cost_per_token: 1.25e-7,
             display_label: None,
+            long_context: None,
         },
     );
     m.insert(
@@ -128,6 +146,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 2e-6,
             cache_read_input_cost_per_token: 2.5e-8,
             display_label: None,
+            long_context: None,
         },
     );
     m.insert(
@@ -137,6 +156,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 1.4e-5,
             cache_read_input_cost_per_token: 1.75e-7,
             display_label: None,
+            long_context: None,
         },
     );
     m.insert(
@@ -146,6 +166,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 1.4e-5,
             cache_read_input_cost_per_token: 1.75e-7,
             display_label: None,
+            long_context: None,
         },
     );
     m.insert(
@@ -155,6 +176,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 1.68e-4,
             cache_read_input_cost_per_token: 2.1e-5,
             display_label: None,
+            long_context: None,
         },
     );
     m.insert(
@@ -164,6 +186,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 1.4e-5,
             cache_read_input_cost_per_token: 1.75e-7,
             display_label: None,
+            long_context: None,
         },
     );
     m.insert(
@@ -173,6 +196,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 0.0,
             cache_read_input_cost_per_token: 0.0,
             display_label: Some("Research Preview"),
+            long_context: None,
         },
     );
 
@@ -184,6 +208,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 1.5e-5,
             cache_read_input_cost_per_token: 2.5e-7,
             display_label: None,
+            long_context: None,
         },
     );
     m.insert(
@@ -193,6 +218,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 1.5e-5,
             cache_read_input_cost_per_token: 2.5e-7,
             display_label: None,
+            long_context: None,
         },
     );
 
@@ -204,6 +230,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 4.5e-6,
             cache_read_input_cost_per_token: 7.5e-8,
             display_label: None,
+            long_context: None,
         },
     );
     m.insert(
@@ -213,6 +240,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 4.5e-6,
             cache_read_input_cost_per_token: 7.5e-8,
             display_label: None,
+            long_context: None,
         },
     );
 
@@ -224,6 +252,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 1.25e-6,
             cache_read_input_cost_per_token: 2e-8,
             display_label: None,
+            long_context: None,
         },
     );
     m.insert(
@@ -233,6 +262,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 1.25e-6,
             cache_read_input_cost_per_token: 2e-8,
             display_label: None,
+            long_context: None,
         },
     );
 
@@ -244,6 +274,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 1.8e-4,
             cache_read_input_cost_per_token: 3e-5,
             display_label: None,
+            long_context: None,
         },
     );
     m.insert(
@@ -253,6 +284,7 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 3e-5,
             cache_read_input_cost_per_token: 5e-7,
             display_label: None,
+            long_context: None,
         },
     );
     m.insert(
@@ -262,6 +294,65 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
             output_cost_per_token: 1.8e-4,
             cache_read_input_cost_per_token: 3e-5,
             display_label: None,
+            long_context: None,
+        },
+    );
+    m.insert(
+        "gpt-5.6-sol",
+        CodexPricing {
+            input_cost_per_token: 5e-6,
+            output_cost_per_token: 3e-5,
+            cache_read_input_cost_per_token: 5e-7,
+            display_label: None,
+            long_context: Some(CodexLongContextRates {
+                input_cost_per_token: 1e-5,
+                output_cost_per_token: 4.5e-5,
+                cache_read_input_cost_per_token: 1e-6,
+            }),
+        },
+    );
+    m.insert(
+        "gpt-5.6-terra",
+        CodexPricing {
+            input_cost_per_token: 2e-6,
+            output_cost_per_token: 1.2e-5,
+            cache_read_input_cost_per_token: 2e-7,
+            display_label: None,
+            long_context: Some(CodexLongContextRates {
+                input_cost_per_token: 4e-6,
+                output_cost_per_token: 1.8e-5,
+                cache_read_input_cost_per_token: 4e-7,
+            }),
+        },
+    );
+    m.insert(
+        "gpt-5.6-luna",
+        CodexPricing {
+            input_cost_per_token: 2e-7,
+            output_cost_per_token: 1.2e-6,
+            cache_read_input_cost_per_token: 2e-8,
+            display_label: None,
+            long_context: Some(CodexLongContextRates {
+                input_cost_per_token: 4e-7,
+                output_cost_per_token: 1.8e-6,
+                cache_read_input_cost_per_token: 4e-8,
+            }),
+        },
+    );
+    // GPT-6 Astra pricing (OpenAI model card and pricing table).
+    // Long-context rates apply to the whole request above 272K input tokens.
+    m.insert(
+        "gpt-6-astra",
+        CodexPricing {
+            input_cost_per_token: 1e-5,
+            output_cost_per_token: 5e-5,
+            cache_read_input_cost_per_token: 1e-6,
+            display_label: None,
+            long_context: Some(CodexLongContextRates {
+                input_cost_per_token: 2e-5,
+                output_cost_per_token: 7.5e-5,
+                cache_read_input_cost_per_token: 2e-6,
+            }),
         },
     );
 
@@ -271,6 +362,22 @@ static CODEX_PRICING: LazyLock<HashMap<&'static str, CodexPricing>> = LazyLock::
 /// Claude model pricing table
 static CLAUDE_PRICING: LazyLock<HashMap<&'static str, ClaudePricing>> = LazyLock::new(|| {
     let mut m = HashMap::new();
+
+    // Fable 5
+    m.insert(
+        "claude-fable-5",
+        ClaudePricing {
+            input_cost_per_token: 1e-5,
+            output_cost_per_token: 5e-5,
+            cache_creation_input_cost_per_token: 1.25e-5,
+            cache_read_input_cost_per_token: 1e-6,
+            threshold_tokens: None,
+            input_cost_per_token_above_threshold: None,
+            output_cost_per_token_above_threshold: None,
+            cache_creation_input_cost_per_token_above_threshold: None,
+            cache_read_input_cost_per_token_above_threshold: None,
+        },
+    );
 
     // Haiku 4.5
     m.insert(
@@ -335,6 +442,22 @@ static CLAUDE_PRICING: LazyLock<HashMap<&'static str, ClaudePricing>> = LazyLock
     // Opus 4.7 (same pricing as Opus 4.6)
     m.insert(
         "claude-opus-4-7",
+        ClaudePricing {
+            input_cost_per_token: 5e-6,
+            output_cost_per_token: 2.5e-5,
+            cache_creation_input_cost_per_token: 6.25e-6,
+            cache_read_input_cost_per_token: 5e-7,
+            threshold_tokens: None,
+            input_cost_per_token_above_threshold: None,
+            output_cost_per_token_above_threshold: None,
+            cache_creation_input_cost_per_token_above_threshold: None,
+            cache_read_input_cost_per_token_above_threshold: None,
+        },
+    );
+
+    // Opus 4.8 (same pricing as Opus 4.5/4.6/4.7)
+    m.insert(
+        "claude-opus-4-8",
         ClaudePricing {
             input_cost_per_token: 5e-6,
             output_cost_per_token: 2.5e-5,
@@ -476,10 +599,30 @@ static CLAUDE_PRICING: LazyLock<HashMap<&'static str, ClaudePricing>> = LazyLock
 /// Cost usage pricing utilities
 pub struct CostUsagePricing;
 
+pub(crate) fn bundled_codex_long_context_threshold(model: &str) -> Option<u64> {
+    claude_pricing::bundled_codex_long_context_threshold(model)
+}
+
 impl CostUsagePricing {
+    /// Sentinel model key for model-less Codex token events.
+    ///
+    /// Usage remains visible under this key but is never priced as a real model
+    /// (including catalog collisions with a generic "unknown" entry).
+    pub const CODEX_UNATTRIBUTED_MODEL: &'static str = "unknown";
+    /// True when `model` is the unattributed / model-less sentinel.
+    pub fn is_codex_unattributed_model(model: &str) -> bool {
+        Self::normalize_codex_model(model) == Self::CODEX_UNATTRIBUTED_MODEL
+    }
+
     /// Normalize a Codex model name for pricing lookup
     pub fn normalize_codex_model(raw: &str) -> String {
         let mut trimmed = raw.trim().to_string();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("unknown")
+            || trimmed.eq_ignore_ascii_case("unpriced")
+        {
+            return Self::CODEX_UNATTRIBUTED_MODEL.to_string();
+        }
 
         // Remove "openai/" prefix
         if let Some(rest) = trimmed.strip_prefix("openai/") {
@@ -489,20 +632,36 @@ impl CostUsagePricing {
         // Check if base model (without -codex suffix) exists in pricing
         if let Some(idx) = trimmed.find("-codex") {
             let base = &trimmed[..idx];
-            if CODEX_PRICING.contains_key(base) {
-                return base.to_string();
+            if CODEX_PRICING.contains_key(base) || base == "gpt-5.6" {
+                trimmed = base.to_string();
             }
         }
 
         let date_pattern = regex_lite::Regex::new(r"-\d{4}-\d{2}-\d{2}$").unwrap();
         if let Some(mat) = date_pattern.find(&trimmed) {
             let base = &trimmed[..mat.start()];
-            if CODEX_PRICING.contains_key(base) {
-                return base.to_string();
+            if CODEX_PRICING.contains_key(base) || base == "gpt-5.6" {
+                trimmed = base.to_string();
             }
         }
 
+        if trimmed == "gpt-5.6" {
+            return "gpt-5.6-sol".to_string();
+        }
+
         trimmed
+    }
+
+    /// Detect a provider-qualified route prefix on a Codex model name.
+    /// Delegates to [`codex_routed_pricing::codex_routed_provider`].
+    pub fn codex_routed_provider(model: &str) -> Option<&'static str> {
+        codex_routed_pricing::codex_routed_provider(model)
+    }
+
+    /// Whether a Codex model belongs to the native OpenAI subscription rather
+    /// than a provider-qualified routed subscription.
+    pub fn counts_toward_codex_subscription(model: &str) -> bool {
+        codex_routed_pricing::counts_toward_codex_subscription(model)
     }
 
     /// Get the display label for a Codex model (e.g. "Research Preview")
@@ -513,39 +672,129 @@ impl CostUsagePricing {
             .and_then(|p| p.display_label)
     }
 
-    /// Normalize a Claude model name for pricing lookup
-    pub fn normalize_claude_model(raw: &str) -> String {
-        let mut trimmed = raw.trim().to_string();
+    /// Strip Fast/priority suffix to find the base model for pricing lookup.
+    ///
+    /// Fast-tier models ("gpt-5.5-fast", "gpt-5.6-sol-priority") price as the
+    /// standard base × multiplier. Both `codex_api_fast_multiplier` and
+    /// `codex_fast_cost_usd` must use this helper so the original suffix does
+    /// not leak into the base lookup (audit C4).
+    pub fn codex_fast_base_model(model: &str) -> String {
+        let key = Self::normalize_codex_model(model);
+        key.strip_suffix("-fast")
+            .or_else(|| key.strip_suffix("-priority"))
+            .map(Self::normalize_codex_model)
+            .unwrap_or(key)
+    }
 
-        // Remove "anthropic." prefix
-        if let Some(rest) = trimmed.strip_prefix("anthropic.") {
-            trimmed = rest.to_string();
+    /// Fast-tier multiplier per model (upstream 0.48.0 C4). Fast USD = Standard
+    /// cost × multiplier. Returns `None` for models without a Fast lane.
+    ///
+    /// Multipliers: gpt-5.4, gpt-5.4-mini, gpt-5.6-sol, gpt-5.6-terra,
+    /// gpt-5.6-luna → 2.0; gpt-5.5 → 2.5; else nil.
+    pub fn codex_api_fast_multiplier(model: &str) -> Option<f64> {
+        let base = Self::codex_fast_base_model(model);
+        match base.as_str() {
+            "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+            | "gpt-6-astra" => Some(2.0),
+            "gpt-5.5" => Some(2.5),
+            _ => None,
         }
+    }
 
-        // Handle nested model names like "anthropic.claude-sonnet-4.claude-sonnet-4-20250514"
-        if trimmed.contains("claude-")
-            && let Some(last_dot) = trimmed.rfind('.')
+    /// Fast-tier cost in USD for a model (upstream 0.48.0 C4).
+    ///
+    /// Computes the standard cost for the BASE model (stripping fast/priority
+    /// suffixes), then applies the Fast multiplier. Returns `None` when the
+    /// model has no Fast lane or when a model without Astra's published
+    /// long-context Fast rates exceeds the 272 000 threshold.
+    pub fn codex_fast_cost_usd(model: &str, input: u64, cached: u64, output: u64) -> Option<f64> {
+        let multiplier = Self::codex_api_fast_multiplier(model)?;
+        // Older models do not offer Fast for long-context requests. Astra
+        // publishes a Fast rate for the same whole-request long-context tier.
+        if input > codex_pricing::CODEX_LONG_CONTEXT_THRESHOLD
+            && !codex_pricing::codex_fast_allows_long_context(model)
         {
-            let tail = &trimmed[last_dot + 1..];
-            if tail.starts_with("claude-") {
-                trimmed = tail.to_string();
+            return None;
+        }
+        let base = Self::codex_fast_base_model(model);
+        let base_cost = Self::codex_cost_usd(&base, input, cached, output)?;
+        Some(base_cost * multiplier)
+    }
+
+    /// Calculate Codex cost using the rates in effect on a historical usage day.
+    /// GPT-5.6 Terra/Luna were cut on 2026-07-30; Sol was unchanged.
+    pub fn codex_cost_usd_at_date(
+        model: &str,
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        output_tokens: u64,
+        pricing_date: NaiveDate,
+    ) -> Option<f64> {
+        Self::codex_cost_usd_at_date_with_pricing_snapshot(
+            model,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            pricing_date,
+            None,
+        )
+    }
+
+    pub fn codex_cost_usd_at_date_with_pricing_snapshot(
+        model: &str,
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        output_tokens: u64,
+        pricing_date: NaiveDate,
+        pricing_snapshot: Option<&models_dev_pricing::ModelsDevPricingSnapshot>,
+    ) -> Option<f64> {
+        let key = Self::normalize_codex_model(model);
+        let cutoff = NaiveDate::from_ymd_opt(2026, 7, 30).expect("valid pricing cutoff");
+        if pricing_date < cutoff {
+            let long = input_tokens > codex_pricing::CODEX_LONG_CONTEXT_THRESHOLD;
+            let rates = match (key.as_str(), long) {
+                ("gpt-5.6-terra", false) => Some((2.5e-6, 2.5e-7, 1.5e-5)),
+                ("gpt-5.6-terra", true) => Some((5e-6, 5e-7, 2.25e-5)),
+                ("gpt-5.6-luna", false) => Some((1e-6, 1e-7, 6e-6)),
+                ("gpt-5.6-luna", true) => Some((2e-6, 2e-7, 9e-6)),
+                _ => None,
+            };
+            if let Some((input_rate, cache_rate, output_rate)) = rates {
+                return Some(codex_pricing::codex_cost_from_rates(
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                    input_rate,
+                    cache_rate,
+                    output_rate,
+                ));
             }
         }
+        Self::codex_cost_usd_with_pricing_snapshot(
+            model,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            pricing_snapshot,
+        )
+    }
 
-        // Remove version suffix like "-v1:0"
-        let version_pattern = regex_lite::Regex::new(r"-v\d+:\d+$").unwrap();
-        trimmed = version_pattern.replace(&trimmed, "").to_string();
-
-        // Try without date suffix if base exists in pricing
-        let date_pattern = regex_lite::Regex::new(r"-\d{8}$").unwrap();
-        if let Some(mat) = date_pattern.find(&trimmed) {
-            let base = &trimmed[..mat.start()];
-            if CLAUDE_PRICING.contains_key(base) {
-                return base.to_string();
-            }
+    pub fn codex_fast_cost_usd_at_date(
+        model: &str,
+        input: u64,
+        cached: u64,
+        output: u64,
+        pricing_date: NaiveDate,
+    ) -> Option<f64> {
+        let multiplier = Self::codex_api_fast_multiplier(model)?;
+        if input > codex_pricing::CODEX_LONG_CONTEXT_THRESHOLD
+            && !codex_pricing::codex_fast_allows_long_context(model)
+        {
+            return None;
         }
-
-        trimmed
+        let base = Self::codex_fast_base_model(model);
+        let base_cost = Self::codex_cost_usd_at_date(&base, input, cached, output, pricing_date)?;
+        Some(base_cost * multiplier)
     }
 
     /// Calculate cost for Codex usage in USD
@@ -555,66 +804,13 @@ impl CostUsagePricing {
         cached_input_tokens: u64,
         output_tokens: u64,
     ) -> Option<f64> {
-        let key = Self::normalize_codex_model(model);
-        let pricing = CODEX_PRICING.get(key.as_str())?;
-
-        let cached = cached_input_tokens.min(input_tokens);
-        let non_cached = input_tokens.saturating_sub(cached);
-
-        let cost = (non_cached as f64) * pricing.input_cost_per_token
-            + (cached as f64) * pricing.cache_read_input_cost_per_token
-            + (output_tokens as f64) * pricing.output_cost_per_token;
-
-        Some(cost)
-    }
-
-    /// Calculate cost for Claude usage in USD
-    pub fn claude_cost_usd(
-        model: &str,
-        input_tokens: i32,
-        cache_read_input_tokens: i32,
-        cache_creation_input_tokens: i32,
-        output_tokens: i32,
-    ) -> Option<f64> {
-        let key = Self::normalize_claude_model(model);
-        let pricing = CLAUDE_PRICING.get(key.as_str())?;
-
-        /// Calculate tiered cost
-        fn tiered(tokens: i32, base: f64, above: Option<f64>, threshold: Option<i32>) -> f64 {
-            let tokens = tokens.max(0);
-            match (threshold, above) {
-                (Some(thresh), Some(above_rate)) => {
-                    let below = tokens.min(thresh);
-                    let over = (tokens - thresh).max(0);
-                    (below as f64) * base + (over as f64) * above_rate
-                }
-                _ => (tokens as f64) * base,
-            }
-        }
-
-        let cost = tiered(
+        Self::codex_cost_usd_with_cache_write(
+            model,
             input_tokens,
-            pricing.input_cost_per_token,
-            pricing.input_cost_per_token_above_threshold,
-            pricing.threshold_tokens,
-        ) + tiered(
-            cache_read_input_tokens,
-            pricing.cache_read_input_cost_per_token,
-            pricing.cache_read_input_cost_per_token_above_threshold,
-            pricing.threshold_tokens,
-        ) + tiered(
-            cache_creation_input_tokens,
-            pricing.cache_creation_input_cost_per_token,
-            pricing.cache_creation_input_cost_per_token_above_threshold,
-            pricing.threshold_tokens,
-        ) + tiered(
+            cached_input_tokens,
+            0,
             output_tokens,
-            pricing.output_cost_per_token,
-            pricing.output_cost_per_token_above_threshold,
-            pricing.threshold_tokens,
-        );
-
-        Some(cost)
+        )
     }
 
     /// Format model name for display (e.g., "claude-3.5-sonnet" → "Sonnet 3.5")
@@ -667,136 +863,5 @@ impl CostUsagePricing {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_normalize_codex_model() {
-        assert_eq!(CostUsagePricing::normalize_codex_model("gpt-5"), "gpt-5");
-        assert_eq!(
-            CostUsagePricing::normalize_codex_model("openai/gpt-5"),
-            "gpt-5"
-        );
-        assert_eq!(
-            CostUsagePricing::normalize_codex_model("gpt-5-codex"),
-            "gpt-5"
-        );
-    }
-
-    #[test]
-    fn test_normalize_claude_model() {
-        assert_eq!(
-            CostUsagePricing::normalize_claude_model("claude-sonnet-4-5"),
-            "claude-sonnet-4-5"
-        );
-        assert_eq!(
-            CostUsagePricing::normalize_claude_model("anthropic.claude-sonnet-4-5"),
-            "claude-sonnet-4-5"
-        );
-    }
-
-    #[test]
-    fn test_codex_cost() {
-        let cost = CostUsagePricing::codex_cost_usd("gpt-5", 1000, 0, 500);
-        assert!(cost.is_some());
-        let cost = cost.unwrap();
-        // 1000 * 1.25e-6 + 500 * 1e-5 = 0.00125 + 0.005 = 0.00625
-        assert!((cost - 0.00625).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_claude_cost() {
-        let cost = CostUsagePricing::claude_cost_usd("claude-haiku-4-5-20251001", 1000, 0, 0, 500);
-        assert!(cost.is_some());
-    }
-
-    #[test]
-    fn test_format_model_name() {
-        assert_eq!(
-            CostUsagePricing::format_model_name("claude-3.5-sonnet"),
-            "Sonnet 3.5"
-        );
-        assert_eq!(
-            CostUsagePricing::format_model_name("claude-opus-4"),
-            "Opus 4"
-        );
-        assert_eq!(CostUsagePricing::format_model_name("gpt-5"), "GPT-5");
-    }
-
-    #[test]
-    fn test_gpt54_mini_cost() {
-        let cost = CostUsagePricing::codex_cost_usd("gpt-5.4-mini", 1000, 0, 500);
-        assert!(cost.is_some());
-        // 1000 * 7.5e-7 + 500 * 4.5e-6 = 0.00075 + 0.00225 = 0.003
-        assert!((cost.unwrap() - 0.003).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_gpt54_nano_cost() {
-        let cost = CostUsagePricing::codex_cost_usd("gpt-5.4-nano", 1000, 0, 500);
-        assert!(cost.is_some());
-        // 1000 * 2e-7 + 500 * 1.25e-6 = 0.0002 + 0.000625 = 0.000825
-        assert!((cost.unwrap() - 0.000825).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_normalize_gpt54_codex() {
-        assert_eq!(
-            CostUsagePricing::normalize_codex_model("gpt-5.4-mini-codex"),
-            "gpt-5.4-mini"
-        );
-    }
-
-    #[test]
-    fn test_gpt55_pricing() {
-        assert_eq!(
-            CostUsagePricing::normalize_codex_model("openai/gpt-5.5-2026-04-23"),
-            "gpt-5.5"
-        );
-        assert_eq!(
-            CostUsagePricing::normalize_codex_model("gpt-5.5-pro-2026-04-23"),
-            "gpt-5.5-pro"
-        );
-
-        let cost = CostUsagePricing::codex_cost_usd("gpt-5.5", 1000, 500, 500);
-        assert!(cost.is_some());
-        assert!((cost.unwrap() - 0.01775).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_format_gpt54_mini() {
-        assert_eq!(
-            CostUsagePricing::format_model_name("gpt-5.4-mini"),
-            "GPT-5.4 Mini"
-        );
-    }
-
-    #[test]
-    fn test_opus_4_7_cost() {
-        let cost = CostUsagePricing::claude_cost_usd("claude-opus-4-7", 1000, 0, 0, 500);
-        assert!(cost.is_some());
-    }
-
-    #[test]
-    fn test_sonnet_4_6_cost() {
-        let cost = CostUsagePricing::claude_cost_usd("claude-sonnet-4-6", 1000, 0, 0, 500);
-        assert!(cost.is_some());
-    }
-
-    #[test]
-    fn test_gpt5_pro_cost() {
-        let cost = CostUsagePricing::codex_cost_usd("gpt-5-pro", 1000, 0, 500);
-        assert!(cost.is_some());
-        // 1000 * 1.5e-5 + 500 * 1.2e-4 = 0.015 + 0.06 = 0.075
-        assert!((cost.unwrap() - 0.075).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_codex_display_label() {
-        assert_eq!(
-            CostUsagePricing::codex_display_label("gpt-5.3-codex-spark"),
-            Some("Research Preview")
-        );
-        assert_eq!(CostUsagePricing::codex_display_label("gpt-5.4"), None);
-    }
-}
+#[path = "cost_pricing_tests.rs"]
+mod tests;

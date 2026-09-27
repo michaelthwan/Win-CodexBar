@@ -7,6 +7,7 @@ use crate::surface::SurfaceMode;
 use crate::surface_target::SurfaceTarget;
 
 pub(crate) mod dwm;
+pub mod flyout_window;
 mod geometry;
 mod position;
 pub mod settings_window;
@@ -16,16 +17,10 @@ mod window;
 #[cfg(test)]
 mod tests;
 
-#[allow(unused_imports)]
-pub use position::{
-    default_surface_position, inferred_tray_panel_position, remember_current_geometry_if_settings,
-    shortcut_panel_position, tray_panel_position,
-};
-pub use transition::{reopen_to_target, toggle_tray_panel, transition_to_target};
-#[allow(unused_imports)]
-pub use window::{
-    apply_window_properties, hide_to_tray, hide_to_tray_if_current, hide_to_tray_state,
-};
+pub(crate) use position::inferred_tray_panel_position_for_monitor_size;
+pub use position::{remember_current_geometry_if_eligible, tray_panel_position};
+pub use transition::{reopen_to_target, transition_to_target};
+pub use window::hide_to_tray_if_current;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellTransitionRequest {

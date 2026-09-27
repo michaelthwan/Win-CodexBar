@@ -28,6 +28,8 @@ debug_*.swift
 
 # Debug/analysis docs
 docs/*-analysis.md
+# Spec/plan scratch under docs (not product docs)
+docs/superpowers/
 
 # Swift Package Manager metadata (leave sources tracked)
 # Packages/
@@ -37,9 +39,9 @@ docs/*-analysis.md
 rust/target/
 target/
 
-# Host-specific Tauri schemas generated during local desktop checks
-apps/desktop-tauri/src-tauri/gen/schemas/macOS-schema.json
-apps/desktop-tauri/src-tauri/gen/schemas/windows-schema.json
+# Generated Tauri schemas from local desktop checks
+apps/desktop-tauri/src-tauri/gen/schemas/*.json
+rust/gen/schemas/*.json
 
 # Claude temp files
 tmpclaude-*
@@ -60,8 +62,15 @@ nul
 .env
 .env.*
 /.local/
-/docs/
+# Docs children ignored generally; ADRs are product docs and stay trackable
+/docs/*
+!/docs/adr/
+/docs/adr/*
+!/docs/adr/*.md
 /scripts/*
+!/scripts/win-config-tools/
+/scripts/win-config-tools/**/__pycache__/
+/scripts/win-config-tools/**/*.pyc
 /docs/ui-parity-workflow.md
 /scripts/crop_vm_preferences_proof.sh
 /scripts/fetch_vm_preferences_proof.sh
@@ -102,3 +111,27 @@ codexbar-desktop-tauri.exe
 
 # Local git worktrees
 .worktrees/
+.atl/
+
+# --- Local proof-run / CI debris (untracked, keep off disk-tracking) ---
+window-state-cua-*.json
+cua-*.png
+issue241-*.png
+proof-*.png
+proof-abc-*.py
+codexbar-proof-*/
+proof-*/
+.ai-bridge/
+.freebuff/
+.zcode/
+.review/
+manifests/
+.circleci/info.yml
+target-port054/
+final-port054/
+build.log
+build-output.log
+clippy_*.txt
+fmt_*.txt
+rust_test*.txt
+tauri_test*.txt

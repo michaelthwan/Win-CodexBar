@@ -2,11 +2,12 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 use codexbar::core::{
-    FetchContext, ProviderAccountData, ProviderFetchResult, ProviderId, ProviderMetadata,
-    RateWindow, SourceMode, TokenAccount, TokenAccountOverride, TokenAccountStore,
-    instantiate_provider,
+    FetchContext, ManualEmptyCookiePolicy, ProviderAccountData, ProviderFetchResult, ProviderId,
+    ProviderMetadata, RateWindow, SourceMode, TokenAccount, TokenAccountOverride,
+    TokenAccountStore, instantiate_provider,
 };
 use codexbar::locale;
+use codexbar::login::{self, LoginOutcome, LoginPhase};
 use codexbar::providers::copilot::{CopilotApi, device_flow::CopilotDeviceFlow};
 use codexbar::secure_file::{self, SecureFileStatus};
 use codexbar::settings::{
@@ -18,49 +19,70 @@ use std::collections::HashMap;
 use tauri::{Emitter, Manager};
 
 use crate::events;
-use crate::proof_harness::{self, ProofCommand, ProofStatePayload};
 use crate::state::AppState;
 use crate::surface::SurfaceMode;
 use crate::surface_target::SurfaceTarget;
 
 mod chart;
-mod diagnostics;
+mod spend_contract;
 mod tokens;
 mod updater;
+mod usage_spend;
 
+mod agent_sessions;
 mod bridge;
 mod browser_import;
+mod claude_accounts;
+pub(crate) mod claude_reconciliation;
+mod codex_accounts;
+mod codex_workspaces;
 mod credential_detection;
 mod credentials;
+mod diagnostics;
+mod grok_accounts;
 mod locale_cmd;
 mod provider_detail;
+mod provider_refresh;
 mod provider_settings;
 mod providers;
 mod settings;
 mod shortcuts;
 mod surface;
 mod system;
+mod usage_items;
+mod warning_identity;
 
+pub use agent_sessions::*;
 pub(crate) use bridge::*;
 pub use browser_import::*;
+pub use claude_accounts::*;
+pub use codex_accounts::*;
+pub use codex_workspaces::*;
 pub use credential_detection::*;
 pub use credentials::*;
+pub use diagnostics::*;
+pub use grok_accounts::*;
 pub use locale_cmd::*;
 pub use provider_detail::*;
+#[cfg(test)]
+pub(crate) use provider_refresh::is_provider_cache_fresh;
+pub(crate) use provider_refresh::{ProviderRefreshOutcome, ProviderRefreshSkipReason};
 pub use provider_settings::*;
 pub use providers::*;
 pub use settings::*;
 pub use shortcuts::*;
 pub use surface::*;
 pub use system::*;
+pub(crate) use usage_items::*;
 
 #[cfg(test)]
 mod tests;
 
 pub use chart::*;
-pub use diagnostics::*;
+pub use spend_contract::*;
 pub use tokens::*;
 pub use updater::*;
+pub use usage_spend::*;
 
 const PROVIDER_CACHE_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_API_KEY_LEN: usize = 16 * 1024;

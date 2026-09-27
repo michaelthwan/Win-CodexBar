@@ -146,6 +146,7 @@ if ((Test-Path $changelogPath) -and (Select-String -Path $changelogPath -Pattern
 if (Test-Path $AssetsDir) {
     Test-AssetHash (Join-Path $AssetsDir "CodexBar-$Version-Setup.exe")
     Test-AssetHash (Join-Path $AssetsDir "CodexBar-$Version-portable.exe")
+    Test-AssetHash (Join-Path $AssetsDir "CodexBarCLI-v$Version-windows-x64.zip")
 } else {
     Write-Warn "local assets directory not found: $AssetsDir"
 }
@@ -157,7 +158,10 @@ if (-not $SkipGitHub) {
         try {
             $ghJsonPath = Join-Path $env:TEMP "win-codexbar-release-doctor-gh.json"
             $ghErrPath = Join-Path $env:TEMP "win-codexbar-release-doctor-gh.err"
-            & $gh.Source release view $tag --json assets,url 1>$ghJsonPath 2>$ghErrPath
+            $repoFlag = @()
+            $originUrl = (& $git.Source config --get remote.origin.url 2>$null)
+            if ($originUrl) { $repoFlag = @("-R", ($originUrl -replace '^https://github\.com/','' -replace '\.git$','' -replace '^git@github\.com:','')) }
+            & $gh.Source release view $tag @repoFlag --json assets,url 1>$ghJsonPath 2>$ghErrPath
             if ($LASTEXITCODE -eq 0) {
                 $release = Get-Content -Raw $ghJsonPath | ConvertFrom-Json
                 Write-Ok "GitHub release exists: $($release.url)"
@@ -166,7 +170,9 @@ if (-not $SkipGitHub) {
                     "CodexBar-$Version-Setup.exe",
                     "CodexBar-$Version-Setup.exe.sha256",
                     "CodexBar-$Version-portable.exe",
-                    "CodexBar-$Version-portable.exe.sha256"
+                    "CodexBar-$Version-portable.exe.sha256",
+                    "CodexBarCLI-v$Version-windows-x64.zip",
+                    "CodexBarCLI-v$Version-windows-x64.zip.sha256"
                 )) {
                     if ($assetNames -contains $name) {
                         Write-Ok "GitHub release has $name"

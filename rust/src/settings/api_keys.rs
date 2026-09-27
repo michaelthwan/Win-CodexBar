@@ -15,6 +15,10 @@ pub struct ApiKeyEntry {
     /// Optional label for the key (e.g., "Personal", "Work")
     #[serde(default)]
     pub label: Option<String>,
+    /// Azure OpenAI API-version override kept alongside the credential.
+    /// `None` inherits `AZURE_OPENAI_API_VERSION` and the provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
 }
 
 impl ApiKeys {
@@ -57,14 +61,37 @@ impl ApiKeys {
     /// Set API key for a provider
     pub fn set(&mut self, provider_id: &str, api_key: &str, label: Option<&str>) {
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M").to_string();
+        let api_version = self
+            .keys
+            .get(provider_id)
+            .and_then(|entry| entry.api_version.clone());
         self.keys.insert(
             provider_id.to_string(),
             ApiKeyEntry {
                 api_key: api_key.to_string(),
                 saved_at: now,
                 label: label.map(|s| s.to_string()),
+                api_version,
             },
         );
+    }
+
+    /// Get a provider-specific API-version override, if one is stored.
+    pub fn api_version(&self, provider_id: &str) -> Option<&str> {
+        self.keys
+            .get(provider_id)
+            .and_then(|entry| entry.api_version.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    /// Store or clear a provider-specific API-version override.
+    pub fn set_api_version(&mut self, provider_id: &str, api_version: Option<String>) {
+        if let Some(entry) = self.keys.get_mut(provider_id) {
+            entry.api_version = api_version
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+        }
     }
 
     /// Remove API key for a provider
@@ -89,18 +116,7 @@ impl ApiKeys {
                     .map(|p| p.display_name().to_string())
                     .unwrap_or_else(|| id.clone());
 
-                // Mask the key for display (show first 4 and last 4 chars)
-                let masked = if entry.api_key.len() > 12 {
-                    format!(
-                        "{}...{}",
-                        &entry.api_key[..4],
-                        &entry.api_key[entry.api_key.len() - 4..]
-                    )
-                } else if entry.api_key.len() > 4 {
-                    format!("{}...", &entry.api_key[..4])
-                } else {
-                    "****".to_string()
-                };
+                let masked = mask_api_key(&entry.api_key);
 
                 SavedApiKeyInfo {
                     provider_id: id.clone(),
@@ -111,6 +127,20 @@ impl ApiKeys {
                 }
             })
             .collect()
+    }
+}
+
+fn mask_api_key(api_key: &str) -> String {
+    let chars: Vec<char> = api_key.chars().collect();
+    if chars.len() > 12 {
+        let prefix: String = chars.iter().take(4).collect();
+        let suffix: String = chars.iter().skip(chars.len() - 4).collect();
+        format!("{prefix}...{suffix}")
+    } else if chars.len() > 4 {
+        let prefix: String = chars.iter().take(4).collect();
+        format!("{prefix}...")
+    } else {
+        "****".to_string()
     }
 }
 
@@ -160,15 +190,6 @@ pub fn get_api_key_providers() -> Vec<ProviderConfigInfo> {
             dashboard_url: Some("https://sourcegraph.com/cody/manage"),
         },
         ProviderConfigInfo {
-            id: ProviderId::Synthetic,
-            name: "Synthetic",
-            requires_api_key: true,
-            api_key_env_var: Some("SYNTHETIC_API_KEY"),
-            api_key_help: Some("Get your API key from Synthetic → Account → API Keys"),
-            config_file_path: Some("~/.synthetic/config.json"),
-            dashboard_url: Some("https://synthetic.computer/account"),
-        },
-        ProviderConfigInfo {
             id: ProviderId::Copilot,
             name: "GitHub Copilot (legacy token)",
             requires_api_key: true,
@@ -183,10 +204,12 @@ pub fn get_api_key_providers() -> Vec<ProviderConfigInfo> {
             id: ProviderId::Zai,
             name: "z.ai",
             requires_api_key: true,
-            api_key_env_var: Some("ZAI_API_TOKEN"),
-            api_key_help: Some("Get your API token from z.ai Dashboard → Settings"),
+            api_key_env_var: Some("Z_AI_API_KEY or ZAI_API_TOKEN"),
+            api_key_help: Some(
+                "Get your API token from z.ai Dashboard. BigModel team usage can set Z_AI_BIGMODEL_ORGANIZATION + Z_AI_BIGMODEL_PROJECT, or provider workspace_id as organization|project.",
+            ),
             config_file_path: None,
-            dashboard_url: Some("https://z.ai/dashboard"),
+            dashboard_url: Some("https://z.ai/manage-apikey/coding-plan/personal/my-plan"),
         },
         ProviderConfigInfo {
             id: ProviderId::Warp,
@@ -209,6 +232,19 @@ pub fn get_api_key_providers() -> Vec<ProviderConfigInfo> {
             ),
             config_file_path: None,
             dashboard_url: Some("https://ollama.com/settings"),
+        },
+        ProviderConfigInfo {
+            id: ProviderId::MiniMax,
+            name: "MiniMax",
+            requires_api_key: false,
+            api_key_env_var: Some("MINIMAX_API_KEY"),
+            api_key_help: Some(
+                "Optional: a MiniMax API key reads real coding-plan quota via the console's remains API, bypassing the client-rendered usage/plan pages that browser cookies alone cannot scrape.",
+            ),
+            config_file_path: None,
+            dashboard_url: Some(
+                "https://platform.minimax.io/user-center/basic-information/interface-key",
+            ),
         },
         ProviderConfigInfo {
             id: ProviderId::AzureOpenAI,
@@ -251,11 +287,22 @@ pub fn get_api_key_providers() -> Vec<ProviderConfigInfo> {
             dashboard_url: Some("https://cloud.infini-ai.com"),
         },
         ProviderConfigInfo {
+            id: ProviderId::Kimi,
+            name: "Kimi Code API",
+            requires_api_key: true,
+            api_key_env_var: Some("KIMI_CODE_API_KEY"),
+            api_key_help: Some(
+                "Get your Kimi Code API key from Kimi. Optional HTTPS proxy base URL: KIMI_CODE_BASE_URL.",
+            ),
+            config_file_path: None,
+            dashboard_url: Some("https://platform.moonshot.cn/console/api-keys"),
+        },
+        ProviderConfigInfo {
             id: ProviderId::Kilo,
             name: "Kilo",
             requires_api_key: true,
             api_key_env_var: Some("KILO_API_KEY"),
-            api_key_help: Some("Get your API key from Kilo, or sign in with Kilo CLI."),
+            api_key_help: Some("Get your API key from Kilo, or run `kilo auth login`."),
             config_file_path: Some("~/.local/share/kilo/auth.json"),
             dashboard_url: Some("https://app.kilo.ai/usage"),
         },
@@ -293,11 +340,102 @@ pub fn get_api_key_providers() -> Vec<ProviderConfigInfo> {
             dashboard_url: Some("https://platform.deepseek.com/usage"),
         },
         ProviderConfigInfo {
+            id: ProviderId::DeepInfra,
+            name: "DeepInfra",
+            requires_api_key: true,
+            api_key_env_var: Some("DEEPINFRA_API_KEY"),
+            api_key_help: Some(
+                "Get your API key from deepinfra.com/dash. Also accepts DEEPINFRA_TOKEN.",
+            ),
+            config_file_path: None,
+            dashboard_url: Some("https://deepinfra.com/dash"),
+        },
+        ProviderConfigInfo {
+            id: ProviderId::HuggingFace,
+            name: "Hugging Face",
+            requires_api_key: true,
+            api_key_env_var: Some(
+                "CODEXBAR_HUGGINGFACE_API_KEY / HF_TOKEN / HUGGING_FACE_HUB_TOKEN",
+            ),
+            api_key_help: Some(
+                "Add a Hugging Face access token here, set HF_TOKEN, or run `hf auth login`.",
+            ),
+            config_file_path: None,
+            dashboard_url: Some("https://huggingface.co/settings/billing"),
+        },
+        ProviderConfigInfo {
+            id: ProviderId::V0,
+            name: "v0",
+            requires_api_key: true,
+            api_key_env_var: Some("V0_API_KEY"),
+            api_key_help: Some(
+                "Add a v0 Platform API key. An optional scope can use the provider workspace field or V0_SCOPE.",
+            ),
+            config_file_path: None,
+            dashboard_url: Some("https://v0.app/chat/settings/billing"),
+        },
+        ProviderConfigInfo {
+            id: ProviderId::Fireworks,
+            name: "Fireworks",
+            requires_api_key: true,
+            api_key_env_var: Some("FIREWORKS_API_KEY"),
+            api_key_help: Some(
+                "Get your API key from app.fireworks.ai. Also set the account slug from \
+                 app.fireworks.ai/accounts/<slug> (FIREWORKS_ACCOUNT_SLUG).",
+            ),
+            config_file_path: None,
+            dashboard_url: Some("https://app.fireworks.ai"),
+        },
+        ProviderConfigInfo {
+            id: ProviderId::AiAnd,
+            name: "ai&",
+            requires_api_key: true,
+            api_key_env_var: Some("AIAND_API_KEY"),
+            api_key_help: Some("Get your API key from console.aiand.com."),
+            config_file_path: None,
+            dashboard_url: Some("https://console.aiand.com"),
+        },
+        ProviderConfigInfo {
+            id: ProviderId::ZenMux,
+            name: "ZenMux",
+            requires_api_key: true,
+            api_key_env_var: Some("ZENMUX_MANAGEMENT_API_KEY"),
+            api_key_help: Some(
+                "Use a ZenMux Management API key (not an inference key). Also accepts ZENMUX_API_KEY.",
+            ),
+            config_file_path: None,
+            dashboard_url: Some("https://zenmux.ai/platform/management"),
+        },
+        ProviderConfigInfo {
+            id: ProviderId::ClinePass,
+            name: "ClinePass",
+            requires_api_key: true,
+            api_key_env_var: Some("CLINEPASS_API_KEY"),
+            api_key_help: Some(
+                "Get your API key from Cline / ClinePass. Also accepts CLINE_API_KEY.",
+            ),
+            config_file_path: None,
+            dashboard_url: Some("https://app.cline.bot/dashboard/subscription?personal=true"),
+        },
+        ProviderConfigInfo {
+            id: ProviderId::Neuralwatt,
+            name: "Neuralwatt",
+            requires_api_key: true,
+            api_key_env_var: Some("NEURALWATT_API_KEY"),
+            api_key_help: Some("Get your API key from portal.neuralwatt.com."),
+            config_file_path: None,
+            dashboard_url: Some("https://portal.neuralwatt.com/dashboard"),
+        },
+        ProviderConfigInfo {
             id: ProviderId::Doubao,
             name: "Doubao / Volcengine Ark",
             requires_api_key: true,
-            api_key_env_var: Some("ARK_API_KEY"),
-            api_key_help: Some("Get your API key from Volcengine Ark."),
+            api_key_env_var: Some(
+                "ARK_API_KEY or VOLCENGINE_ACCESS_KEY_ID + VOLCENGINE_SECRET_ACCESS_KEY",
+            ),
+            api_key_help: Some(
+                "Use ARK_API_KEY for chat probe fallback, or paste Coding Plan credentials as access_key|secret_key|region (region defaults to cn-beijing).",
+            ),
             config_file_path: None,
             dashboard_url: Some("https://console.volcengine.com/ark/region:ark+cn-beijing/usage"),
         },
@@ -349,6 +487,17 @@ pub fn get_api_key_providers() -> Vec<ProviderConfigInfo> {
             dashboard_url: Some("https://grok.com/settings/subscription"),
         },
         ProviderConfigInfo {
+            id: ProviderId::Xai,
+            name: "xAI",
+            requires_api_key: true,
+            api_key_env_var: Some("XAI_MANAGEMENT_API_KEY"),
+            api_key_help: Some(
+                "Create a Management API key at console.x.ai under Settings > Management Keys (inference keys are rejected). Team ID goes in provider workspace settings or XAI_TEAM_ID.",
+            ),
+            config_file_path: Some("~/.codexbar/config.json"),
+            dashboard_url: Some("https://console.x.ai"),
+        },
+        ProviderConfigInfo {
             id: ProviderId::ElevenLabs,
             name: "ElevenLabs",
             requires_api_key: true,
@@ -384,5 +533,126 @@ pub fn get_api_key_providers() -> Vec<ProviderConfigInfo> {
             config_file_path: None,
             dashboard_url: None,
         },
+        ProviderConfigInfo {
+            id: ProviderId::Chutes,
+            name: "Chutes",
+            requires_api_key: true,
+            api_key_env_var: Some("CHUTES_API_KEY"),
+            api_key_help: Some(
+                "Paste a Chutes API key. Optional API URL override: CHUTES_API_URL.",
+            ),
+            config_file_path: None,
+            dashboard_url: Some("https://chutes.ai"),
+        },
+        ProviderConfigInfo {
+            id: ProviderId::LiteLLM,
+            name: "LiteLLM",
+            requires_api_key: true,
+            api_key_env_var: Some("LITELLM_API_KEY + LITELLM_BASE_URL"),
+            api_key_help: Some(
+                "Paste a LiteLLM key and set the base URL in provider extras or LITELLM_BASE_URL.",
+            ),
+            config_file_path: None,
+            dashboard_url: None,
+        },
+        ProviderConfigInfo {
+            id: ProviderId::Poe,
+            name: "Poe",
+            requires_api_key: true,
+            api_key_env_var: Some("POE_API_KEY"),
+            api_key_help: Some("Get your API key from Poe API settings."),
+            config_file_path: None,
+            dashboard_url: Some("https://poe.com/settings/subscription"),
+        },
+        ProviderConfigInfo {
+            id: ProviderId::Devin,
+            name: "Devin",
+            requires_api_key: true,
+            api_key_env_var: Some("DEVIN_BEARER_TOKEN + DEVIN_ORG"),
+            api_key_help: Some(
+                "Paste a Devin bearer token and set the organization in provider extras or DEVIN_ORG.",
+            ),
+            config_file_path: None,
+            dashboard_url: Some("https://app.devin.ai/settings/billing"),
+        },
+        ProviderConfigInfo {
+            id: ProviderId::Zed,
+            name: "Zed",
+            requires_api_key: true,
+            api_key_env_var: Some("ZED_CREDENTIALS"),
+            api_key_help: Some(
+                "Paste Zed credentials as `user_id access_token`; optional API URL in provider extras.",
+            ),
+            config_file_path: Some("~/.config/zed/settings.json"),
+            dashboard_url: Some("https://zed.dev/account"),
+        },
+        ProviderConfigInfo {
+            id: ProviderId::CrossModel,
+            name: "CrossModel",
+            requires_api_key: true,
+            api_key_env_var: Some("CROSSMODEL_API_KEY"),
+            api_key_help: Some(
+                "Paste a CrossModel API key. Optional API URL override: CROSSMODEL_API_URL.",
+            ),
+            config_file_path: None,
+            dashboard_url: Some("https://crossmodel.ai"),
+        },
+        ProviderConfigInfo {
+            id: ProviderId::Sub2Api,
+            name: "sub2api",
+            requires_api_key: true,
+            api_key_env_var: Some("SUB2API_API_KEY"),
+            api_key_help: Some(
+                "Paste a group API key and set the base URL in provider extras or SUB2API_BASE_URL. HTTPS required (loopback HTTP allowed for local dev).",
+            ),
+            config_file_path: None,
+            dashboard_url: None,
+        },
+        ProviderConfigInfo {
+            id: ProviderId::Factory,
+            name: "Droid (Factory)",
+            requires_api_key: true,
+            api_key_env_var: Some("FACTORY_API_KEY"),
+            api_key_help: Some(
+                "Get your API key from Factory → Settings → API Keys. Optional fallback: %USERPROFILE%\\.factory\\.env. Auto mode tries the key first, then browser cookies.",
+            ),
+            config_file_path: Some("%USERPROFILE%\\.factory\\.env"),
+            dashboard_url: Some("https://app.factory.ai/settings/api-keys"),
+        },
+        ProviderConfigInfo {
+            id: ProviderId::Meta,
+            name: "Meta",
+            requires_api_key: true,
+            api_key_env_var: Some("MODEL_API_KEY / META_API_KEY"),
+            api_key_help: Some("Create key in Meta Model API dashboard"),
+            config_file_path: None,
+            dashboard_url: Some("https://dev.meta.ai/docs"),
+        },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiKeys;
+
+    #[test]
+    fn api_version_survives_api_key_update() {
+        let mut keys = ApiKeys::default();
+        keys.set("azureopenai", "key", Some("work"));
+        keys.set_api_version("azureopenai", Some("v1".to_string()));
+        keys.set("azureopenai", "new-key", None);
+
+        assert_eq!(keys.get("azureopenai"), Some("new-key"));
+        assert_eq!(keys.api_version("azureopenai"), Some("v1"));
+    }
+
+    #[test]
+    fn clearing_api_version_removes_the_override() {
+        let mut keys = ApiKeys::default();
+        keys.set("azureopenai", "key", None);
+        keys.set_api_version("azureopenai", Some("2025-01-01".to_string()));
+        keys.set_api_version("azureopenai", None);
+
+        assert_eq!(keys.api_version("azureopenai"), None);
+    }
 }

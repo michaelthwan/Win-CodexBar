@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::watch;
 
-const GITHUB_REPO: &str = "Finesssee/Win-CodexBar";
+const GITHUB_REPO: &str = "nesszer/Win-CodexBar";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// State of the update download process
@@ -37,9 +37,15 @@ pub struct UpdateInfo {
     pub version: String,
     pub download_url: String,
     pub expected_sha256: Option<String>,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "update metadata fields are deserialized for version comparison but not all are read"
+    )]
     pub release_url: String,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "update metadata fields are deserialized for version comparison but not all are read"
+    )]
     pub release_notes: String,
     pub delivery: UpdateDelivery,
 }
@@ -63,7 +69,10 @@ struct GitHubRelease {
     #[serde(default)]
     draft: bool,
     #[serde(default)]
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "update metadata fields are deserialized for version comparison but not all are read"
+    )]
     prerelease: bool,
 }
 
@@ -79,7 +88,10 @@ struct GitHubAsset {
 ///
 /// When `channel` is `UpdateChannel::Beta`, includes pre-release versions.
 /// When `channel` is `UpdateChannel::Stable`, only considers stable releases.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "update check response fields are deserialized for parsing but not all are read"
+)]
 pub async fn check_for_updates() -> Option<UpdateInfo> {
     check_for_updates_with_channel(UpdateChannel::Stable).await
 }
@@ -106,7 +118,7 @@ fn release_url(channel: UpdateChannel) -> String {
 }
 
 fn update_client() -> Option<reqwest::Client> {
-    reqwest::Client::builder()
+    crate::core::apply_app_proxy(reqwest::Client::builder())
         .user_agent("CodexBar")
         .build()
         .ok()
@@ -230,7 +242,10 @@ fn is_newer_version(remote: &str, current: &str) -> bool {
 }
 
 /// Get the current version
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "update info struct reserved for future UI integration"
+)]
 pub fn current_version() -> &'static str {
     CURRENT_VERSION
 }
@@ -255,8 +270,8 @@ pub async fn download_update(
     write_download_response(response, &file_path, &progress_tx).await?;
     verify_download_hash(&file_path, expected_update_sha256(update_info)?).await?;
 
-    // Signal download complete
-    let _ = progress_tx.send(UpdateState::Ready(file_path.clone()));
+    // Signal download complete; the receiver may be gone, which is fine.
+    let _ready_signal = progress_tx.send(UpdateState::Ready(file_path.clone()));
 
     Ok(file_path)
 }
@@ -295,7 +310,7 @@ fn expected_update_sha256(update_info: &UpdateInfo) -> Result<&str, String> {
 }
 
 fn update_http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+    crate::core::apply_app_proxy(reqwest::Client::builder())
         .user_agent("CodexBar")
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))
@@ -359,14 +374,16 @@ fn send_download_progress(
         0.0
     };
 
-    let _ = progress_tx.send(UpdateState::Downloading(progress));
+    // Best-effort progress update; a dropped receiver is fine.
+    let _progress_update = progress_tx.send(UpdateState::Downloading(progress));
 }
 
 /// Verify the SHA256 hash of a downloaded file against release metadata.
 async fn verify_download_hash(file_path: &PathBuf, expected_hash: &str) -> Result<(), String> {
     let actual = sha256_file_async(file_path).await?;
     if let Err(e) = verify_sha256_hex(&actual, expected_hash) {
-        let _ = std::fs::remove_file(file_path);
+        // Best-effort cleanup of the corrupt download; the hash error is returned regardless.
+        let _removed = std::fs::remove_file(file_path);
         return Err(e);
     }
 
@@ -419,7 +436,10 @@ fn sha256_file(file_path: &Path) -> Result<String, String> {
 /// Start background download of an update
 ///
 /// Returns a receiver that can be polled for progress updates.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "update info struct reserved for future UI integration"
+)]
 pub fn start_background_download(
     update_info: UpdateInfo,
 ) -> (
@@ -437,7 +457,8 @@ pub fn start_background_download(
                     // UpdateState::Ready is already sent by download_update
                 }
                 Err(e) => {
-                    let _ = tx.send(UpdateState::Failed(e));
+                    // Best-effort failure signal; the receiver may already be gone.
+                    let _failure_signal = tx.send(UpdateState::Failed(e));
                 }
             }
         });
@@ -454,8 +475,6 @@ pub fn start_background_download(
 ///
 /// The installer should handle upgrading the application while it's closed.
 pub fn apply_update(installer_path: &PathBuf) -> Result<(), String> {
-    use std::process::Command;
-
     // Verify the file exists
     if !installer_path.exists() {
         return Err(format!("Installer not found: {:?}", installer_path));
@@ -472,19 +491,19 @@ pub fn apply_update(installer_path: &PathBuf) -> Result<(), String> {
         );
     }
 
-    // Spawn the installer process
-    // Using /SILENT for NSIS-style installers, or /quiet for MSI
-    // The installer should detect the running app and wait or prompt
     #[cfg(target_os = "windows")]
-    {
-        Command::new(installer_path)
-            .args(["/SILENT", "/CLOSEAPPLICATIONS"])
-            .spawn()
-            .map_err(|e| format!("Failed to launch installer: {}", e))?;
-    }
+    spawn_windows_installer(
+        installer_path,
+        &windows_update_relaunch_path(
+            &std::env::current_exe()
+                .map_err(|e| format!("Failed to determine current executable for restart: {e}"))?,
+        ),
+    )?;
 
     #[cfg(not(target_os = "windows"))]
     {
+        use std::process::Command;
+
         Command::new(installer_path)
             .spawn()
             .map_err(|e| format!("Failed to launch installer: {}", e))?;
@@ -494,8 +513,136 @@ pub fn apply_update(installer_path: &PathBuf) -> Result<(), String> {
     std::process::exit(0);
 }
 
+#[cfg(target_os = "windows")]
+fn windows_update_relaunch_path(current_exe: &Path) -> PathBuf {
+    let file_name = current_exe.file_name().and_then(|name| name.to_str());
+    if file_name.is_some_and(|name| name.eq_ignore_ascii_case("codexbar-desktop.exe"))
+        && let Some(primary_desktop_exe) = current_exe
+            .parent()
+            .map(|dir| dir.join("codexbar.exe"))
+            .filter(|path| path.exists())
+    {
+        return primary_desktop_exe;
+    }
+
+    current_exe.to_path_buf()
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_windows_installer(installer_path: &Path, relaunch_path: &Path) -> Result<(), String> {
+    use std::process::Command;
+
+    let plan = windows_installer_launch_plan(installer_path)?;
+    Command::new(windows_powershell_path())
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &windows_installer_apply_script(&plan, std::process::id(), relaunch_path),
+        ])
+        .spawn()
+        .map_err(|e| format!("Failed to launch installer: {}", e))?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsInstallerLaunchPlan {
+    program: PathBuf,
+    args: Vec<std::ffi::OsString>,
+}
+
+#[cfg(target_os = "windows")]
+fn windows_installer_launch_plan(
+    installer_path: &Path,
+) -> Result<WindowsInstallerLaunchPlan, String> {
+    let extension = installer_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if extension == "msi" {
+        return Ok(WindowsInstallerLaunchPlan {
+            program: PathBuf::from("msiexec.exe"),
+            args: vec![
+                std::ffi::OsString::from("/i"),
+                installer_path.as_os_str().to_os_string(),
+                std::ffi::OsString::from("/quiet"),
+                std::ffi::OsString::from("/norestart"),
+            ],
+        });
+    }
+
+    // CodexBar release setup executables are built by rust/installer/codexbar.iss
+    // (Inno Setup). Silent installs skip the installer's postinstall [Run]
+    // entry, so the update helper relaunches CodexBar after setup exits.
+    Ok(WindowsInstallerLaunchPlan {
+        program: installer_path.to_path_buf(),
+        args: vec![
+            std::ffi::OsString::from("/SILENT"),
+            std::ffi::OsString::from("/SUPPRESSMSGBOXES"),
+            std::ffi::OsString::from("/CLOSEAPPLICATIONS"),
+            std::ffi::OsString::from("/NORESTART"),
+        ],
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_installer_apply_script(
+    plan: &WindowsInstallerLaunchPlan,
+    current_pid: u32,
+    relaunch_path: &Path,
+) -> String {
+    format!(
+        "Wait-Process -Id {current_pid} -ErrorAction SilentlyContinue; \
+         $p = Start-Process -FilePath {} -ArgumentList {} -PassThru -Wait; \
+         if ($p.ExitCode -eq 0 -and (Test-Path {})) {{ \
+           Start-Process -FilePath {} -ArgumentList @('menubar') \
+         }}",
+        powershell_single_quoted(&plan.program.to_string_lossy()),
+        powershell_argument_list(&plan.args),
+        powershell_single_quoted(&relaunch_path.to_string_lossy()),
+        powershell_single_quoted(&relaunch_path.to_string_lossy()),
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn powershell_argument_list(args: &[std::ffi::OsString]) -> String {
+    let args = args
+        .iter()
+        .map(|arg| powershell_single_quoted(&arg.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("@({args})")
+}
+
+#[cfg(target_os = "windows")]
+fn powershell_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_powershell_path() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .map(|root| {
+            root.join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        })
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from("powershell.exe"))
+}
+
 /// Check if there's a pending update ready to install
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "update info struct reserved for future UI integration"
+)]
 pub fn get_pending_update() -> Option<PathBuf> {
     let download_dir = get_download_dir()?;
 
@@ -537,10 +684,13 @@ fn find_pending_installer_in_dir(download_dir: &Path) -> Option<PathBuf> {
 }
 
 /// Clean up downloaded updates
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "update info struct reserved for future UI integration"
+)]
 pub fn cleanup_downloads() {
     if let Some(download_dir) = get_download_dir() {
-        let _ = std::fs::remove_dir_all(&download_dir);
+        let _cleaned = std::fs::remove_dir_all(&download_dir);
     }
 }
 
@@ -562,7 +712,7 @@ mod tests {
     fn prefers_installer_asset_for_auto_update() {
         let release = GitHubRelease {
             tag_name: "v1.2.6".to_string(),
-            html_url: "https://github.com/Finesssee/Win-CodexBar/releases/tag/v1.2.6".to_string(),
+            html_url: "https://github.com/nesszer/Win-CodexBar/releases/tag/v1.2.6".to_string(),
             body: None,
             assets: vec![
                 GitHubAsset {
@@ -598,7 +748,7 @@ mod tests {
     fn falls_back_to_manual_release_when_only_portable_exe_exists() {
         let release = GitHubRelease {
             tag_name: "v1.2.6".to_string(),
-            html_url: "https://github.com/Finesssee/Win-CodexBar/releases/tag/v1.2.6".to_string(),
+            html_url: "https://github.com/nesszer/Win-CodexBar/releases/tag/v1.2.6".to_string(),
             body: None,
             assets: vec![GitHubAsset {
                 name: "codexbar.exe".to_string(),
@@ -613,7 +763,7 @@ mod tests {
 
         assert_eq!(
             update.download_url,
-            "https://github.com/Finesssee/Win-CodexBar/releases/tag/v1.2.6"
+            "https://github.com/nesszer/Win-CodexBar/releases/tag/v1.2.6"
         );
         assert!(!update.supports_auto_apply());
     }
@@ -695,5 +845,85 @@ mod tests {
         let wrong = "0".repeat(64);
         let err = verify_installer_hash(&path, &wrong).unwrap_err();
         assert!(err.contains("SHA256 mismatch"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_setup_exe_uses_inno_silent_flags() {
+        let path = PathBuf::from(r"C:\Temp\CodexBar-1.2.3-Setup.exe");
+
+        let plan = windows_installer_launch_plan(&path).expect("launch plan");
+
+        assert_eq!(plan.program, path);
+        assert_eq!(
+            plan.args,
+            vec![
+                std::ffi::OsString::from("/SILENT"),
+                std::ffi::OsString::from("/SUPPRESSMSGBOXES"),
+                std::ffi::OsString::from("/CLOSEAPPLICATIONS"),
+                std::ffi::OsString::from("/NORESTART"),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_apply_script_waits_for_current_process_before_installing() {
+        let path = PathBuf::from(r"C:\Temp\CodexBar-1.2.3-Setup.exe");
+        let relaunch_path = PathBuf::from(r"C:\Program Files\CodexBar\codexbar.exe");
+        let plan = windows_installer_launch_plan(&path).expect("launch plan");
+
+        let script = windows_installer_apply_script(&plan, 12345, &relaunch_path);
+
+        assert!(script.contains("Wait-Process -Id 12345"));
+        assert!(script.contains(r"Start-Process -FilePath 'C:\Temp\CodexBar-1.2.3-Setup.exe'"));
+        assert!(script.contains(
+            "-ArgumentList @('/SILENT','/SUPPRESSMSGBOXES','/CLOSEAPPLICATIONS','/NORESTART')"
+        ));
+        assert!(script.contains("-PassThru -Wait"));
+        assert!(script.contains(r"Start-Process -FilePath 'C:\Program Files\CodexBar\codexbar.exe' -ArgumentList @('menubar')"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_update_relaunch_path_prefers_primary_desktop_exe_from_legacy_alias() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let desktop_path = temp.path().join("codexbar.exe");
+        let legacy_desktop_path = temp.path().join("codexbar-desktop.exe");
+        std::fs::write(&desktop_path, b"desktop").expect("write desktop");
+        std::fs::write(&legacy_desktop_path, b"legacy desktop").expect("write legacy desktop");
+
+        assert_eq!(
+            windows_update_relaunch_path(&legacy_desktop_path),
+            desktop_path
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_msi_uses_msiexec_quiet_install() {
+        let path = PathBuf::from(r"C:\Temp\CodexBar-1.2.3.msi");
+
+        let plan = windows_installer_launch_plan(&path).expect("launch plan");
+
+        assert_eq!(plan.program, PathBuf::from("msiexec.exe"));
+        assert_eq!(
+            plan.args,
+            vec![
+                std::ffi::OsString::from("/i"),
+                path.as_os_str().to_os_string(),
+                std::ffi::OsString::from("/quiet"),
+                std::ffi::OsString::from("/norestart"),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn powershell_quoting_escapes_single_quotes() {
+        assert_eq!(
+            powershell_single_quoted(r"C:\Temp\CodexBar's Setup.exe"),
+            r"'C:\Temp\CodexBar''s Setup.exe'"
+        );
     }
 }

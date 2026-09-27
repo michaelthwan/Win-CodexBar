@@ -5,12 +5,63 @@
 
 use crate::settings::Language;
 use crate::settings::Settings;
+use fluent_templates::{Loader, static_loader};
+use std::sync::LazyLock;
+use unic_langid::LanguageIdentifier;
+
+static_loader! {
+    static LOCALES = {
+        locales: "./src/locale",
+        fallback_language: "en-US",
+        customise: |bundle| bundle.set_use_isolating(false),
+    };
+}
 
 /// Get the localized string for a given key in the specified language
-pub fn get_text(lang: Language, key: LocaleKey) -> &'static str {
+pub fn get_text(lang: Language, key: LocaleKey) -> String {
+    LOCALES
+        .try_lookup(language_id(lang), key.name())
+        .unwrap_or_else(|| key.name().to_string())
+}
+
+/// Replace `{}` placeholders in a template sequentially.
+/// Safe for templates with multiple placeholders; each arg replaces the next occurrence.
+pub fn format_template(template: &str, args: &[&str]) -> String {
+    let mut result = template.to_string();
+    for arg in args {
+        if let Some(pos) = result.find("{}") {
+            result.replace_range(pos..pos + 2, arg);
+        } else {
+            break;
+        }
+    }
+    result
+}
+
+/// Get a localized string and replace `{}` placeholders sequentially.
+pub fn format_locale(lang: Language, key: LocaleKey, args: &[&str]) -> String {
+    format_template(&get_text(lang, key), args)
+}
+
+fn language_id(lang: Language) -> &'static LanguageIdentifier {
+    static EN_US: LazyLock<LanguageIdentifier> = LazyLock::new(|| "en-US".parse().unwrap());
+    static ZH_CN: LazyLock<LanguageIdentifier> = LazyLock::new(|| "zh-CN".parse().unwrap());
+    static ZH_TW: LazyLock<LanguageIdentifier> = LazyLock::new(|| "zh-TW".parse().unwrap());
+    static JA_JP: LazyLock<LanguageIdentifier> = LazyLock::new(|| "ja-JP".parse().unwrap());
+    static KO_KR: LazyLock<LanguageIdentifier> = LazyLock::new(|| "ko-KR".parse().unwrap());
+    static ES_MX: LazyLock<LanguageIdentifier> = LazyLock::new(|| "es-MX".parse().unwrap());
+    static RU_RU: LazyLock<LanguageIdentifier> = LazyLock::new(|| "ru-RU".parse().unwrap());
+    static TR_TR: LazyLock<LanguageIdentifier> = LazyLock::new(|| "tr-TR".parse().unwrap());
+
     match lang {
-        Language::English => key.english(),
-        Language::Chinese => key.chinese(),
+        Language::English => &EN_US,
+        Language::Chinese => &ZH_CN,
+        Language::ChineseTraditional => &ZH_TW,
+        Language::Japanese => &JA_JP,
+        Language::Korean => &KO_KR,
+        Language::Spanish => &ES_MX,
+        Language::Russian => &RU_RU,
+        Language::Turkish => &TR_TR,
     }
 }
 
@@ -25,11 +76,23 @@ pub fn tray_tooltip(provider_name: &str, session_percent: f64, weekly_percent: f
     let lang = current_language();
     let session_label = get_text(lang, LocaleKey::TraySessionPercent);
     let weekly_label = get_text(lang, LocaleKey::TrayWeeklyPercent);
+    // Display-only percent tooltip; both values are 0–100 usage percents that
+    // fit i32, and the casts only drop the fractional part for a whole-percent label.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "tooltip percent is bounded to 0–100 and fits i32; only the fractional part is dropped for a whole-percent label"
+    )]
+    let session_pct = session_percent as i32;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "tooltip percent is bounded to 0–100 and fits i32; only the fractional part is dropped for a whole-percent label"
+    )]
+    let weekly_pct = weekly_percent as i32;
     format!(
         "{}: {} | {}",
         provider_name,
-        session_label.replace("{}", &format!("{}", session_percent as i32)),
-        weekly_label.replace("{}", &format!("{}", weekly_percent as i32))
+        session_label.replace("{}", &format!("{session_pct}")),
+        weekly_label.replace("{}", &format!("{weekly_pct}"))
     )
 }
 
@@ -45,17 +108,29 @@ pub fn tray_tooltip_with_status(
     let session_label = get_text(lang, LocaleKey::TraySessionPercent);
     let weekly_label = get_text(lang, LocaleKey::TrayWeeklyPercent);
     let status_suffix = match status {
-        None => "",
+        None => String::new(),
         Some(IconOverlayStatus::Error) => get_text(lang, LocaleKey::TrayStatusError),
         Some(IconOverlayStatus::Stale) => get_text(lang, LocaleKey::TrayStatusStale),
         Some(IconOverlayStatus::Incident) => get_text(lang, LocaleKey::TrayStatusIncident),
         Some(IconOverlayStatus::Partial) => get_text(lang, LocaleKey::TrayStatusPartial),
     };
+    // Display-only percent tooltip; both values are 0–100 usage percents that
+    // fit i32, and the casts only drop the fractional part for a whole-percent label.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "tooltip percent is bounded to 0–100 and fits i32; only the fractional part is dropped for a whole-percent label"
+    )]
+    let session_pct = session_percent as i32;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "tooltip percent is bounded to 0–100 and fits i32; only the fractional part is dropped for a whole-percent label"
+    )]
+    let weekly_pct = weekly_percent as i32;
     format!(
         "{}: {} | {}{}",
         provider_name,
-        session_label.replace("{}", &format!("{}", session_percent as i32)),
-        weekly_label.replace("{}", &format!("{}", weekly_percent as i32)),
+        session_label.replace("{}", &format!("{session_pct}")),
+        weekly_label.replace("{}", &format!("{weekly_pct}")),
         status_suffix
     )
 }
@@ -83,16 +158,41 @@ pub fn tray_tooltip_credits(provider_name: &str, credits_percent: f64) -> String
     )
 }
 
-/// Locale keys for app-owned UI strings
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
-pub enum LocaleKey {
+macro_rules! locale_keys {
+    ($($key:ident,)*) => {
+        /// Locale keys for app-owned UI strings.
+        #[allow(dead_code, reason = "locale keys are generated for all supported UI strings; not all are referenced yet")]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum LocaleKey {
+            $($key,)*
+        }
+
+        impl LocaleKey {
+            /// Every LocaleKey variant paired with its serialized name.
+            pub const ALL: &'static [(LocaleKey, &'static str)] = &[
+                $((LocaleKey::$key, stringify!($key)),)*
+            ];
+
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $(Self::$key => stringify!($key),)*
+                }
+            }
+        }
+    };
+}
+
+locale_keys! {
+
     // Tab names (Preferences)
     TabGeneral,
     TabProviders,
-    TabDisplay,
+    TabNotifications,
+    TabMenuBar,
+    TabMenu,
     TabApiKeys,
     TabCookies,
+    TabUsageSpend,
     TabAdvanced,
     TabAbout,
     TabShortcuts,
@@ -114,11 +214,36 @@ pub enum LocaleKey {
     // Notification settings (Preferences)
     ShowNotifications,
     SoundEnabled,
-    SoundVolume,
+    NotificationSoundTheme,
+    NotificationSoundThemeHelper,
+    NotificationSoundThemeWindows,
+    NotificationSoundThemeCodexBar,
+    NotificationSoundChooseFile,
+    NotificationSoundClearFile,
+    NotificationSoundUsesTheme,
+    NotificationSoundWaveFile,
+    NotificationSoundEventPredictiveWarning,
+    NotificationSoundEventPredictiveWarningHelper,
+    NotificationSoundEventHighUsage,
+    NotificationSoundEventHighUsageHelper,
+    NotificationSoundEventCriticalUsage,
+    NotificationSoundEventCriticalUsageHelper,
+    NotificationSoundEventExhausted,
+    NotificationSoundEventExhaustedHelper,
+    NotificationSoundEventStatusIssue,
+    NotificationSoundEventStatusIssueHelper,
+    NotificationSoundEventSessionDepleted,
+    NotificationSoundEventSessionDepletedHelper,
+    NotificationSoundEventSessionRestored,
+    NotificationSoundEventSessionRestoredHelper,
     HighUsageThreshold,
     HighUsageAlert,
     CriticalUsageThreshold,
     CriticalUsageAlert,
+    PredictivePaceWarnings,
+    PredictivePaceWarningsHelper,
+    PredictivePaceWarningTitle,
+    PredictivePaceWarningBody,
 
     // Display settings (Preferences)
     UsageDisplay,
@@ -126,8 +251,10 @@ pub enum LocaleKey {
     ShowUsageAsUsedHelper,
     ResetTimeRelative,
     ResetTimeRelativeHelper,
-    ShowCreditsExtra,
-    ShowCreditsExtraHelper,
+    ShowResetWhenExhausted,
+    ShowResetWhenExhaustedHelper,
+    ShowPace,
+    ShowPaceHelper,
     TrayIcon,
     MergeTrayIcons,
     MergeTrayIconsHelper,
@@ -139,6 +266,7 @@ pub enum LocaleKey {
     ProviderDisabled,
     ProviderInfo,
     ProviderUsage,
+    PanelUsageDetails,
     AuthType,
     DataSource,
     ProviderNotDetected,
@@ -154,6 +282,17 @@ pub enum LocaleKey {
     ProviderSourceGithubApiShort,
     ProviderSourceLocalShort,
     ProviderSourceKiroEnvShort,
+    WayfinderGatewayTitle,
+    WayfinderGatewayLabel,
+    WayfinderGatewayHelp,
+    WayfinderGatewayStatus,
+    WayfinderModels,
+    WayfinderRequests,
+    WayfinderTokens,
+    WayfinderSaved,
+    WayfinderOffline,
+    WayfinderDryRun,
+    WayfinderMissingKeys,
     TrackingItem,
     MainWindowLiveUsageData,
     StartTrackingUsage,
@@ -232,6 +371,14 @@ pub enum LocaleKey {
     ProviderSession,
     ProviderWeekly,
     ProviderMonthly,
+    DeepSeekPricingTitle,
+    DeepSeekPricingStandard,
+    DeepSeekPricingPeak,
+    DeepSeekPricingOffPeak,
+    DeepSeekPricingCurrent,
+    DeepSeekPricingNext,
+    DeepSeekPricingEffective,
+    DeepSeekPricingAdvice,
     ProviderModel,
     ProviderPlan,
     ProviderNextReset,
@@ -305,6 +452,8 @@ pub enum LocaleKey {
     // Tray - Single icon mode
     TrayOpenCodexBar,
     TrayPopOutDashboard,
+    TrayShowWindow,
+    TrayShowFloatBar,
     TrayRefreshAll,
     TrayProviders,
     TraySettings,
@@ -346,10 +495,17 @@ pub enum LocaleKey {
     // Provider detail - Usage section
     ProviderSessionLabel,
     ProviderWeeklyLabel,
+    ClaudeScopedWeeklyLabel,
     ProviderCodeReviewLabel,
     ResetsInShort,
     ResetsInDaysHours,
     ResetsInHoursMinutes,
+    ResetsInMinutes,
+    NextExpiresInDaysHours,
+    NextExpiresInHoursMinutes,
+    NextExpiresInMinutes,
+    NextExpiresDueNow,
+    InventoryAvailableCount,
 
     // Provider detail - Tray Display
     TrayDisplayTitle,
@@ -388,6 +544,66 @@ pub enum LocaleKey {
     ProviderClaudeCookiesHelp,
     ProviderClaudeAvoidKeychainPrompts,
     ProviderClaudeAvoidKeychainPromptsHelp,
+    ProviderClaudeDailyRoutinesUsage,
+    ProviderClaudeDailyRoutinesUsageHelp,
+    ProviderClaudeAllowReadingClaudeCodeCredentials,
+    ProviderClaudeAllowReadingClaudeCodeCredentialsHelp,
+    ProviderCodexSparkUsage,
+    ProviderCodexSparkUsageHelp,
+    CopilotSeatCreditTitle,
+    CopilotSeatCreditHelper,
+    CopilotSeatCreditInvalid,
+    CodexAccountsTitle,
+    ClaudeAccountsTitle,
+    ClaudeAccountsHint,
+    ClaudeAccountsEmpty,
+    ClaudeAccountsSaveCurrent,
+    ClaudeAccountsCancelLogin,
+    ClaudeAccountsSigningIn,
+    ClaudeAccountsSwitched,
+    ClaudeAccountsAdded,
+    ClaudeAccountsReconciling,
+    GrokAccountsTitle,
+    GrokAccountsHint,
+    GrokAccountsEmpty,
+    GrokAccountsSaveCurrent,
+    GrokAccountsCancelLogin,
+    GrokAccountsSigningIn,
+    GrokAccountsSwitched,
+    GrokAccountsAdded,
+    ClaudeSwapTitle,
+    ClaudeSwapHint,
+    ClaudeSwapEnable,
+    ClaudeSwapEnableHelp,
+    ClaudeSwapExecutablePath,
+    ClaudeSwapExecutablePathPlaceholder,
+    ClaudeSwapStatusDisabled,
+    ClaudeSwapStatusNoExecutable,
+    ClaudeSwapStatusReady,
+    ClaudeSwapEmpty,
+    ClaudeSwapSwitchButton,
+    ClaudeSwapReauthenticateButton,
+    ClaudeSwapSwitched,
+    ClaudeSwapReconciling,
+    ClaudeSwapReauthenticated,
+    ClaudeSwapUsageUnavailable,
+    ClaudeSwapHistoricalUsage,
+    ClaudeSwapHistoricalCapturedAt,
+    ClaudeSwapSpend,
+    ClaudeSwapDisabled,
+    CodexAccountsHint,
+    CodexAccountsAddButton,
+    CodexAccountsReauthenticateButton,
+    CodexAccountsSwitchButton,
+    CodexAccountsFetchButton,
+    CodexAccountsRemoveButton,
+    CodexAccountsEmpty,
+    CodexAccountsSourceAmbient,
+    CodexAccountsSourceManaged,
+    CodexAccountsUsageUnavailable,
+    CodexSwitchSuccess,
+    CodexSwitchRestartPrompt,
+    CodexAccountsRestartDesktop,
     ProviderCursorCookieSourceHelp,
     ProviderCursorCreditsHelp,
     AutoFallbackHelp,
@@ -403,6 +619,78 @@ pub enum LocaleKey {
     PrivacyTitle,
     HidePersonalInfo,
     HidePersonalInfoHelper,
+    SectionLocalIntegrations,
+    PowerToysPipeLabel,
+    PowerToysPipeHelper,
+    HooksTitle,
+    HooksCaption,
+    HooksEnableLabel,
+    HooksEnableHelper,
+    HooksConfigPathHint,
+    NetworkProxyTitle,
+    NetworkProxyCaption,
+    NetworkProxyEnableLabel,
+    NetworkProxyEnableHelper,
+    NetworkProxyUrlLabel,
+    NetworkProxyUrlHelper,
+    NetworkProxyUserLabel,
+    NetworkProxyPasswordLabel,
+    NetworkProxyPasswordHelper,
+    NetworkProxyInvalidUrl,
+    UsageSpendTitle,
+    UsageSpendCaption,
+    UsageSpendModels,
+    UsageSpendAllTime,
+    UsageSpendOpenCodexImport,
+    UsageSpendHideNativeCodex,
+    UsageSpendSpend,
+    UsageSpendPriceCoverage,
+    UsageSpendConversations,
+    UsageSpendTokenMix,
+    UsageSpendKnownZero,
+    UsageSpendApiEstimate,
+    UsageSpendVendorMetered,
+    UsageSpendMixedSources,
+    UsageSpendUnknown,
+    UsageSpendUnpriced,
+    UsageSpendHistoryCovered,
+    UsageSpendPartialHistory,
+    UsageSpendCustomPricingActive,
+    UsageSpendDefaultPricing,
+    UsageSpendHourlyActivity,
+    UsageSpendRequests,
+    UsageSpendTokens,
+    UsageSpendAllTimeHistory,
+    UsageSpendCustomPricing,
+    OverviewSpendTitle,
+    OverviewSpendProviderCoverage,
+    OverviewSpendEstimate,
+    UsageSpendProjects,
+    UsageSpendShowAll,
+    UsageSpendShowLess,
+    UsageSpendNoModels,
+    UsageSpendNoProjects,
+    UsageSpendRefresh,
+    UsageSpendLoading,
+    UsageSpendRefreshing,
+    UsageSpendEmpty,
+    UsageSpendColProvider,
+    UsageSpendCol7d,
+    UsageSpendCol30d,
+    UsageSpendColCurrency,
+    UsageSpendColSource,
+    UsageSpendShare,
+    UsageSpendCopyJson,
+    UsageSpendSaveJson,
+    UsageSpendShareEmpty,
+    UsageSpendShareFailed,
+    AgentSessionsTitle,
+    AgentSessionsEnableLabel,
+    AgentSessionsEnableHelper,
+    AgentSessionsSshHostsLabel,
+    AgentSessionsSshHostsHelper,
+    AgentSessionsLoading,
+    AgentSessionsEmpty,
     UpdatesTitle,
     UpdateChannelChoice,
     UpdateChannelChoiceHelper,
@@ -421,7 +709,6 @@ pub enum LocaleKey {
     ShortcutHintPlaceholder,
 
     // Display/Preferences helpers
-    SurpriseAnimationsHelper,
     SelectProvider,
 
     // Refresh interval labels
@@ -496,7 +783,13 @@ pub enum LocaleKey {
     // Tauri desktop shell — General tab fields
     RefreshIntervalLabel,
     RefreshIntervalHelper,
-    SoundVolumeHelper,
+    RefreshAllProvidersOnMenuOpen,
+    RefreshAllProvidersOnMenuOpenHelper,
+    LowPowerMode,
+    LowPowerModeHelper,
+    LowPowerModeOff,
+    LowPowerModeOn,
+    LowPowerModeAutomatic,
     HighUsageWarningHelper,
     CriticalUsageWarningHelper,
     GlobalShortcutFieldLabel,
@@ -525,26 +818,36 @@ pub enum LocaleKey {
     DisplayModeDetailed,
     DisplayModeCompact,
     DisplayModeMinimal,
+    WindowScaleLabel,
+    WindowScaleHelper,
+    WindowScaleAriaLabel,
+    TrayPanelAlwaysOnTopLabel,
+    TrayPanelAlwaysOnTopHelper,
+    WindowMinimize,
+    WindowMaximize,
+    WindowRestore,
+    WindowClose,
     ShowAsUsedLabel,
     ShowAsUsedHelper,
+    OverviewLayoutLabel,
+    OverviewLayoutHelper,
+    OverviewLayoutDetailed,
+    OverviewLayoutCompact,
     ShowAllTokenAccountsLabel,
     ShowAllTokenAccountsHelper,
     EnableAnimationsLabel,
     EnableAnimationsHelper,
-    SurpriseAnimationsLabel,
-
     // Tauri desktop shell — Advanced tab fields
     UpdateChannelStableOption,
     UpdateChannelBetaOption,
+    CodexLocalLogsTitle,
+    CodexLocalLogsCaption,
+    CodexLogPathsLabel,
+    CodexLogPathsHelper,
     AvoidKeychainPromptsLabel,
     AvoidKeychainPromptsHelper,
     DisableAllKeychainLabel,
     DisableAllKeychainHelper,
-    ShowDebugSettingsLabel,
-    ShowDebugSettingsHelper,
-    LanguageEnglishOption,
-    LanguageChineseOption,
-
     // Tauri desktop shell — Theme (Phase 12)
     SectionTheme,
     ThemeLabel,
@@ -591,15 +894,53 @@ pub enum LocaleKey {
     DetailPaceRunsOutIn,
     DetailPaceWillLastToReset,
     DetailCostTitle,
+    ApiSpendTitle,
     DetailCostUsed,
     DetailCostLimit,
     DetailCostRemaining,
+    DetailCostBalance,
     DetailCostResets,
     DetailChartCost,
+    DetailChartTokens,
+    DetailChartRefreshing,
     DetailChartCredits,
     DetailChartUsageBreakdown,
     DetailChartEmpty,
     DetailUpdatedPrefix,
+    PanelAllProviders,
+    PanelAllProvidersShort,
+    PanelShowAllProviders,
+    PanelShowFewerProviders,
+    PanelZoom,
+    PanelMenu,
+    PanelCopied,
+    PanelToday,
+    PanelThirtyDayCost,
+    PanelThirtyDayTokens,
+    PanelLatestTokens,
+    PanelThirtyDayCostHistogram,
+    PanelTopModelPrefix,
+    PanelEstimatedFromLocalLogs,
+    PanelEstimatedFromLocalLogsClaude,
+    PanelEstimatedFromLocalLogsMuse,
+    PanelExpected,
+    PanelActual,
+    PanelUsedSuffix,
+    PanelLeftSuffix,
+    PanelOnPaceBudget,
+    PanelNow,
+    PanelOneHour,
+    PanelFiveHours,
+    PanelTodayBudget,
+    PanelReserveSuffix,
+    PanelReserveLastsUntilReset,
+    PanelReserveRunsOutInDaysHours,
+    PanelReserveRunsOutInHours,
+    FloatBarThirtyDayShort,
+    FloatBarNoProviders,
+    FloatBarRemainingSuffix,
+    FloatBarShowCost,
+    FloatBarShowCostDescription,
 
     // Tauri desktop shell — update banner
     BannerCheckingForUpdates,
@@ -618,12 +959,45 @@ pub enum LocaleKey {
     ProviderSidebarClearSearch,
     ProviderSidebarNoMatches,
     ProviderSidebarReorderHint,
+    ProviderSidebarMoveUp,
+    ProviderSidebarMoveDown,
     ProviderStatusOk,
     ProviderStatusStale,
     ProviderStatusError,
     ProviderStatusLoading,
     ProviderStatusDisabled,
     ProviderDetailPlaceholder,
+    ProviderIssueNeedsSignIn,
+    ProviderIssueFetchNeedsAttention,
+    ProviderIssueCopy,
+    ProviderIssueUnsupportedSourceModePrefix,
+    ProviderIssueAuthRequired,
+    ProviderIssueSessionExpired,
+    ProviderIssueLocalRuntimeOffline,
+    ProviderIssueUnknown,
+    ProviderIssuePrivacySafeDetail,
+    CredentialStorageTitle,
+    CredentialRevokeStored,
+    CredentialApiKeys,
+    CredentialManualCookies,
+    CredentialTokenAccounts,
+    CredentialProtectedPrefix,
+    CredentialStatusNotCreated,
+    CredentialStatusPlaintext,
+    CredentialStatusUnavailable,
+    CredentialStatusUnreadable,
+    BrowserCookiesSectionTitle,
+    BrowserCookieNoneSaved,
+    BrowserCookieSavedBadge,
+    BrowserCookieRemove,
+    BrowserCookieImportSuccess,
+    BrowserCookieImportFromBrowser,
+    BrowserCookieProfileSingular,
+    BrowserCookieProfilePlural,
+    BrowserCookiePlaceholderDefault,
+    BrowserCookiePlaceholderOllama,
+    BrowserCookiePlaceholderCurl,
+    BrowserCookieSave,
 
     // Tauri desktop shell — Phase 6d credential detection UIs
     CredentialsSectionTitle,
@@ -656,6 +1030,13 @@ pub enum LocaleKey {
     CredsKiroLabel,
     CredsKiroHelperAvailablePrefix,
     CredsKiroHelperMissing,
+    OpenCodeGoWorkspaceTitle,
+    OpenCodeGoWorkspaceLabel,
+    OpenCodeGoWorkspaceHelp,
+    OpenRouterManagementKeyTitle,
+    OpenRouterManagementKeyLabel,
+    OpenRouterManagementKeyHelp,
+    OpenRouterManagementKeyConfigured,
     CredsOpenAiHistoryHelp,
 
     // Tauri desktop shell — Token accounts (Phase 6e, review)
@@ -681,11 +1062,139 @@ pub enum LocaleKey {
     TrayPaceBadgeBurning,
     TrayResetsInLabel,
     TrayResetsDueNow,
-}
 
-mod chinese;
-mod english;
-mod keys;
+    // Tauri desktop shell — FloatBar settings section
+    FloatBarSectionTitle,
+    FloatBarShowFloatingBar,
+    FloatBarShowFloatingBarHelper,
+    FloatBarOrientation,
+    FloatBarOrientationHelper,
+    FloatBarOrientationHorizontal,
+    FloatBarOrientationVertical,
+    FloatBarStyle,
+    FloatBarStyleHelper,
+    FloatBarStyleFloating,
+    FloatBarStyleTaskbar,
+    FloatBarOpacity,
+    FloatBarOpacityHelper,
+    FloatBarOpacityAriaLabel,
+    FloatBarSize,
+    FloatBarSizeHelper,
+    FloatBarSizeAriaLabel,
+    FloatBarShowResetInline,
+    FloatBarShowResetInlineHelper,
+    FloatBarInvertColors,
+    FloatBarInvertColorsHelper,
+    FloatBarClickThrough,
+    FloatBarClickThroughHelper,
+
+    // Tauri desktop shell — About / app identity
+    AppName,
+    SettingsWindowTitle,
+    ErrorPrefix,
+    AboutLoading,
+    AboutCheckForUpdates,
+    AboutChecking,
+    AboutUpToDate,
+    AboutCopyrightBefore,
+    AboutCopyrightAfter,
+    AboutLinkGitHub,
+    AboutLinkWebsite,
+    AboutLinkOriginalProject,
+    DiagnosticsSectionHeading,
+    DiagnosticsCopyButton,
+    DiagnosticsCopied,
+    DiagnosticsCopyFailed,
+
+    // Tauri desktop shell — Cookies tab hints / placeholder
+    SavedCookiesHint,
+    ImportFromBrowserHint,
+    NoBrowsersDetectedHint,
+    CookieHeaderValuePlaceholder,
+
+    // Tauri desktop shell — API key section fields
+    ApiKeyTitle,
+    ApiKeyNotSet,
+    ApiKeyUpdate,
+    ApiKeyLabelOptional,
+
+    // Tauri desktop shell — App bootstrap fallbacks
+    BootstrapFailed,
+    LoadingShellContract,
+    LoadingShellContractHint,
+
+    // Tauri desktop shell — Refresh interval + provider display names
+    RefreshIntervalManual,
+    RefreshIntervalAdaptive,
+    RefreshInterval15Min,
+    RefreshInterval30Min,
+    RefreshInterval1Hour,
+    ProviderNameCodex,
+    ProviderNameClaude,
+    AgentSessionsProviderPi,
+    AgentSessionsProviderOmp,
+
+    // Tauri desktop shell — misc singletons
+    ProvidersAriaLabel,
+    WaitingForUsage,
+    TokenAccountTokenPlaceholder,
+    ProviderPlanClaudeAi,
+    PaceChartAriaLabel,
+    PaceChartLegendAverageSoFar,
+    PaceChartLegendIdealPace,
+    PaceChartLegendProjection,
+    BarChartAriaLabel,
+    StackedBarChartAriaLabel,
+
+    // Tauri desktop shell — OpenAI extras (admin/litellm/devin/zed)
+    OpenAiAdminApiTitle,
+    OpenAiProjectIdLabel,
+    OpenAiProjectIdPlaceholder,
+    OpenAiProjectIdHelp,
+    LiteLlmApiTitle,
+    LiteLlmBaseUrlLabel,
+    LiteLlmBaseUrlPlaceholder,
+    LiteLlmBaseUrlHelp,
+    DevinApiTitle,
+    DevinOrganizationLabel,
+    DevinOrganizationPlaceholder,
+    DevinOrganizationHelp,
+    ZedApiTitle,
+    ZedApiUrlLabel,
+    ZedApiUrlPlaceholder,
+    ZedApiUrlHelp,
+    Sub2ApiTitle,
+    Sub2ApiBaseUrlLabel,
+    Sub2ApiBaseUrlPlaceholder,
+    Sub2ApiBaseUrlHelp,
+
+    // Tray icon visibility (Windows 11 hidden-icons overflow)
+    PromoteTrayIconLabel,
+    PromoteTrayIconHelper,
+    PromoteTrayIconUnsupportedHint,
+
+    // Mistral PAYG monthly spend (#2821, #2947)
+    MistralMonthlySpend,
+    MistralMonthlySpendHelper,
+
+    // Menu cost-summary display style (#2976)
+    CostSummaryDisplayStyle,
+    CostSummaryDisplayStyleHelper,
+    CostSummaryStyleCompact,
+    CostSummaryStyleDetailed,
+    CostSummaryStyleHidden,
+
+    // Per-provider accent color override (#2972)
+    ProviderAccentColor,
+    ProviderAccentColorHelper,
+    ProviderAccentColorReset,
+    ProviderAccentColorInvalid,
+
+    // Per-provider automatic CLI session resume (#486)
+    ProviderAutoResumeTitle,
+    ProviderAutoResumeAfterQuotaReset,
+    ProviderAutoResumeAfterQuotaResetHelper,
+}
 
 #[cfg(test)]
 mod tests;

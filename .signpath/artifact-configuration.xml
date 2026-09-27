@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" required="true" />
+  </parameters>
+  <zip-file>
+    <pe-file path="CodexBar-${version}-Setup.exe">
+      <authenticode-sign />
+    </pe-file>
+    <pe-file path="CodexBar-${version}-portable.exe">
+      <authenticode-sign />
+    </pe-file>
+    <zip-file path="CodexBarCLI-v${version}-windows-x64.zip">
+      <pe-file path="codexbar-cli.exe">
+        <authenticode-sign />
+      </pe-file>
+    </zip-file>
+  </zip-file>
+</artifact-configuration>

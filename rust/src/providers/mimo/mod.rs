@@ -31,6 +31,10 @@ struct BalanceResponse {
 struct BalanceData {
     balance: String,
     currency: String,
+    #[serde(default, alias = "cashBalance")]
+    cash_balance: Option<String>,
+    #[serde(default, alias = "giftBalance")]
+    gift_balance: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,8 +91,9 @@ impl MiMoProvider {
                 is_primary: false,
                 dashboard_url: Some("https://platform.xiaomimimo.com/#/console/balance"),
                 status_page_url: None,
+                tertiary_label_key: None,
             },
-            client: Client::builder()
+            client: crate::core::credentialed_http_client_builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
@@ -122,6 +127,8 @@ impl MiMoProvider {
         Ok(snapshot_from_parts(
             balance_value,
             data.currency,
+            data.cash_balance,
+            data.gift_balance,
             detail,
             usage,
         ))
@@ -203,6 +210,8 @@ fn normalize_cookie_header(raw: &str) -> Option<String> {
 fn snapshot_from_parts(
     balance: f64,
     currency: String,
+    cash_balance: Option<String>,
+    gift_balance: Option<String>,
     detail: Option<TokenPlanDetailResponse>,
     usage: Option<TokenPlanUsageResponse>,
 ) -> UsageSnapshot {
@@ -225,15 +234,25 @@ fn snapshot_from_parts(
     let primary = if let Some(item) = usage_item {
         RateWindow::with_details(
             item.percent,
-            None,
+            RateWindow::monthly_window_minutes(period_end),
             period_end,
             Some(format!("{}/{} tokens", item.used, item.limit)),
         )
     } else {
-        RateWindow::with_details(0.0, None, period_end, Some("No token-plan usage".into()))
+        RateWindow::with_details(
+            0.0,
+            RateWindow::monthly_window_minutes(period_end),
+            period_end,
+            Some("No token-plan usage".into()),
+        )
     };
     let mut secondary = RateWindow::new(0.0);
-    secondary.reset_description = Some(format!("{balance:.2} {currency} balance"));
+    secondary.reset_description = Some(balance_description(
+        balance,
+        &currency,
+        cash_balance.as_deref(),
+        gift_balance.as_deref(),
+    ));
 
     let mut snapshot = UsageSnapshot::new(primary).with_secondary(secondary);
     if let Some(plan) = plan_name {
@@ -248,6 +267,27 @@ fn parse_mimo_date(value: &str) -> Option<DateTime<Utc>> {
     NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
         .ok()
         .map(|dt| Utc.from_utc_datetime(&dt))
+}
+
+fn parse_decimal(value: Option<&str>) -> Option<f64> {
+    value?.trim().parse().ok()
+}
+
+fn balance_description(
+    balance: f64,
+    currency: &str,
+    cash_balance: Option<&str>,
+    gift_balance: Option<&str>,
+) -> String {
+    let currency = currency.trim();
+    let total = format!("{balance:.2} {currency} balance");
+    let Some(cash) = parse_decimal(cash_balance) else {
+        return total;
+    };
+    let Some(gift) = parse_decimal(gift_balance) else {
+        return total;
+    };
+    format!("{total} (Paid: {cash:.2} {currency} / Granted: {gift:.2} {currency})")
 }
 
 impl Default for MiMoProvider {
@@ -269,12 +309,12 @@ impl Provider for MiMoProvider {
     async fn fetch_usage(&self, ctx: &FetchContext) -> Result<ProviderFetchResult, ProviderError> {
         match ctx.source_mode {
             SourceMode::Auto | SourceMode::Web => {
-                let cookie = ctx
-                    .manual_cookie_header
-                    .as_deref()
-                    .ok_or(ProviderError::NoCookies)?;
+                let cookie = match ctx.manual_cookie_header.as_deref() {
+                    Some(cookie) => cookie.to_string(),
+                    None => crate::providers::browser_cookie_header(&["platform.xiaomimimo.com"])?,
+                };
                 Ok(ProviderFetchResult::new(
-                    self.fetch_web(cookie).await?,
+                    self.fetch_web(&cookie).await?,
                     "web",
                 ))
             }
@@ -301,5 +341,31 @@ mod tests {
     fn mimo_cookie_requires_service_token_and_user_id() {
         assert!(normalize_cookie_header("api-platform_serviceToken=abc; userId=42").is_some());
         assert!(normalize_cookie_header("api-platform_serviceToken=abc").is_none());
+    }
+
+    #[test]
+    fn mimo_balance_description_includes_paid_and_granted_components() {
+        assert_eq!(
+            balance_description(12.5, "CNY", Some("8.25"), Some("4.25")),
+            "12.50 CNY balance (Paid: 8.25 CNY / Granted: 4.25 CNY)"
+        );
+        assert_eq!(
+            balance_description(12.5, "CNY", Some("8.25"), None),
+            "12.50 CNY balance"
+        );
+    }
+
+    #[test]
+    fn mimo_token_plan_uses_calendar_month_minutes() {
+        // Period end 2026-03-01 → February cycle is 28 days.
+        let period_end = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap();
+        let primary = RateWindow::with_details(
+            40.0,
+            RateWindow::monthly_window_minutes(Some(period_end)),
+            Some(period_end),
+            Some("400/1000 tokens".into()),
+        );
+        assert_eq!(primary.window_minutes, Some(28 * 24 * 60));
+        assert_eq!(primary.resets_at, Some(period_end));
     }
 }

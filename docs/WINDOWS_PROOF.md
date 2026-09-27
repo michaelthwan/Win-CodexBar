@@ -30,6 +30,13 @@ cargo test
 cargo test -p codexbar-desktop-tauri
 cargo clippy -p codexbar-desktop-tauri --all-targets -- -D warnings
 
+# Proof/CUA captures: set `CODEXBAR_PROOF_MODE` (e.g. `trayPanel`) to open a
+# surface with blur-dismiss suppressed; optionally set
+# `CODEXBAR_SEED_USAGE_JSON=<abs-path>` to plant one synthetic bridge-shaped
+# Codex ProviderUsageSnapshot into the provider cache at launch (malformed
+# files are warned about and ignored) — the seeded cache is pinned against
+# refresh eviction for the duration of the run.
+
 # Frontend unit tests + bundle
 cd apps\desktop-tauri
 pnpm install --frozen-lockfile
@@ -55,12 +62,11 @@ For the Inno Setup release artifact, prefer the cached Windows release builder:
 
 It keeps a clean managed checkout while reusing Cargo, pnpm, and signed
 installer dependency caches. Use `-WarmCacheOnly` after large ports to prepare
-the desktop cache without packaging, `-WarmCliCache` as a compatibility alias
-because release packaging now builds CLI artifacts every time, `-SmokeInstall`
-to install/uninstall the generated installer, and `-UploadRelease vX.Y.Z` to
-upload assets directly to GitHub.
-Run the standalone smoke installer test on a Windows machine before manual
-upload or publication:
+the desktop cache, and `-SmokeInstall` to install/uninstall the generated
+installer. The builder has no upload switch. Publication is performed only by
+the approval-gated CircleCI draft publisher in `docs/release/ci-cd.md`, which
+checks hashes and never overwrites an existing asset.
+Run the standalone smoke installer test on a Windows machine before approval:
 
 ```powershell
 powershell -ExecutionPolicy Bypass `

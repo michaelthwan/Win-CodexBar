@@ -9,6 +9,8 @@ pub struct ProviderDetail {
     pub id: String,
     pub display_name: String,
     pub enabled: bool,
+    pub auto_resume_after_quota_reset: bool,
+    pub auto_resume_supported: bool,
 
     // Identity
     pub email: Option<String>,
@@ -23,7 +25,14 @@ pub struct ProviderDetail {
     pub weekly: Option<RateWindowSnapshot>,
     pub model_specific: Option<RateWindowSnapshot>,
     pub tertiary: Option<RateWindowSnapshot>,
+    /// Locale key naming the tertiary lane when it carries a semantic label
+    /// beyond "Tertiary" (upstream F5). Drives the settings metric picker.
+    pub tertiary_label_key: Option<&'static str>,
     pub extra_rate_windows: Vec<NamedRateWindowSnapshot>,
+    pub usage_items: Vec<ProviderUsageItemSnapshot>,
+    pub hidden_usage_item_ids: Vec<String>,
+    pub inventory: Vec<ProviderInventoryItemSnapshot>,
+    pub display_details: Vec<ProviderDisplayDetailSnapshot>,
 
     // Cost / pace.
     pub cost: Option<CostSnapshotBridge>,
@@ -31,6 +40,8 @@ pub struct ProviderDetail {
 
     // Error / state.
     pub last_error: Option<String>,
+    /// Backend-classified availability state for the latest refresh.
+    pub error_state: Option<codexbar::core::ProviderStateKind>,
 
     // URLs for quick-actions (button visibility).
     pub dashboard_url: Option<String>,
@@ -43,11 +54,14 @@ pub struct ProviderDetail {
     // Phase 6c — currently-persisted cookie source & region for round-tripping
     // into the settings UI pickers. `None` for providers that do not support
     // one of the pickers.
+    pub usage_source: Option<String>,
     pub cookie_source: Option<String>,
     pub region: Option<String>,
 }
 
-pub(crate) fn build_provider_detail(provider_id: &str) -> Result<ProviderDetail, String> {
+pub(crate) fn build_provider_detail(
+    provider_id: &str,
+) -> Result<(ProviderDetail, Settings, ProviderId), String> {
     let id = parse_provider_arg(provider_id)?;
 
     let settings = Settings::load();
@@ -58,6 +72,7 @@ pub(crate) fn build_provider_detail(provider_id: &str) -> Result<ProviderDetail,
 
     let provider = instantiate_provider(id);
     let metadata = provider.metadata();
+    let resume_supported = auto_resume_supported(id);
     let dashboard_url = if id == codexbar::core::ProviderId::MiniMax {
         Some(
             codexbar::providers::MiniMaxProvider::dashboard_url_for_region(Some(
@@ -68,10 +83,12 @@ pub(crate) fn build_provider_detail(provider_id: &str) -> Result<ProviderDetail,
         metadata.dashboard_url.map(|s| s.to_string())
     };
 
-    Ok(ProviderDetail {
+    let detail = ProviderDetail {
         id: id.cli_name().to_string(),
         display_name: id.display_name().to_string(),
         enabled,
+        auto_resume_after_quota_reset: settings.auto_resume_after_quota_reset(id),
+        auto_resume_supported: resume_supported,
         email: None,
         plan: None,
         auth_type: None,
@@ -82,10 +99,16 @@ pub(crate) fn build_provider_detail(provider_id: &str) -> Result<ProviderDetail,
         weekly: None,
         model_specific: None,
         tertiary: None,
+        tertiary_label_key: metadata.tertiary_label_key,
         extra_rate_windows: Vec::new(),
+        usage_items: Vec::new(),
+        hidden_usage_item_ids: settings.hidden_usage_item_ids(id),
+        inventory: Vec::new(),
+        display_details: Vec::new(),
         cost: None,
         pace: None,
         last_error: None,
+        error_state: None,
         dashboard_url: dashboard_url.clone(),
         status_page_url: metadata.status_page_url.map(|s| s.to_string()),
         // Buy-credits currently mirrors the dashboard URL for providers that
@@ -96,9 +119,20 @@ pub(crate) fn build_provider_detail(provider_id: &str) -> Result<ProviderDetail,
             None
         },
         has_snapshot: false,
+        usage_source: provider_usage_source_lookup(&settings, id.cli_name()),
         cookie_source: provider_cookie_source_lookup(&settings, id.cli_name()),
         region: provider_region_lookup(&settings, id.cli_name()),
-    })
+    };
+
+    Ok((detail, settings, id))
+}
+
+/// Return whether the exact-session resume control can safely be offered for
+/// the currently selected credential lane. Managed token-account lanes cannot
+/// be correlated with local process discovery, so the UI and command both fail
+/// closed while one is active (or when its store cannot be read).
+pub(crate) fn auto_resume_supported(id: ProviderId) -> bool {
+    crate::auto_resume::supports_auto_resume(id) && crate::auto_resume::is_auto_resume_available(id)
 }
 
 #[tauri::command]
@@ -106,7 +140,7 @@ pub fn get_provider_detail(
     app: tauri::AppHandle,
     provider_id: String,
 ) -> Result<ProviderDetail, String> {
-    let mut detail = build_provider_detail(&provider_id)?;
+    let (mut detail, settings, parsed_provider_id) = build_provider_detail(&provider_id)?;
 
     // Merge the latest cached snapshot, if any.
     let state = app.state::<Mutex<AppState>>();
@@ -116,38 +150,52 @@ pub fn get_provider_detail(
             .iter()
             .find(|s| s.provider_id == detail.id)
     {
-        detail.email = snap.account_email.clone();
-        detail.plan = snap.plan_name.clone();
-        detail.organization = snap.account_organization.clone();
-        detail.source_label = if snap.source_label.is_empty() {
+        let snapshot = snap.clone();
+        detail.email = snapshot.account_email.clone();
+        detail.plan = snapshot.plan_name.clone();
+        detail.organization = snapshot.account_organization.clone();
+        detail.source_label = if snapshot.source_label.is_empty() {
             None
         } else {
-            Some(snap.source_label.clone())
+            Some(snapshot.source_label.clone())
         };
-        detail.last_updated = Some(snap.updated_at.clone());
-        if snap.error.is_none() {
-            detail.session = Some(snap.primary.clone());
-            detail.weekly = snap.secondary.clone();
-            detail.model_specific = snap.model_specific.clone();
-            detail.tertiary = snap.tertiary.clone();
-            detail.extra_rate_windows = snap.extra_rate_windows.clone();
-            detail.cost = snap.cost.clone();
-            detail.pace = snap.pace.clone();
+        detail.last_updated = Some(snapshot.updated_at.clone());
+        if snapshot.error.is_none() {
+            detail.usage_items =
+                super::usage_item_descriptors(Some(&snapshot), &settings, parsed_provider_id);
+            detail.session = Some(snapshot.primary.clone());
+            detail.weekly = snapshot.secondary.clone();
+            detail.model_specific = snapshot.model_specific.clone();
+            detail.tertiary = snapshot.tertiary.clone();
+            detail.extra_rate_windows = snapshot.extra_rate_windows.clone();
+            detail.inventory = snapshot.inventory.clone();
+            detail.display_details = snapshot.display_details.clone();
+            detail.cost = snapshot.cost.clone();
+            detail.pace = snapshot.pace.clone();
         }
-        detail.last_error = snap.error.clone();
+        detail.last_error = snapshot.error.clone();
+        detail.error_state = Some(snapshot.error_state);
         detail.has_snapshot = true;
+    }
+
+    if detail.usage_items.is_empty() {
+        detail.usage_items = super::usage_item_descriptors(None, &settings, parsed_provider_id);
     }
 
     Ok(detail)
 }
 
 #[tauri::command]
-pub fn revoke_provider_credentials(provider_id: String) -> Result<(), String> {
+pub fn revoke_provider_credentials(
+    app: tauri::AppHandle,
+    provider_id: String,
+) -> Result<(), String> {
     // Best-effort: drop every app-managed credential for this provider so the
     // caller can follow up with a fresh login or import. Missing entries are
     // silently ignored; only I/O errors propagate.
     let id = parse_provider_arg(&provider_id)?;
     let provider_id = id.cli_name();
+    crate::auto_resume::clear(&app, id);
 
     let mut keys = ApiKeys::load();
     keys.remove(provider_id);

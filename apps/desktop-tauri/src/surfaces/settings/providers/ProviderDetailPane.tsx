@@ -1,13 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
-import type {
-  CookieSourceOption,
-  CredentialStorageStatus,
-  ProviderDetail,
-  RegionOption,
-  SettingsSnapshot,
-  SettingsUpdate,
-} from "../../../types/bridge";
+import { useCallback, useEffect, useReducer } from "react";
+import type { SettingsSnapshot, SettingsUpdate } from "../../../types/bridge";
 import { useLocale } from "../../../hooks/useLocale";
+import { providerAllowsPace } from "../../../lib/providerPace";
 import {
   getCredentialStorageStatus,
   getProviderCookieSourceOptions,
@@ -18,34 +12,53 @@ import {
   openProviderStatusPage,
   refreshProviders,
   revokeProviderCredentials,
+  setProviderGatewayUrl,
   triggerProviderLogin,
 } from "../../../lib/tauri";
 import { listen } from "@tauri-apps/api/event";
 
+import {
+  initialState,
+  providerDetailPaneReducer,
+} from "./providerDetailPaneState";
+import { buildSubtitle } from "./providerDetailFormat";
 import { IdentitySection } from "./sections/IdentitySection";
 import { UsageSection } from "./sections/UsageSection";
+import { UsageItemVisibilitySection } from "./sections/UsageItemVisibilitySection";
+import { AutoResumeSection } from "./sections/AutoResumeSection";
 import { PaceSection } from "./sections/PaceSection";
 import { CostSection } from "./sections/CostSection";
 import { QuickActionsSection } from "./sections/QuickActionsSection";
 import { ChartsSection } from "./sections/charts/ChartsSection";
 import { CookieSourceSection } from "./sections/CookieSourceSection";
+import { UsageSourceSection } from "./sections/UsageSourceSection";
+import { shouldShowCookieSource } from "./sections/usageSourcePolicy";
 import { RegionSection } from "./sections/RegionSection";
-import { GeminiCliCreds } from "./sections/credentials/GeminiCliCreds";
-import { VertexAiCreds } from "./sections/credentials/VertexAiCreds";
-import { JetBrainsCreds } from "./sections/credentials/JetBrainsCreds";
-import { KiroCreds } from "./sections/credentials/KiroCreds";
-import { ClaudeCreds } from "./sections/credentials/ClaudeCreds";
-import { OpenAiExtras } from "./sections/credentials/OpenAiExtras";
+import { CopilotSeatCreditOptions } from "./sections/credentials/CopilotSeatCreditOptions";
+import { CodexAccountsSection } from "./sections/credentials/CodexAccountsSection";
+import { ClaudeAccountsSection } from "./sections/credentials/ClaudeAccountsSection";
+import { GrokAccountsSection } from "./sections/credentials/GrokAccountsSection";
 import { TokenAccountsPanel } from "../tokens/TokenAccountsPanel";
 import { ApiKeySection } from "./ApiKeySection";
 import { CookieSection } from "./CookieSection";
 import { MenuBarMetricSection } from "./sections/MenuBarMetricSection";
+import { AccentColorSection } from "./sections/AccentColorSection";
+import { ProviderIssueNotice } from "./sections/ProviderIssueNotice";
+import { CredentialStorageSection } from "./sections/CredentialStorageSection";
+import { CredentialsDispatcher } from "./sections/CredentialsDispatcher";
+import { WayfinderGatewaySection } from "./sections/WayfinderGatewaySection";
+import { AzureApiVersionSection } from "./sections/AzureApiVersionSection";
 
 interface Props {
   providerId: string | null;
   cookieDomain?: string | null;
   resetTimeRelative: boolean;
   providerMetrics: SettingsSnapshot["providerMetrics"];
+  copilotSeatCreditEntitlement: SettingsSnapshot["copilotSeatCreditEntitlement"];
+  /** Per-provider accent color overrides (CLI name → hex color). */
+  providerAccentColors: SettingsSnapshot["providerAccentColors"];
+  wayfinderGatewayUrl: string;
+  hidePersonalInfo: boolean;
   settingsDisabled: boolean;
   onSettingsChange: (patch: SettingsUpdate) => void;
 }
@@ -55,32 +68,91 @@ interface Props {
  *
  * Top-level port of
  * `rust/src/native_ui/preferences.rs::render_provider_detail_panel`
- * (lines 4301–6698). Only the header, usage bars, pace, cost and the
- * quick-action bar are implemented here. Cookie-source picker (6c),
- * credential detection UIs (6d), inline token accounts (6e) and charts
- * (6f) are wired in as sub-sections below.
+ * (lines 4301–6698).
  */
 export function ProviderDetailPane({
   providerId,
   cookieDomain = null,
   resetTimeRelative,
   providerMetrics,
+  copilotSeatCreditEntitlement,
+  providerAccentColors,
+  wayfinderGatewayUrl,
+  hidePersonalInfo,
   settingsDisabled,
   onSettingsChange,
 }: Props) {
-  const { t } = useLocale();
-  const [detail, setDetail] = useState<ProviderDetail | null>(null);
-  const [cookieOptions, setCookieOptions] = useState<CookieSourceOption[]>([]);
-  const [regionOptions, setRegionOptions] = useState<RegionOption[]>([]);
-  const [credentialStatus, setCredentialStatus] =
-    useState<CredentialStorageStatus | null>(null);
-  const [credentialRevision, setCredentialRevision] = useState(0);
-  const [tokenProviderIds, setTokenProviderIds] = useState<Set<string>>(
-    () => new Set(),
+  const { t, language } = useLocale();
+  const [state, dispatch] = useReducer(
+    providerDetailPaneReducer,
+    { wayfinderGatewayUrl, providerId },
+    (init) => initialState(init.wayfinderGatewayUrl, init.providerId),
   );
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+
+  if (
+    providerId !== state.syncedProviderId ||
+    wayfinderGatewayUrl !== state.syncedGatewayUrl
+  ) {
+    dispatch({ type: "SYNC_PROPS", providerId, wayfinderGatewayUrl });
+  }
+
+  const {
+    detail,
+    cookieOptions,
+    regionOptions,
+    credentialStatus,
+    credentialRevision,
+    tokenProviderIds,
+    loading,
+    error,
+    busy,
+    gatewayDraft,
+    gatewayError,
+  } = state;
+
+  const setErr = (e: unknown) =>
+    dispatch({ type: "SET_ERROR", error: String(e) });
+  const setBusy = (value: boolean) =>
+    dispatch({ type: "SET_BUSY", busy: value });
+
+  const load = useCallback(async (id: string, signal?: { stale: boolean }) => {
+    dispatch({ type: "LOAD_START" });
+    try {
+      const [next, cookieOpts, regionOpts, storageStatus] = await Promise.all([
+        getProviderDetail(id),
+        getProviderCookieSourceOptions(id),
+        getProviderRegionOptions(id),
+        getCredentialStorageStatus(),
+      ]);
+      if (signal?.stale) return;
+      dispatch({
+        type: "LOAD_SUCCESS",
+        detail: next,
+        cookieOptions: cookieOpts,
+        regionOptions: regionOpts,
+        credentialStatus: storageStatus,
+      });
+    } catch (e) {
+      if (signal?.stale) return;
+      dispatch({ type: "LOAD_ERROR", error: String(e) });
+    } finally {
+      // Keep stale guard — concurrent provider switches must not clear loading
+      // for the in-flight replacement load.
+      if (!signal?.stale) dispatch({ type: "LOAD_FINISH" });
+    }
+  }, []);
+
+  const saveGateway = async () => {
+    dispatch({ type: "SAVE_GATEWAY_START" });
+    try {
+      await setProviderGatewayUrl("wayfinder", gatewayDraft);
+      await load("wayfinder");
+    } catch (e) {
+      dispatch({ type: "SAVE_GATEWAY_ERROR", error: String(e) });
+    } finally {
+      setBusy(false);
+    }
+  };
 
   // Load the set of providers that support token accounts once.
   useEffect(() => {
@@ -88,7 +160,10 @@ export function ProviderDetailPane({
     void getTokenAccountProviders()
       .then((list) => {
         if (!cancelled) {
-          setTokenProviderIds(new Set(list.map((p) => p.providerId)));
+          dispatch({
+            type: "SET_TOKEN_PROVIDERS",
+            ids: list.map((p) => p.providerId),
+          });
         }
       })
       .catch(() => {
@@ -99,48 +174,18 @@ export function ProviderDetailPane({
     };
   }, []);
 
-  const load = useCallback(async (id: string, signal?: { stale: boolean }) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const [next, cookieOpts, regionOpts, storageStatus] = await Promise.all([
-        getProviderDetail(id),
-        getProviderCookieSourceOptions(id),
-        getProviderRegionOptions(id),
-        getCredentialStorageStatus(),
-      ]);
-      if (signal?.stale) return;
-      setDetail(next);
-      setCookieOptions(cookieOpts);
-      setRegionOptions(regionOpts);
-      setCredentialStatus(storageStatus);
-    } catch (e) {
-      if (signal?.stale) return;
-      setError(String(e));
-      setDetail(null);
-      setCookieOptions([]);
-      setRegionOptions([]);
-      setCredentialStatus(null);
-    } finally {
-      if (!signal?.stale) setLoading(false);
-    }
-  }, []);
-
   useEffect(() => {
     if (!providerId) {
-      setDetail(null);
-      setCookieOptions([]);
-      setRegionOptions([]);
+      dispatch({ type: "LOAD_CLEAR", mode: "empty" });
       return;
     }
     // Clear stale detail immediately so we don't render the old provider
-    setDetail(null);
-    setCookieOptions([]);
-    setRegionOptions([]);
-    setCredentialStatus(null);
+    dispatch({ type: "LOAD_CLEAR", mode: "switch" });
     const signal = { stale: false };
     void load(providerId, signal);
-    return () => { signal.stale = true; };
+    return () => {
+      signal.stale = true;
+    };
   }, [providerId, load]);
 
   // Live-refresh when a new snapshot lands for this provider.
@@ -151,9 +196,7 @@ export function ProviderDetailPane({
       "provider-updated",
       (event) => {
         const pid = event.payload?.providerId;
-        if (!pid || pid === providerId) {
-          void load(providerId, signal);
-        }
+        if (!pid || pid === providerId) void load(providerId, signal);
       },
     );
     return () => {
@@ -162,46 +205,42 @@ export function ProviderDetailPane({
     };
   }, [providerId, load]);
 
+  // Visibility changes are persisted through the shared settings command and
+  // broadcast to detached windows. Reload the selected provider so the raw
+  // descriptor list and hidden IDs stay authoritative after that event.
+  useEffect(() => {
+    if (!providerId) return;
+    const signal = { stale: false };
+    const unlistenPromise = listen("settings-changed", () => {
+      void load(providerId, signal);
+    });
+    return () => {
+      signal.stale = true;
+      void unlistenPromise.then((fn) => fn());
+    };
+  }, [providerId, load]);
+
   if (!providerId) {
-    return (
-      <div className="provider-detail">
-        <div className="provider-detail-empty">
-          {t("StateNoProviderSelected")}
-        </div>
-      </div>
-    );
+    return emptyDetail(t("StateNoProviderSelected"));
   }
-
   if (loading && !detail) {
-    return (
-      <div className="provider-detail">
-        <div className="provider-detail-empty">
-          {t("StateLoadingProviders")}
-        </div>
-      </div>
-    );
+    return emptyDetail(t("StateLoadingProviders"));
   }
-
   if (error && !detail) {
-    return (
-      <div className="provider-detail">
-        <div className="provider-detail-empty provider-detail-empty--error">
-          {t("StateError")}: {error}
-        </div>
-      </div>
-    );
+    return emptyDetail(`${t("StateError")}: ${error}`, true);
   }
-
   if (!detail) return null;
 
   const subtitle = buildSubtitle(detail, t);
+  const reload = () => void load(detail.id);
+  const credKey = `${detail.id}-${credentialRevision}`;
 
   const handleRefresh = async () => {
     setBusy(true);
     try {
       await refreshProviders();
     } catch (e) {
-      setError(String(e));
+      setErr(e);
     } finally {
       setBusy(false);
     }
@@ -211,11 +250,11 @@ export function ProviderDetailPane({
     setBusy(true);
     try {
       await triggerProviderLogin(detail.id);
-      setCredentialRevision((value) => value + 1);
+      dispatch({ type: "BUMP_CREDENTIAL_REVISION" });
       await refreshProviders();
       await load(detail.id);
     } catch (e) {
-      setError(String(e));
+      setErr(e);
     } finally {
       setBusy(false);
     }
@@ -223,35 +262,27 @@ export function ProviderDetailPane({
 
   const handleRevokeCredentials = async () => {
     setBusy(true);
-    setError(null);
+    dispatch({ type: "SET_ERROR", error: null });
     try {
       await revokeProviderCredentials(detail.id);
-      setCredentialRevision((value) => value + 1);
+      dispatch({ type: "BUMP_CREDENTIAL_REVISION" });
       await load(detail.id);
     } catch (e) {
-      setError(String(e));
+      setErr(e);
     } finally {
       setBusy(false);
     }
   };
 
   const handleOpenDashboard = () => {
-    void openProviderDashboard(detail.id).catch((e) => setError(String(e)));
+    void openProviderDashboard(detail.id).catch(setErr);
   };
-
   const handleOpenStatusPage = () => {
-    void openProviderStatusPage(detail.id).catch((e) => setError(String(e)));
+    void openProviderStatusPage(detail.id).catch(setErr);
   };
-
-  const handleCopyError = () => {
-    if (detail.lastError && navigator.clipboard) {
-      void navigator.clipboard.writeText(detail.lastError);
-    }
-  };
-
   const handleBuyCredits = () => {
     if (detail.buyCreditsUrl) {
-      void openProviderDashboard(detail.id).catch((e) => setError(String(e)));
+      void openProviderDashboard(detail.id).catch(setErr);
     }
   };
 
@@ -259,12 +290,14 @@ export function ProviderDetailPane({
     <div className="provider-detail">
       <IdentitySection provider={detail} subtitle={subtitle} t={t} />
 
+      {detail.id === "codex" && (
+        <CodexAccountsSection t={t} hidePersonalInfo={hidePersonalInfo} />
+      )}
+      {detail.id === "claude" && <ClaudeAccountsSection t={t} language={language} />}
+      {detail.id === "grok" && <GrokAccountsSection t={t} />}
+
       {detail.lastError && (
-        <ProviderIssueNotice
-          detail={detail}
-          message={detail.lastError}
-          onCopy={handleCopyError}
-        />
+        <ProviderIssueNotice detail={detail} t={t} />
       )}
 
       <UsageSection
@@ -272,6 +305,33 @@ export function ProviderDetailPane({
         resetTimeRelative={resetTimeRelative}
         t={t}
       />
+      <UsageItemVisibilitySection
+        provider={detail}
+        disabled={settingsDisabled}
+        t={t}
+        onChange={onSettingsChange}
+      />
+      <AutoResumeSection
+        providerId={detail.id}
+        enabled={detail.autoResumeAfterQuotaReset}
+        available={detail.autoResumeSupported}
+        disabled={settingsDisabled}
+        t={t}
+        onChanged={reload}
+      />
+      {detail.id === "wayfinder" && (
+        <WayfinderGatewaySection
+          draft={gatewayDraft}
+          error={gatewayError}
+          busy={busy}
+          disabled={settingsDisabled}
+          onDraftChange={(draft) =>
+            dispatch({ type: "SET_GATEWAY_DRAFT", draft })
+          }
+          onSave={() => void saveGateway()}
+          t={t}
+        />
+      )}
       <MenuBarMetricSection
         provider={detail}
         providerMetrics={providerMetrics}
@@ -279,49 +339,76 @@ export function ProviderDetailPane({
         t={t}
         onChange={onSettingsChange}
       />
-      <PaceSection pace={detail.pace} t={t} />
+      <AccentColorSection
+        providerId={detail.id}
+        accentColor={providerAccentColors[detail.id] ?? null}
+        t={t}
+        onChange={onSettingsChange}
+      />
+      <PaceSection
+        pace={
+          providerAllowsPace(detail.id, detail.sourceLabel)
+            ? detail.pace
+            : null
+        }
+        t={t}
+      />
       <CostSection cost={detail.cost} t={t} />
 
-      {/* Per-provider sub-sections ported in Phases 6c–6f. */}
-      <CookieSourceSection
+      <UsageSourceSection
         providerId={detail.id}
-        currentValue={detail.cookieSource}
-        options={cookieOptions}
+        currentValue={detail.usageSource}
         t={t}
-        onChanged={() => void load(detail.id)}
+        onChanged={reload}
       />
+      {shouldShowCookieSource(detail.id, detail.usageSource) && (
+        <CookieSourceSection
+          providerId={detail.id}
+          currentValue={detail.cookieSource}
+          options={cookieOptions}
+          t={t}
+          onChanged={reload}
+        />
+      )}
       <RegionSection
         providerId={detail.id}
         currentValue={detail.region}
         options={regionOptions}
         t={t}
-        onChanged={() => void load(detail.id)}
+        onChanged={reload}
       />
+      {detail.id === "azureopenai" && (
+        <AzureApiVersionSection
+          providerId={detail.id}
+          disabled={settingsDisabled}
+          onChanged={reload}
+        />
+      )}
       <CredentialsDispatcher providerId={detail.id} t={t} />
+
       <CredentialStorageSection
         status={credentialStatus}
         busy={busy}
         onRevoke={handleRevokeCredentials}
+        t={t}
       />
       {tokenProviderIds.has(detail.id) && (
         <TokenAccountsPanel
-          key={`token-${detail.id}-${credentialRevision}`}
+          key={`token-${credKey}`}
           providerId={detail.id}
           compact
         />
       )}
-      <ApiKeySection
-        key={`api-${detail.id}-${credentialRevision}`}
-        providerId={detail.id}
-      />
+      <ApiKeySection key={`api-${credKey}`} providerId={detail.id} />
       <CookieSection
-        key={`cookie-${detail.id}-${credentialRevision}`}
+        key={`cookie-${credKey}`}
         providerId={detail.id}
         cookieDomain={cookieDomain}
       />
       <ChartsSection
         providerId={detail.id}
         accountEmail={detail.email}
+        accentColor={providerAccentColors[detail.id]}
         t={t}
       />
 
@@ -332,7 +419,6 @@ export function ProviderDetailPane({
         onSwitchAccount={handleSwitchAccount}
         onOpenDashboard={handleOpenDashboard}
         onOpenStatusPage={handleOpenStatusPage}
-        onCopyError={handleCopyError}
         onBuyCredits={handleBuyCredits}
         t={t}
       />
@@ -340,156 +426,18 @@ export function ProviderDetailPane({
   );
 }
 
-function ProviderIssueNotice({
-  detail,
-  message,
-  onCopy,
-}: {
-  detail: ProviderDetail;
-  message: string;
-  onCopy: () => void;
-}) {
-  const cleaned = message.replace(/^last fetch failed:\s*/i, "").trim();
-  const lower = cleaned.toLowerCase();
-  const needsLogin =
-    lower.includes("auth.json not found") ||
-    lower.includes("not signed in") ||
-    lower.includes("credentials not found") ||
-    lower.includes("oauth credentials not found") ||
-    lower.includes("run `") ||
-    lower.includes("run codex") ||
-    lower.includes("run claude");
-  const title = needsLogin
-    ? `${detail.displayName} needs sign-in`
-    : "Provider fetch needs attention";
-
+function emptyDetail(message: string, isError = false) {
   return (
-    <div className="provider-detail-error" role="status">
-      <div className="provider-detail-error__header">
-        <strong>{title}</strong>
-        <button
-          type="button"
-          className="provider-detail-error__copy"
-          onClick={onCopy}
-        >
-          Copy
-        </button>
+    <div className="provider-detail">
+      <div
+        className={
+          isError
+            ? "provider-detail-empty provider-detail-empty--error"
+            : "provider-detail-empty"
+        }
+      >
+        {message}
       </div>
-      <p>{cleaned}</p>
     </div>
   );
-}
-
-function CredentialStorageSection({
-  status,
-  busy,
-  onRevoke,
-}: {
-  status: CredentialStorageStatus | null;
-  busy: boolean;
-  onRevoke: () => void;
-}) {
-  if (!status) return null;
-
-  return (
-    <section className="provider-detail-section provider-detail-credential-storage">
-      <div className="provider-detail-section__header">
-        <h4>Credential Storage</h4>
-        <button
-          className="credential-btn credential-btn--danger"
-          disabled={busy}
-          onClick={onRevoke}
-        >
-          Revoke Stored Credentials
-        </button>
-      </div>
-      <dl className="provider-detail-grid provider-detail-grid--storage">
-        <dt>API keys</dt>
-        <dd>{storageLabel(status.apiKeys)}</dd>
-        <dt>Manual cookies</dt>
-        <dd>{storageLabel(status.manualCookies)}</dd>
-        <dt>Token accounts</dt>
-        <dd>{storageLabel(status.tokenAccounts)}</dd>
-      </dl>
-    </section>
-  );
-}
-
-function storageLabel(value: string): string {
-  if (value.startsWith("protected:")) {
-    return `Protected (${value.slice("protected:".length)})`;
-  }
-  switch (value) {
-    case "missing":
-      return "Not created";
-    case "plaintext":
-      return "Plaintext";
-    case "unavailable":
-      return "Unavailable";
-    case "unreadable":
-      return "Unreadable";
-    default:
-      return value;
-  }
-}
-
-function buildSubtitle(
-  detail: ProviderDetail,
-  t: (k: Parameters<ReturnType<typeof useLocale>["t"]>[0]) => string,
-): string {
-  const parts: string[] = [];
-  if (detail.sourceLabel) parts.push(detail.sourceLabel);
-  if (detail.lastUpdated) {
-    const ago = relativeAgo(detail.lastUpdated);
-    if (ago) parts.push(`${t("DetailUpdatedPrefix")} ${ago}`);
-  } else if (!detail.hasSnapshot) {
-    parts.push(t("ProviderUsageNotFetchedYet"));
-  }
-  return parts.join(" · ");
-}
-
-function relativeAgo(iso: string): string | null {
-  const t = new Date(iso).getTime();
-  if (!Number.isFinite(t)) return null;
-  const diff = Date.now() - t;
-  const secs = Math.round(Math.abs(diff) / 1000);
-  if (secs < 60) return `${secs}s`;
-  const mins = Math.round(secs / 60);
-  if (mins < 60) return `${mins}m`;
-  const hrs = Math.round(mins / 60);
-  if (hrs < 24) return `${hrs}h`;
-  return `${Math.round(hrs / 24)}d`;
-}
-
-/**
- * Dispatch the appropriate Phase-6d credential component based on the
- * current provider. Providers without a bespoke credentials UI render
- * nothing. Mirrors the `provider_id == ProviderId::*` chain in
- * `rust/src/native_ui/preferences.rs::render_provider_detail_panel`.
- */
-function CredentialsDispatcher({
-  providerId,
-  t,
-}: {
-  providerId: string;
-  t: ReturnType<typeof useLocale>["t"];
-}) {
-  switch (providerId) {
-    case "gemini":
-      return <GeminiCliCreds providerId={providerId} t={t} />;
-    case "vertexai":
-      return <VertexAiCreds providerId={providerId} t={t} />;
-    case "jetbrains":
-      return <JetBrainsCreds t={t} />;
-    case "kiro":
-      return <KiroCreds t={t} />;
-    case "claude":
-      return <ClaudeCreds t={t} />;
-    case "codex":
-      return <OpenAiExtras providerId={providerId} t={t} />;
-    case "openaiapi":
-      return <OpenAiExtras providerId={providerId} t={t} />;
-    default:
-      return null;
-  }
 }

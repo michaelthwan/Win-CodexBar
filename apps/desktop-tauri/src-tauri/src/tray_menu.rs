@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 
 use crate::commands::ProviderCatalogEntry;
+use codexbar::locale::{self, LocaleKey};
+use codexbar::settings::Language;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrayMenuEntry {
@@ -15,7 +17,7 @@ pub(crate) struct TrayMenuEntry {
 }
 
 impl TrayMenuEntry {
-    fn item(id: impl Into<String>, label: impl Into<String>) -> Self {
+    pub(crate) fn item(id: impl Into<String>, label: impl Into<String>) -> Self {
         Self {
             id: Some(id.into()),
             label: label.into(),
@@ -27,7 +29,11 @@ impl TrayMenuEntry {
     }
 
     /// A checkbox menu item. `checked` mirrors the provider's enabled state.
-    fn check_item(id: impl Into<String>, label: impl Into<String>, checked: bool) -> Self {
+    pub(crate) fn check_item(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        checked: bool,
+    ) -> Self {
         Self {
             id: Some(id.into()),
             label: label.into(),
@@ -38,9 +44,13 @@ impl TrayMenuEntry {
         }
     }
 
-    fn submenu(label: impl Into<String>, children: Vec<Self>) -> Self {
+    pub(crate) fn submenu(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        children: Vec<Self>,
+    ) -> Self {
         Self {
-            id: None,
+            id: Some(id.into()),
             label: label.into(),
             children,
             is_separator: false,
@@ -49,7 +59,7 @@ impl TrayMenuEntry {
         }
     }
 
-    fn separator() -> Self {
+    pub(crate) fn separator() -> Self {
         Self {
             id: None,
             label: String::new(),
@@ -70,26 +80,21 @@ impl TrayMenuEntry {
             checked: None,
         }
     }
-
-    fn path_segment(&self) -> Option<String> {
-        if self.is_separator {
-            return None;
-        }
-
-        Some(
-            self.id
-                .clone()
-                .unwrap_or_else(|| self.label.to_ascii_lowercase().replace(' ', "_")),
-        )
-    }
 }
 
+#[cfg(test)]
 pub(crate) fn build_tray_menu(
     providers: &[ProviderCatalogEntry],
     status_labels: &[(String, String)],
     enabled_providers: &HashSet<String>,
 ) -> Vec<TrayMenuEntry> {
-    build_tray_menu_with(providers, status_labels, enabled_providers, false)
+    build_tray_menu_with(
+        providers,
+        status_labels,
+        enabled_providers,
+        false,
+        Language::English,
+    )
 }
 
 pub(crate) fn build_tray_menu_with(
@@ -97,8 +102,10 @@ pub(crate) fn build_tray_menu_with(
     status_labels: &[(String, String)],
     enabled_providers: &HashSet<String>,
     float_bar_enabled: bool,
+    lang: Language,
 ) -> Vec<TrayMenuEntry> {
     let mut menu: Vec<TrayMenuEntry> = Vec::new();
+    let text = |key| locale::get_text(lang, key);
 
     // Status rows (one per enabled provider with live usage).
     for (id, label) in status_labels {
@@ -108,19 +115,29 @@ pub(crate) fn build_tray_menu_with(
         menu.push(TrayMenuEntry::separator());
     }
 
-    menu.push(TrayMenuEntry::item("refresh", "Refresh All"));
-    menu.push(TrayMenuEntry::item("pop_out", "Pop Out Dashboard"));
-    menu.push(TrayMenuEntry::item("show_panel", "Show Panel"));
+    menu.push(TrayMenuEntry::item(
+        "refresh",
+        text(LocaleKey::TrayRefreshAll),
+    ));
+    menu.push(TrayMenuEntry::item(
+        "pop_out",
+        text(LocaleKey::TrayPopOutDashboard),
+    ));
+    menu.push(TrayMenuEntry::item(
+        "show_panel",
+        text(LocaleKey::TrayShowWindow),
+    ));
     menu.push(TrayMenuEntry::check_item(
         "toggle_float_bar",
-        "Show Float Bar",
+        text(LocaleKey::TrayShowFloatBar),
         float_bar_enabled,
     ));
     menu.push(TrayMenuEntry::separator());
 
     if !providers.is_empty() {
         menu.push(TrayMenuEntry::submenu(
-            "Providers",
+            "providers",
+            text(LocaleKey::TrayProviders),
             providers
                 .iter()
                 .map(|provider| {
@@ -136,85 +153,19 @@ pub(crate) fn build_tray_menu_with(
         menu.push(TrayMenuEntry::separator());
     }
 
-    menu.push(TrayMenuEntry::item("settings", "Settings"));
+    menu.push(TrayMenuEntry::item(
+        "settings",
+        text(LocaleKey::TraySettings),
+    ));
     menu.push(TrayMenuEntry::item(
         "check_for_updates",
-        "Check for Updates",
+        text(LocaleKey::TrayCheckForUpdates),
     ));
-    menu.push(TrayMenuEntry::item("about", "About"));
+    menu.push(TrayMenuEntry::item("about", text(LocaleKey::MenuAbout)));
     menu.push(TrayMenuEntry::separator());
-    menu.push(TrayMenuEntry::item("quit", "Quit CodexBar"));
+    menu.push(TrayMenuEntry::item("quit", text(LocaleKey::MenuQuit)));
 
     menu
-}
-
-pub(crate) fn proof_menu_items(entries: &[TrayMenuEntry], menu_path: &str) -> Option<Vec<String>> {
-    proof_menu_entries(entries, menu_path).map(|visible_entries| {
-        visible_entries
-            .iter()
-            .filter(|entry| !entry.is_separator)
-            .map(|entry| entry.label.clone())
-            .collect()
-    })
-}
-
-pub(crate) fn proof_menu_context_for_item(
-    entries: &[TrayMenuEntry],
-    item_id: &str,
-) -> Option<(String, Vec<String>)> {
-    proof_menu_context_for_item_inner(entries, item_id, "tray")
-}
-
-fn proof_menu_context_for_item_inner(
-    entries: &[TrayMenuEntry],
-    item_id: &str,
-    menu_path: &str,
-) -> Option<(String, Vec<String>)> {
-    for entry in entries {
-        if entry.is_separator {
-            continue;
-        }
-
-        if entry.id.as_deref() == Some(item_id) {
-            return proof_menu_items(entries, menu_path)
-                .map(|items| (menu_path.to_string(), items));
-        }
-
-        if entry.children.is_empty() {
-            continue;
-        }
-
-        let next_path = format!("{menu_path}/{}", entry.path_segment()?);
-        if let Some(context) =
-            proof_menu_context_for_item_inner(&entry.children, item_id, &next_path)
-        {
-            return Some(context);
-        }
-    }
-
-    None
-}
-
-fn proof_menu_entries<'a>(
-    entries: &'a [TrayMenuEntry],
-    menu_path: &str,
-) -> Option<&'a [TrayMenuEntry]> {
-    let mut segments = menu_path.split('/');
-    if segments.next()? != "tray" {
-        return None;
-    }
-
-    let mut current = entries;
-    for segment in segments {
-        let submenu = current.iter().find(|entry| {
-            !entry.is_separator
-                && !entry.children.is_empty()
-                && entry.path_segment().as_deref() == Some(segment)
-        })?;
-        current = &submenu.children;
-    }
-
-    Some(current)
 }
 
 #[cfg(test)]
@@ -250,53 +201,6 @@ mod tests {
     }
 
     #[test]
-    fn proof_menu_items_follow_current_context() {
-        let items = proof_menu_items(
-            &build_tray_menu(&sample_provider_catalog(), &[], &both_enabled()),
-            "tray",
-        )
-        .unwrap();
-
-        assert_eq!(
-            items,
-            vec![
-                "Refresh All",
-                "Pop Out Dashboard",
-                "Show Panel",
-                "Show Float Bar",
-                "Providers",
-                "Settings",
-                "Check for Updates",
-                "About",
-                "Quit CodexBar",
-            ]
-        );
-    }
-
-    #[test]
-    fn proof_menu_items_follow_submenu_context() {
-        let items = proof_menu_items(
-            &build_tray_menu(&sample_provider_catalog(), &[], &both_enabled()),
-            "tray/providers",
-        )
-        .unwrap();
-
-        assert_eq!(items, vec!["Codex", "Claude"]);
-    }
-
-    #[test]
-    fn proof_menu_context_for_leaf_item_returns_parent_menu() {
-        let (menu_path, items) = proof_menu_context_for_item(
-            &build_tray_menu(&sample_provider_catalog(), &[], &both_enabled()),
-            "about",
-        )
-        .unwrap();
-
-        assert_eq!(menu_path, "tray");
-        assert!(items.iter().any(|item| item == "About"));
-    }
-
-    #[test]
     fn check_for_updates_item_is_present() {
         let menu = build_tray_menu(&sample_provider_catalog(), &[], &both_enabled());
         assert!(menu_contains(&menu, "check_for_updates"));
@@ -311,7 +215,7 @@ mod tests {
         );
         let providers_submenu = menu
             .iter()
-            .find(|e| e.label == "Providers")
+            .find(|e| e.id.as_deref() == Some("providers"))
             .expect("providers submenu");
 
         let claude_item = providers_submenu
@@ -336,6 +240,7 @@ mod tests {
             &[],
             &both_enabled(),
             /* float_bar_enabled = */ true,
+            Language::English,
         );
         let toggle = menu_on
             .iter()
@@ -349,12 +254,46 @@ mod tests {
             &[],
             &both_enabled(),
             /* float_bar_enabled = */ false,
+            Language::English,
         );
         let toggle = menu_off
             .iter()
             .find(|e| e.id.as_deref() == Some("toggle_float_bar"))
             .expect("float bar toggle present");
         assert_eq!(toggle.checked, Some(false));
+    }
+
+    #[test]
+    fn tray_menu_static_labels_follow_language_but_provider_names_stay_raw() {
+        let menu = build_tray_menu_with(
+            &sample_provider_catalog(),
+            &[],
+            &both_enabled(),
+            false,
+            Language::Japanese,
+        );
+        fn label_for<'a>(menu: &'a [TrayMenuEntry], id: &'a str) -> &'a str {
+            menu.iter()
+                .find(|e| e.id.as_deref() == Some(id))
+                .map(|e| e.label.as_str())
+                .expect(id)
+        }
+
+        assert_eq!(label_for(&menu, "refresh"), "すべて更新");
+        assert_eq!(label_for(&menu, "show_panel"), "ウィンドウを表示");
+        assert_eq!(label_for(&menu, "settings"), "設定...");
+        assert_eq!(label_for(&menu, "quit"), "終了");
+
+        let providers = menu
+            .iter()
+            .find(|e| e.id.as_deref() == Some("providers"))
+            .expect("providers submenu");
+        let provider_labels: Vec<&str> = providers
+            .children
+            .iter()
+            .map(|e| e.label.as_str())
+            .collect();
+        assert_eq!(provider_labels, vec!["Codex", "Claude"]);
     }
 
     #[test]

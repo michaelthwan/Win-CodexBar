@@ -24,18 +24,27 @@ export function orderedEnabledProviderSlots(
   catalog: ProviderCatalogEntry[],
   enabledProviderIds: string[],
   snapshots: ProviderUsageSnapshot[],
+  providerOrder: string[] = [],
 ): TrayProviderSlot[] {
   const enabled = new Set(enabledProviderIds);
+  const catalogById = new Map(catalog.map((provider) => [provider.id, provider]));
   const snapshotNames = new Map(
     snapshots.map((provider) => [provider.providerId, provider.displayName]),
   );
   const slots: TrayProviderSlot[] = [];
   const seen = new Set<string>();
+  const orderedIds = providerOrder.length > 0
+    ? providerOrder
+    : catalog.map((provider) => provider.id);
 
-  for (const provider of catalog) {
-    if (!enabled.has(provider.id)) continue;
-    seen.add(provider.id);
-    slots.push({ id: provider.id, displayName: provider.displayName });
+  for (const providerId of orderedIds) {
+    if (!enabled.has(providerId)) continue;
+    seen.add(providerId);
+    slots.push({
+      id: providerId,
+      displayName:
+        catalogById.get(providerId)?.displayName ?? snapshotNames.get(providerId) ?? providerId,
+    });
   }
 
   for (const providerId of enabledProviderIds) {
@@ -57,6 +66,7 @@ export function providerPlaceholder(
     providerId,
     displayName,
     primary: { ...EMPTY_RATE_WINDOW },
+    selectedMetric: { ...EMPTY_RATE_WINDOW },
     primaryLabel: "Usage",
     secondary: null,
     modelSpecific: null,
@@ -68,6 +78,7 @@ export function providerPlaceholder(
     sourceLabel: "pending",
     updatedAt: new Date(0).toISOString(),
     error: "Loading provider data...",
+    errorState: "unknown",
     pace: null,
     accountOrganization: null,
     trayStatusLabel: null,

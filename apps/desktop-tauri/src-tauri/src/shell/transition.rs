@@ -6,7 +6,6 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Manager, WebviewWindow};
 
 use crate::events;
-use crate::proof_harness;
 use crate::state::AppState;
 use crate::surface::{SurfaceMode, SurfaceTransition, WindowProperties};
 use crate::surface_target::SurfaceTarget;
@@ -24,6 +23,32 @@ use super::{SHELL_TRANSITION_SERIAL, ShellTransitionRequest};
 /// physical coordinates through without manual division.
 fn os_position(_window: &WebviewWindow, x: i32, y: i32) -> tauri::PhysicalPosition<i32> {
     tauri::PhysicalPosition::new(x, y)
+}
+
+// `should_force_tray_panel_reveal` is the predicate the (now-removed)
+// startup tray-panel reveal fallback used to decide whether to force-show
+// a hidden/tiny `main` window. The fallback itself was deleted once `main`
+// could no longer transition into `SurfaceMode::TrayPanel` (that mode opens
+// as the dedicated `flyout` window — see `shell::flyout_window`). The
+// predicate is retained under `#[cfg(test)]` because `shell::tests` still
+// exercises it as a pure unit.
+#[cfg(test)]
+pub(super) fn should_force_tray_panel_reveal(
+    current: SurfaceMode,
+    main_window_visible: bool,
+    main_window_size: Option<(u32, u32)>,
+) -> bool {
+    current == SurfaceMode::TrayPanel
+        && (!main_window_visible
+            || main_window_size.is_some_and(|(width, height)| width < 100 || height < 100))
+}
+
+fn mark_tray_panel_shown(app: &AppHandle) {
+    if let Some(state) = app.try_state::<Mutex<AppState>>()
+        && let Ok(mut guard) = state.lock()
+    {
+        guard.mark_tray_panel_shown(std::time::Instant::now());
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,9 +379,6 @@ pub(super) fn restore_surface_snapshot(state: &mut AppState, snapshot: &SurfaceS
     if snapshot.mode == SurfaceMode::Hidden {
         let _ = state.hide_surface();
     } else {
-        if snapshot.mode == SurfaceMode::TrayPanel {
-            state.last_shown_at = Some(std::time::Instant::now());
-        }
         let _ = state.transition_surface(snapshot.mode, snapshot.target.clone());
     }
 }
@@ -382,9 +404,9 @@ pub(super) fn restore_recovery_surface<F>(
     mut apply_properties: F,
 ) -> Result<(), String>
 where
-    F: FnMut(&WindowProperties) -> Result<(), String>,
+    F: FnMut(SurfaceMode, &WindowProperties) -> Result<(), String>,
 {
-    apply_properties(&recovery.mode.window_properties())
+    apply_properties(recovery.mode, &recovery.mode.window_properties())
 }
 
 pub(super) fn recovery_snapshot_for_failed_transition(
@@ -423,9 +445,9 @@ fn apply_same_mode_target_update(
         },
     )?;
     events::emit_surface_mode_changed(app, mode, mode, target);
-    let _ = window.show();
-    let _ = window.set_focus();
-    proof_harness::sync_after_surface_transition(app);
+    if show_window(window).is_ok() && mode == SurfaceMode::TrayPanel {
+        mark_tray_panel_shown(app);
+    }
     Ok(mode)
 }
 
@@ -443,7 +465,7 @@ pub(super) fn apply_transition(
 
     // Phase 1: apply layout properties (size, decorations, etc.) WITHOUT
     // making the window visible yet.
-    match apply_window_layout(window, &transition.properties) {
+    match apply_window_layout(window, transition.to, &transition.properties) {
         Ok(needs_show) => {
             // Phase 2: commit state + emit event so the React frontend can
             // start rendering the correct surface BEFORE the window appears.
@@ -456,22 +478,24 @@ pub(super) fn apply_transition(
             )?;
             events::emit_surface_mode_changed(app, transition.from, transition.to, current_target);
 
-            // Phase 3: now make the window visible. TrayPanel is revealed by
-            // the frontend after its first layout pass so Windows never shows
-            // the pre-measure blank/backing frame.
-            if needs_show && transition.to != SurfaceMode::TrayPanel {
+            // Phase 3: now make the window visible. (The flyout's own
+            // "revealed by the frontend after first layout" behavior lives
+            // entirely in `shell::flyout_window` + the frontend's
+            // `useTrayPanelLayout` now — `main`'s transitions here can only
+            // ever target Hidden/PopOut/Settings, none of which defer their
+            // own reveal.)
+            if needs_show {
                 let _ = show_window(window);
             }
             clamp_current_window_to_work_area(window);
 
-            proof_harness::sync_after_surface_transition(app);
             Ok(transition.to)
         }
         Err(err) => {
             let recovery =
                 recovery_snapshot_for_failed_transition(transition, previous, &current_target);
-            if let Err(recovery_err) = restore_recovery_surface(&recovery, |properties| {
-                apply_window_properties(window, properties)
+            if let Err(recovery_err) = restore_recovery_surface(&recovery, |mode, properties| {
+                apply_window_properties(window, mode, properties)
             }) {
                 let hidden = hidden_surface_snapshot();
                 if let Err(hide_err) = window.hide().map_err(|e| e.to_string()) {
@@ -496,7 +520,6 @@ pub(super) fn apply_transition(
                     hidden.mode,
                     hidden.target.clone(),
                 );
-                proof_harness::sync_after_surface_transition(app);
                 tracing::warn!(
                     "shell: failed to restore recovery surface during {:?} -> {:?} after reverting to {:?}; forcing hidden surface: apply error: {}; recovery error: {}",
                     transition.from,
@@ -514,7 +537,6 @@ pub(super) fn apply_transition(
                 recovery.mode,
                 recovery.target.clone(),
             );
-            proof_harness::sync_after_surface_transition(app);
             tracing::warn!(
                 "shell: recovered from window-property failure during {:?} -> {:?} by reapplying {:?}: {}",
                 transition.from,
@@ -527,32 +549,9 @@ pub(super) fn apply_transition(
     }
 }
 
-/// Toggle the tray panel: hide if currently showing, show at `position` otherwise.
-pub fn toggle_tray_panel(app: &AppHandle, position: Option<(i32, i32)>) {
-    let current = {
-        let st = app.state::<Mutex<AppState>>();
-        st.lock().unwrap().surface_machine.current()
-    };
-    let main_window_visible = app
-        .get_webview_window("main")
-        .and_then(|window| window.is_visible().ok())
-        .unwrap_or(false);
-
-    if should_hide_tray_panel_on_toggle(current, main_window_visible) {
-        let _ = super::window::hide_to_tray(app);
-    } else {
-        let _ = reopen_to_target(
-            app,
-            SurfaceMode::TrayPanel,
-            SurfaceTarget::Summary,
-            position,
-        );
-    }
-}
-
-pub(super) fn should_hide_tray_panel_on_toggle(
-    current: SurfaceMode,
-    main_window_visible: bool,
-) -> bool {
-    current == SurfaceMode::TrayPanel && main_window_visible
-}
+// The old `handle_tray_panel_click` / `toggle_tray_panel` /
+// `should_hide_tray_panel_on_toggle` trio (tray-icon left-click handling for
+// the shared `main` window's TrayPanel state) was removed here: the flyout is
+// now its own dedicated window, and the tray-icon left-click handler in
+// `tray_bridge.rs` calls `shell::flyout_window::toggle_with_blur_consume`
+// directly instead of going through the `main`-window surface machine.

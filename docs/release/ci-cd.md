@@ -1,90 +1,111 @@
-# Win-CodexBar CI/CD
+# Win-CodexBar CI and release delivery
 
-Win-CodexBar release builds use CircleCI hosted Windows first. Buildkite is kept
-ready for a future non-AWS self-hosted Windows runner. Cloudflare R2 mirrors the
-release artifacts after the Windows smoke test passes.
+## Responsibilities
 
-## Current Model
+CircleCI is the primary hosted Windows validation system. Its
+pr-check workflow runs the canonical scripts/local-check.ps1 -Slice ci contract
+for pull requests and protected branch pushes. CircleCI does not build or
+publish release tags.
 
-- Primary release CI: CircleCI hosted Windows.
-- Artifact mirror: Cloudflare R2.
-- Future self-hosted CI: Buildkite queue `windows-release`.
-- Not used for automated release builds: GitHub Actions, AWS EC2, or an always-on
-  FSOS runner.
+GitHub Actions is the sole canonical release producer. The tag workflow in
+.github/workflows/release.yml runs on a GitHub-hosted Windows runner, because
+SignPath's GitHub trusted-build integration verifies that the build and the
+uploaded signing artifact came from GitHub Actions.
 
-The canonical Windows build path remains:
+The manual .github/workflows/signpath-test.yml workflow exercises the same
+three-file signing bundle with the fixed test-signing policy. It retains the
+verified result as a workflow artifact and never creates or modifies a GitHub
+Release.
 
-```powershell
-powershell.exe -File scripts\release-doctor.ps1 -SkipGitHub
-powershell.exe -File scripts\windows-release-build.ps1 -Ref v0.30.0 -SmokeInstall
-```
+## Production release flow
 
-CI wrappers must call those scripts instead of duplicating the release logic.
+A maintainer creates a protected canonical tag such as v0.60.4 on main. The
+tag workflow then performs this sequence:
 
-## CircleCI
+1. Check out the exact tag and freeze its full 40-character commit SHA.
+2. Run scripts/release-preflight.ps1 to validate the canonical repository,
+   tag/SHA identity, main ancestry, and every committed version file.
+3. Fail immediately if the required SignPath credentials are absent.
+4. Build fresh unsigned artifacts with the existing Windows release builder.
+5. Create a signing input containing exactly these top-level files:
+   - CodexBar-X.Y.Z-Setup.exe
+   - CodexBar-X.Y.Z-portable.exe
+   - CodexBarCLI-vX.Y.Z-windows-x64.zip
+6. Upload that directory as a GitHub Actions artifact and submit it to the
+   pinned codexbar-installer configuration and release-signing policy.
+7. Wait for SignPath to finish. Denial, timeout, approval failure, origin
+   verification failure, missing output, or any malformed output fails the job.
+8. Verify Authenticode on both top-level executables and on codexbar-cli.exe
+   inside the returned CLI ZIP.
+9. Build a new final bundle only from the verified SignPath files, compute all
+   three SHA-256 sidecars after signing, and regenerate release-manifest.json.
+10. Validate the exact six publishable assets, hashes, byte counts, and sidecars.
+11. Run scripts/publish-github-release.ps1, which creates or updates a draft
+    release without replacing divergent assets. A maintainer publishes the
+    draft manually after review.
 
-CircleCI builds tagged releases with the Windows executor from `.circleci/config.yml`.
-The tag workflow runs for tags matching `v*`.
+The unsigned build tree, SignPath output, and final bundle are separate. There
+is no unsigned fallback after a signing failure.
 
-Manual release checks can be started from CircleCI with pipeline parameters:
+The final public asset set is:
 
-- `run_windows_release=true`
-- `upload_cloudflare=false` for dry/manual validation
-- `upload_cloudflare=true` only when Cloudflare R2 secrets are configured
+- CodexBar-X.Y.Z-Setup.exe and its .sha256 sidecar
+- CodexBar-X.Y.Z-portable.exe and its .sha256 sidecar
+- CodexBarCLI-vX.Y.Z-windows-x64.zip and its .sha256 sidecar
 
-Required CircleCI project environment variables for Cloudflare upload:
+release-manifest.json is retained for verification but is not a publishable
+release asset.
 
-- `CLOUDFLARE_ACCOUNT_ID`
-- `CLOUDFLARE_R2_BUCKET`
-- `CLOUDFLARE_R2_ACCESS_KEY_ID`
-- `CLOUDFLARE_R2_SECRET_ACCESS_KEY`
+## SignPath onboarding boundary
 
-`GITHUB_TOKEN` is not required by default. CircleCI should not upload to GitHub
-Releases unless that behavior is explicitly added and reviewed later.
+The repository wiring can be reviewed before production signing is enabled.
+Do not create a production tag until the SignPath project has a valid
+release-signing policy, an issued production certificate, the GitHub.com
+trusted build system linked to the project, the SignPath GitHub App installed
+with repository access, and the repository secrets configured.
 
-## Cloudflare R2
+The production policy is intentionally fail-closed. v0.60.3 remains the
+immutable unsigned release created before this cutover. The first signed
+production release is the next normal version, such as v0.60.4.
 
-Cloudflare R2 is a mirror/proof layer, not the source of truth for publishing.
-The upload script uses R2's S3-compatible API directly:
+After the manual test-signing run, inspect the origin value reported by
+SignPath before narrowing the policy's allowed branch names. Do not guess the
+branch value from the tag name.
 
-```powershell
-powershell.exe -File scripts\ci\upload-cloudflare-r2.ps1 -Version 0.30.0 -DryRun
-powershell.exe -File scripts\ci\upload-cloudflare-r2.ps1 -Version 0.30.0
-```
+## Local checks
 
-Object layout:
+Run the dependency-free release checks:
 
-```text
-releases/v0.30.0/CodexBar-0.30.0-Setup.exe
-releases/v0.30.0/CodexBar-0.30.0-Setup.exe.sha256
-releases/v0.30.0/CodexBar-0.30.0-portable.exe
-releases/v0.30.0/CodexBar-0.30.0-portable.exe.sha256
-releases/v0.30.0/release-manifest.json
-releases/v0.30.0/smoke-test-log.txt
-```
+~~~powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\release-pipeline.tests.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\install-release-prerequisites.ps1 -AssertOnly
+~~~
 
-`smoke-test-log.txt` is uploaded only when the Windows smoke test produced it.
+The build and preflight helpers accept explicit tag and SHA values:
 
-## Buildkite
+~~~powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\release-preflight.ps1 -Tag vX.Y.Z -Sha <full-40-character-sha>
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\circleci-release-build.ps1 -Tag vX.Y.Z -Sha <full-40-character-sha>
+~~~
 
-`.buildkite/pipeline.yml` is a future-runner skeleton. It requires a Windows
-agent attached to the `windows-release` queue and does not start, stop, or manage
-AWS instances.
+The second script retains its historical filename for compatibility; the
+release workflow passes all identity values explicitly and does not depend on
+CircleCI environment variables.
 
-The Buildkite release path requires `BUILDKITE_TAG` and runs:
+## Administrator setup
 
-```powershell
-powershell.exe -File scripts\ci\buildkite-release.ps1
-```
+Configure SIGNPATH_API_TOKEN as the only SignPath GitHub Actions repository
+secret. The workflow pins the reviewed organization ID, project slug,
+release-signing/test-signing policies, and codexbar-installer configuration in
+source. After SignPath issues the certificates, set the nonsecret Actions
+variable SIGNPATH_RELEASE_CERT_THUMBPRINT; production verification requires
+it and compares all three signed executables against it.
+- GITHUB_TOKEN is provided by GitHub Actions
 
-Do not make Buildkite mandatory until a non-AWS Windows host is attached.
+The workflow pins release-signing, test-signing, and codexbar-installer in
+reviewed source. The policy slug is not selected by a mutable secret.
 
-## Release Flow
-
-1. Tag the release, for example `v0.30.0`.
-2. CircleCI hosted Windows builds the installer and portable exe.
-3. `scripts\windows-smoke-install.ps1` installs, verifies, and uninstalls the app.
-4. CircleCI stores release assets and SHA-256 sidecars.
-5. Cloudflare R2 mirrors the assets when secrets are configured.
-6. Publish or update the GitHub release with the verified assets.
-7. Submit the Winget manifest update after the GitHub installer URL is stable.
+Keep CircleCI credentials and release contexts disabled for tag publication.
+CircleCI only needs its existing validation configuration and CI budget
+settings. Protect main and the canonical vX.Y.Z tag namespace so only
+authorized maintainers can create release tags.

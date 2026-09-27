@@ -33,7 +33,7 @@ Increment for backwards-compatible bug fixes and minor improvements.
 Increment for new features that are backwards-compatible.
 
 **Examples:**
-- Add new AI provider (e.g., Amp, Synthetic)
+- Add new AI provider (e.g., Amp, JetBrains AI)
 - Add new animation type (e.g., Unbraid, Tilt)
 - Add new CLI command or flag
 - Add new preferences option

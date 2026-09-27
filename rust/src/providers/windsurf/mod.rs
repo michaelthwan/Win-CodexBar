@@ -67,6 +67,7 @@ impl WindsurfProvider {
                 is_primary: false,
                 dashboard_url: Some("https://windsurf.com/subscription"),
                 status_page_url: Some("https://status.windsurf.com"),
+                tertiary_label_key: None,
             },
         }
     }
@@ -249,7 +250,9 @@ fn decode_json_blob(value: &[u8]) -> Option<String> {
 
     if value.len().is_multiple_of(2) {
         let utf16: Vec<u16> = value
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect();
         if let Ok(text) = String::from_utf16(&utf16)
@@ -272,13 +275,8 @@ fn valid_json_text(text: &str) -> Option<String> {
 
 fn window_from_remaining_percent(remaining: f64, reset_unix: Option<i64>) -> RateWindow {
     let resets_at = reset_unix.and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0));
-    let description = resets_at.as_ref().and_then(format_reset_description);
-    RateWindow::with_details(
-        (100.0 - remaining).clamp(0.0, 100.0),
-        None,
-        resets_at,
-        description,
-    )
+    // Reset countdowns are localized at render time; keep cached snapshots language-neutral.
+    RateWindow::with_details((100.0 - remaining).clamp(0.0, 100.0), None, resets_at, None)
 }
 
 fn usage_window(
@@ -311,23 +309,6 @@ fn with_identity(
         snapshot = snapshot.with_organization(format!("Expires {}", end.format("%Y-%m-%d")));
     }
     snapshot
-}
-
-fn format_reset_description(date: &DateTime<Utc>) -> Option<String> {
-    let now = Utc::now();
-    if *date <= now {
-        return Some("Expired".to_string());
-    }
-    let duration = *date - now;
-    let hours = duration.num_hours();
-    let minutes = duration.num_minutes() % 60;
-    if hours > 24 {
-        Some(format!("Resets in {}d {}h", hours / 24, hours % 24))
-    } else if hours > 0 {
-        Some(format!("Resets in {hours}h {minutes}m"))
-    } else {
-        Some(format!("Resets in {minutes}m"))
-    }
 }
 
 #[cfg(test)]
@@ -372,5 +353,25 @@ mod tests {
             decode_json_value(SqlValue::Text(json.to_string())).as_deref(),
             Some(json)
         );
+    }
+
+    #[test]
+    fn quota_window_with_resets_at_has_no_pre_localized_description() {
+        let future = Utc::now() + chrono::Duration::hours(4);
+        let window = window_from_remaining_percent(80.0, Some(future.timestamp()));
+
+        assert!(window.resets_at.is_some());
+        assert!(
+            window.reset_description.is_none(),
+            "reset_description should be None when resets_at is present, got {:?}",
+            window.reset_description
+        );
+    }
+
+    #[test]
+    fn usage_window_keeps_raw_unit_description() {
+        let window = usage_window(Some(5), Some(5), Some(10), "messages").unwrap();
+
+        assert_eq!(window.reset_description.as_deref(), Some("5 / 10 messages"));
     }
 }

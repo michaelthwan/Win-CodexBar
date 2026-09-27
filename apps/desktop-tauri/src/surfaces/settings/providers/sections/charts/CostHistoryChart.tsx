@@ -8,7 +8,6 @@ interface Props {
   ariaLabel: string;
   providerId: string;
   animations: boolean;
-  surprise: boolean;
   emptyMessage: string;
 }
 
@@ -23,7 +22,6 @@ export function CostHistoryChart({
   ariaLabel,
   providerId,
   animations,
-  surprise,
   emptyMessage,
 }: Props) {
   const recent = data.slice(-30);
@@ -37,7 +35,6 @@ export function CostHistoryChart({
         ariaLabel={ariaLabel}
         valueFormatter={(v) => `$${v.toFixed(2)}`}
         animations={animations}
-        surprise={surprise}
         emptyMessage={emptyMessage}
       />
     </div>

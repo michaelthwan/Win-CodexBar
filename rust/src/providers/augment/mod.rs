@@ -6,7 +6,10 @@
 mod keepalive;
 
 // Re-exports for future session management
-#[allow(unused_imports)]
+#[allow(
+    unused_imports,
+    reason = "keepalive API re-exported for upcoming session-management wiring"
+)]
 pub use keepalive::{AugmentSessionKeepalive, KeepaliveConfig};
 
 use async_trait::async_trait;
@@ -41,6 +44,7 @@ impl AugmentProvider {
                 is_primary: false,
                 dashboard_url: Some("https://app.augmentcode.com/account"),
                 status_page_url: Some("https://status.augmentcode.com"),
+                tertiary_label_key: None,
             },
         }
     }
@@ -138,7 +142,7 @@ impl AugmentProvider {
     async fn fetch_via_web(&self) -> Result<UsageSnapshot, ProviderError> {
         let token = self.read_auth_token().await?;
 
-        let client = reqwest::Client::builder()
+        let client = crate::core::credentialed_http_client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| ProviderError::Other(e.to_string()))?;
@@ -247,7 +251,10 @@ impl AugmentProvider {
         parse_auggie_account_status(&stdout)
     }
 
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "detection probe kept alongside the fetch path; only fetch_via_cli is wired into fetch() today"
+    )]
     /// Probe CLI for detection
     async fn probe_cli(&self) -> Result<UsageSnapshot, ProviderError> {
         self.fetch_via_cli().await.or_else(|_| {
@@ -318,6 +325,23 @@ impl Provider for AugmentProvider {
 
     fn supports_cli(&self) -> bool {
         true
+    }
+    /// Augment's CLI probes raise `NotInstalled` when the CLI binary or
+    /// config root is absent ("Augment CLI not found. Install from ...",
+    /// "Augment not found. Install from ...") — an installation gap, not a
+    /// credential problem — so those surface as an offline local runtime
+    /// (matching the pre-backend classifier's treatment of CLI-presence
+    /// failures). The guard is message-scoped: "Augment config not found"
+    /// (a missing auth config) keeps the default sign-in mapping.
+    fn error_state_kind(&self, error: &ProviderError) -> crate::core::ProviderStateKind {
+        match error {
+            ProviderError::NotInstalled(msg)
+                if msg.contains("Install from") || msg.contains("not found. Install") =>
+            {
+                crate::core::ProviderStateKind::LocalRuntimeOffline
+            }
+            _ => error.state_kind(),
+        }
     }
 }
 
@@ -448,5 +472,29 @@ mod tests {
 
         assert!((usage.primary.used_percent - 98.79).abs() < 0.01);
         assert_eq!(usage.login_method.as_deref(), Some("450,000 credits/month"));
+    }
+
+    #[test]
+    fn cli_presence_maps_to_local_runtime_offline_but_config_stays_default() {
+        // CLI-presence messages surface as an offline local runtime.
+        assert_eq!(
+            AugmentProvider::new().error_state_kind(&ProviderError::NotInstalled(
+                "Augment CLI not found. Install from https://www.augmentcode.com".to_string(),
+            )),
+            crate::core::ProviderStateKind::LocalRuntimeOffline
+        );
+        assert_eq!(
+            AugmentProvider::new().error_state_kind(&ProviderError::NotInstalled(
+                "Augment not found. Install from https://www.augmentcode.com".to_string(),
+            )),
+            crate::core::ProviderStateKind::LocalRuntimeOffline
+        );
+        // The auth-flavored config message keeps the default mapping.
+        assert_eq!(
+            AugmentProvider::new().error_state_kind(&ProviderError::NotInstalled(
+                "Augment config not found".to_string(),
+            )),
+            crate::core::ProviderStateKind::NeedsAuthentication
+        );
     }
 }

@@ -12,30 +12,62 @@ const tauriMocks = vi.hoisted(() => ({
   applyUpdate: vi.fn(),
   dismissUpdate: vi.fn(),
   openReleasePage: vi.fn(),
-  setSurfaceMode: vi.fn(),
+  openFlyoutWindow: vi.fn(),
   openSettingsWindow: vi.fn(),
   quitApp: vi.fn(),
   getProviderChartData: vi.fn(),
   getLocaleStrings: vi.fn(),
   setUiLanguage: vi.fn(),
+  getDeepSeekPricingStatus: vi.fn().mockResolvedValue(null),
+  claudeReconciliationState: vi.fn().mockResolvedValue(null),
 }));
 
 const eventMocks = vi.hoisted(() => ({
   listen: vi.fn(),
 }));
 
-const windowMocks = vi.hoisted(() => ({
-  getCurrentWindow: vi.fn(() => ({
-    setSize: vi.fn().mockResolvedValue(undefined),
-    setPosition: vi.fn().mockResolvedValue(undefined),
-  })),
-  LogicalSize: vi.fn((width: number, height: number) => ({ width, height })),
-  LogicalPosition: vi.fn((x: number, y: number) => ({ x, y })),
-}));
+const windowMocks = vi.hoisted(() => {
+  const setSize = vi.fn().mockResolvedValue(undefined);
+  const setPosition = vi.fn().mockResolvedValue(undefined);
+  const minimize = vi.fn().mockResolvedValue(undefined);
+  const toggleMaximize = vi.fn().mockResolvedValue(undefined);
+  const close = vi.fn().mockResolvedValue(undefined);
+  const isMaximized = vi.fn().mockResolvedValue(false);
+  const onResized = vi.fn().mockResolvedValue(() => {});
+  return {
+    setSize,
+    setPosition,
+    minimize,
+    toggleMaximize,
+    close,
+    isMaximized,
+    onResized,
+    getCurrentWindow: vi.fn(() => ({
+      setSize,
+      setPosition,
+      minimize,
+      toggleMaximize,
+      close,
+      isMaximized,
+      onResized,
+    })),
+    LogicalSize: vi.fn((width: number, height: number) => ({ width, height })),
+    LogicalPosition: vi.fn((x: number, y: number) => ({ x, y })),
+  };
+});
+
+const webviewWindowMocks = vi.hoisted(() => {
+  const setZoom = vi.fn().mockResolvedValue(undefined);
+  return {
+    setZoom,
+    getCurrentWebviewWindow: vi.fn(() => ({ setZoom })),
+  };
+});
 
 vi.mock("../lib/tauri", () => tauriMocks);
 vi.mock("@tauri-apps/api/event", () => eventMocks);
 vi.mock("@tauri-apps/api/window", () => windowMocks);
+vi.mock("@tauri-apps/api/webviewWindow", () => webviewWindowMocks);
 
 import PopOutPanel from "./PopOutPanel";
 import { LocaleProvider } from "../i18n/LocaleProvider";
@@ -66,6 +98,7 @@ function provider(id: string, displayName: string, used = 20): ProviderUsageSnap
     providerId: id,
     displayName,
     primary: rateWindow(used),
+    selectedMetric: rateWindow(used),
     primaryLabel: "Monthly",
     secondary: null,
     modelSpecific: null,
@@ -77,6 +110,7 @@ function provider(id: string, displayName: string, used = 20): ProviderUsageSnap
     sourceLabel: "auto",
     updatedAt: "2026-05-24T00:00:00Z",
     error: null,
+    errorState: "ready",
     pace: null,
     accountOrganization: null,
     trayStatusLabel: null,
@@ -84,56 +118,96 @@ function provider(id: string, displayName: string, used = 20): ProviderUsageSnap
   };
 }
 
+function providerWithThreeQuotaWindows(
+  id: string,
+  displayName: string,
+): ProviderUsageSnapshot {
+  const snapshot = provider(id, displayName);
+  snapshot.secondary = rateWindow(35);
+  snapshot.secondaryLabel = "Weekly";
+  snapshot.tertiary = rateWindow(50);
+  snapshot.tertiaryLabel = "Monthly";
+  return snapshot;
+}
+
 function settings(): SettingsSnapshot {
   return {
     enabledProviders: ["codex", "claude"],
     refreshIntervalSecs: 300,
+    adaptiveRefresh: false,
+    refreshAllProvidersOnMenuOpen: false,
+  lowPowerMode: false,
     startAtLogin: false,
     startMinimized: false,
     showNotifications: true,
     soundEnabled: true,
-    soundVolume: 100,
+    notificationSoundTheme: "windows",
+    notificationSoundPaths: {
+      predictiveWarning: null,
+      highUsage: null,
+      criticalUsage: null,
+      exhausted: null,
+      statusIssue: null,
+      sessionDepleted: null,
+      sessionRestored: null,
+    },
     highUsageThreshold: 70,
     criticalUsageThreshold: 90,
+    predictivePaceWarningEnabled: false,
     trayIconMode: "single",
     switcherShowsIcons: true,
     menuBarShowsHighestUsage: false,
     menuBarShowsPercent: false,
     showAsUsed: true,
-    showCreditsExtraUsage: true,
     showAllTokenAccountsInMenu: false,
-    surpriseAnimations: false,
     enableAnimations: true,
     resetTimeRelative: true,
+    showResetWhenExhausted: false,
     menuBarDisplayMode: "detailed",
+    overviewLayout: "detailed",
     hidePersonalInfo: false,
     updateChannel: "stable",
     autoDownloadUpdates: false,
     installUpdatesOnQuit: false,
     globalShortcut: "Ctrl+Shift+U",
+    codexCustomSessionsDirs: [],
     uiLanguage: "english",
     theme: "dark",
+    windowScalePercent: 125,
+    trayScalePercent: 100,
+    trayPanelAlwaysOnTop: false,
+    powertoysStatusPipeEnabled: false,
     claudeAvoidKeychainPrompts: false,
+    codexSparkUsageVisible: true,
     disableKeychainAccess: false,
-    showDebugSettings: false,
     providerMetrics: {},
     floatBarEnabled: false,
     floatBarOpacity: 80,
+    floatBarScale: 100,
     floatBarOrientation: "horizontal",
+    floatBarStyle: "floating",
     floatBarClickThrough: false,
     floatBarProviderIds: [],
     floatBarDarkText: false,
+    floatBarShowResetInline: false,
+    floatBarShowCost: false,
+    claudeDailyRoutinesUsageVisible: true,
+    claudeAllowReadingClaudeCodeCredentials: false,
+    alibabaTokenPlanRegion: "cn",
+    weeklyProgressWorkDays: null,
+    costSummaryDisplayStyle: "compact",
+    providerAccentColors: {},
   };
 }
 
-function bootstrap(catalog: ProviderCatalogEntry[] = []): BootstrapState {
+function bootstrap(
+  catalog: ProviderCatalogEntry[] = [],
+  settingsOverride: Partial<SettingsSnapshot> = {},
+): BootstrapState {
   return {
     contractVersion: "v1",
-    surfaceModes: [],
-    commands: [],
-    events: [],
     providers: catalog,
-    settings: settings(),
+    settings: { ...settings(), ...settingsOverride },
   };
 }
 
@@ -141,11 +215,17 @@ function renderPopOut(
   providers: ProviderUsageSnapshot[],
   providerId?: string,
   catalog: ProviderCatalogEntry[] = [],
+  settingsOverride: Partial<SettingsSnapshot> = {},
 ) {
   tauriMocks.getCachedProviders.mockResolvedValue(providers);
+  const snapshot = { ...settings(), ...settingsOverride };
+  tauriMocks.getSettingsSnapshot.mockResolvedValue(snapshot);
   return render(
     <LocaleProvider>
-      <PopOutPanel state={bootstrap(catalog)} providerId={providerId} />
+      <PopOutPanel
+        state={{ ...bootstrap(catalog, settingsOverride), settings: snapshot }}
+        providerId={providerId}
+      />
     </LocaleProvider>,
   );
 }
@@ -153,6 +233,7 @@ function renderPopOut(
 describe("PopOutPanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    tauriMocks.claudeReconciliationState.mockResolvedValue(null);
     tauriMocks.refreshProviders.mockResolvedValue(undefined);
     tauriMocks.refreshProvidersIfStale.mockResolvedValue(undefined);
     tauriMocks.getSettingsSnapshot.mockResolvedValue(settings());
@@ -174,8 +255,17 @@ describe("PopOutPanel", () => {
       localUsage: null,
     });
     tauriMocks.getLocaleStrings.mockResolvedValue(
-      buildBundle({ SummaryProvidersLabel: "providers" }),
+      buildBundle({
+        PanelAllProviders: "All providers",
+        PanelAllProvidersShort: "All",
+        PanelLeftSuffix: "left",
+        PanelShowAllProviders: "Show all providers",
+        PanelShowFewerProviders: "Show fewer providers",
+        PanelUsedSuffix: "used",
+        SummaryProvidersLabel: "providers",
+      }),
     );
+    tauriMocks.openFlyoutWindow.mockResolvedValue(undefined);
     eventMocks.listen.mockResolvedValue(() => {});
   });
 
@@ -192,6 +282,80 @@ describe("PopOutPanel", () => {
     expect(container.querySelector(".provider-grid__item--active")?.getAttribute("aria-label")).toBe("Claude");
     expect(screen.getAllByText("Claude").length).toBeGreaterThanOrEqual(2);
     expect(container.querySelectorAll(".menu-stack__item")).toHaveLength(1);
+  });
+
+  it("renders cleanly with the flyout-window rewiring for goTray's onClick", async () => {
+    // goTray's onClick now calls openFlyoutWindow() (formerly
+    // setSurfaceMode("trayPanel", ...)) — asserted directly against the mock
+    // import rather than via a click because `headerActions` (the array
+    // goTray's handler lives in) is currently never rendered by
+    // MenuSurface: `actions` is destructured in MenuSurfaceProps but not
+    // consumed in its JSX (components/MenuSurface.tsx), so there is no
+    // "back to tray" button in the DOM to click today. That's a pre-existing
+    // gap tracked separately, not introduced by this rewiring. This test
+    // instead pins down that the component still renders without error and
+    // that openFlyoutWindow is never called on mount (only on the — for now
+    // unreachable — click), so the rewiring doesn't regress anything that
+    // currently DOES work.
+    renderPopOut([provider("codex", "Codex", 80)]);
+
+    await waitFor(() => {
+      expect(screen.getAllByText("Codex").length).toBeGreaterThan(0);
+    });
+
+    expect(tauriMocks.openFlyoutWindow).not.toHaveBeenCalled();
+  });
+
+  it("applies the persisted PopOut display scale", async () => {
+    const { container } = renderPopOut(
+      [provider("codex", "Codex", 80)],
+      undefined,
+      [],
+      { windowScalePercent: 175 },
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector(".popout-scale-shell")).not.toBeNull();
+    });
+
+    // Scaling is applied via the webview's native zoom, not an inline
+    // `--window-scale` style (which the earlier CSS-zoom approach used).
+    await waitFor(() => {
+      expect(webviewWindowMocks.setZoom).toHaveBeenCalledWith(1.75);
+    });
+  });
+
+  it("does not resize or reposition the native window on mount", async () => {
+    renderPopOut([provider("codex", "Codex", 80)]);
+
+    await waitFor(() => {
+      expect(screen.getAllByText("Codex").length).toBeGreaterThan(0);
+    });
+
+    // The PopOut title bar reads window state (isMaximized) on mount, so
+    // getCurrentWindow is legitimately called; assert only that the surface
+    // itself never resizes or repositions the native window.
+    expect(windowMocks.setSize).not.toHaveBeenCalled();
+    expect(windowMocks.setPosition).not.toHaveBeenCalled();
+  });
+
+  it("localizes static popout panel footer labels in Japanese", async () => {
+    tauriMocks.getLocaleStrings.mockResolvedValue(
+      buildBundle(
+        {
+          MenuAbout: "CodexBar について",
+          MenuQuit: "終了",
+          TooltipSettings: "設定",
+        },
+        "japanese",
+      ),
+    );
+
+    renderPopOut([provider("codex", "Codex", 80)]);
+
+    expect(await screen.findByText("設定")).toBeInTheDocument();
+    expect(screen.getByText("CodexBar について")).toBeInTheDocument();
+    expect(screen.getByText("終了")).toBeInTheDocument();
   });
 
   it("renders overview cards in settings catalog order instead of fetch order", async () => {
@@ -220,6 +384,21 @@ describe("PopOutPanel", () => {
         (node) => node.textContent,
       ),
     ).toEqual(["Codex", "Claude", "Cursor"]);
+  });
+
+  it("keeps compact Overview limited to two quota rows when explicitly selected", async () => {
+    const { container } = renderPopOut(
+      [providerWithThreeQuotaWindows("codex", "Codex")],
+      undefined,
+      [],
+      { overviewLayout: "compact" },
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector(".menu-stack__item")).not.toBeNull();
+    });
+
+    expect(container.querySelectorAll(".menu-metric")).toHaveLength(2);
   });
 
   it("keeps the popout overview focused until the provider grid expands", async () => {

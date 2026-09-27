@@ -95,7 +95,7 @@ impl VertexAITokenRefresher {
             ));
         }
 
-        let client = reqwest::Client::builder()
+        let client = crate::core::credentialed_http_client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| RefreshError::NetworkError(e.to_string()))?;
@@ -147,7 +147,13 @@ impl VertexAITokenRefresher {
             .and_then(|v| v.as_f64())
             .unwrap_or(3600.0);
 
-        let new_expiry_date = Utc::now() + chrono::Duration::seconds(expires_in as i64);
+        // OAuth expires_in is a whole-second lifetime (default 3600), far below i64::MAX.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "token lifetime seconds fit i64"
+        )]
+        let expiry_seconds = expires_in as i64;
+        let new_expiry_date = Utc::now() + chrono::Duration::seconds(expiry_seconds);
 
         // Extract email from new ID token if present
         let email = json

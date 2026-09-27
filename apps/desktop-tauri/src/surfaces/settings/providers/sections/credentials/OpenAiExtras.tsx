@@ -26,9 +26,10 @@ export function OpenAiExtras({ providerId = "codex", t }: Props) {
   const [savedProjectId, setSavedProjectId] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const config = extraConfig(providerId, t);
 
   useEffect(() => {
-    if (providerId !== "openaiapi") return;
+    if (!WORKSPACE_EXTRA_IDS[providerId]) return;
     let cancelled = false;
     void getProviderWorkspaceId(providerId)
       .then((value) => {
@@ -59,24 +60,24 @@ export function OpenAiExtras({ providerId = "codex", t }: Props) {
     }
   };
 
-  if (providerId === "openaiapi") {
+  if (config) {
     return (
       <section className="provider-detail-section">
-        <h4>OpenAI Admin API</h4>
+        <h4>{config.title}</h4>
         <label className="provider-detail-field">
           <span className="provider-detail-field__label">
-            Project ID
+            {config.label}
           </span>
           <input
             className="provider-detail-field__input"
             value={projectId}
-            placeholder="proj_..."
+            placeholder={config.placeholder}
             spellCheck={false}
             onChange={(event) => setProjectId(event.target.value)}
           />
         </label>
         <div className="provider-detail-helper">
-          Leave blank for organization-wide usage. Set a project ID to scope OpenAI usage and cost requests with the Admin API.
+          {config.help}
         </div>
         <div className="provider-detail-actions">
           <button
@@ -85,7 +86,7 @@ export function OpenAiExtras({ providerId = "codex", t }: Props) {
             disabled={busy || projectId.trim() === savedProjectId}
             onClick={saveProjectId}
           >
-            Save
+            {t("Save")}
           </button>
         </div>
         {error && <div className="provider-detail-error">{error}</div>}
@@ -104,4 +105,78 @@ export function OpenAiExtras({ providerId = "codex", t }: Props) {
       </div>
     </section>
   );
+}
+
+const WORKSPACE_EXTRA_IDS: Record<string, true> = {
+  openaiapi: true,
+  litellm: true,
+  devin: true,
+  opencodego: true,
+  zed: true,
+  sub2api: true,
+  xai: true,
+  fireworks: true,
+};
+
+function extraConfig(providerId: string, t: Props["t"]) {
+  switch (providerId) {
+    case "openaiapi":
+      return {
+        title: t("OpenAiAdminApiTitle"),
+        label: t("OpenAiProjectIdLabel"),
+        placeholder: t("OpenAiProjectIdPlaceholder"),
+        help: t("OpenAiProjectIdHelp"),
+      };
+    case "litellm":
+      return {
+        title: t("LiteLlmApiTitle"),
+        label: t("LiteLlmBaseUrlLabel"),
+        placeholder: t("LiteLlmBaseUrlPlaceholder"),
+        help: t("LiteLlmBaseUrlHelp"),
+      };
+    case "devin":
+      return {
+        title: t("DevinApiTitle"),
+        label: t("DevinOrganizationLabel"),
+        placeholder: t("DevinOrganizationPlaceholder"),
+        help: t("DevinOrganizationHelp"),
+      };
+    case "opencodego":
+      return {
+        title: t("OpenCodeGoWorkspaceTitle"),
+        label: t("OpenCodeGoWorkspaceLabel"),
+        placeholder: "wrk_...",
+        help: t("OpenCodeGoWorkspaceHelp"),
+      };
+    case "zed":
+      return {
+        title: t("ZedApiTitle"),
+        label: t("ZedApiUrlLabel"),
+        placeholder: t("ZedApiUrlPlaceholder"),
+        help: t("ZedApiUrlHelp"),
+      };
+    case "sub2api":
+      return {
+        title: t("Sub2ApiTitle"),
+        label: t("Sub2ApiBaseUrlLabel"),
+        placeholder: t("Sub2ApiBaseUrlPlaceholder"),
+        help: t("Sub2ApiBaseUrlHelp"),
+      };
+    case "xai":
+      return {
+        title: "xAI team",
+        label: "Team ID",
+        placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+        help: "Required. Shown in the xAI Console URL and team settings. Or set XAI_TEAM_ID. Pair with a Management API key (not an inference key).",
+      };
+    case "fireworks":
+      return {
+        title: "Fireworks account",
+        label: "Account slug",
+        placeholder: "your-account-slug",
+        help: "From app.fireworks.ai/accounts/<slug>. Or set FIREWORKS_ACCOUNT_SLUG. Pair with a Fireworks API key to read 30-day rated billing spend.",
+      };
+    default:
+      return null;
+  }
 }

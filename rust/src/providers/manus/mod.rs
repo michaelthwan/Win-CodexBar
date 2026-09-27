@@ -59,8 +59,9 @@ impl ManusProvider {
                 is_primary: false,
                 dashboard_url: Some("https://manus.im"),
                 status_page_url: None,
+                tertiary_label_key: None,
             },
-            client: Client::builder()
+            client: crate::core::credentialed_http_client_builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
@@ -220,12 +221,12 @@ impl Provider for ManusProvider {
     async fn fetch_usage(&self, ctx: &FetchContext) -> Result<ProviderFetchResult, ProviderError> {
         match ctx.source_mode {
             SourceMode::Auto | SourceMode::Web => {
-                let cookie = ctx
-                    .manual_cookie_header
-                    .as_deref()
-                    .ok_or(ProviderError::NoCookies)?;
+                let cookie = match ctx.manual_cookie_header.as_deref() {
+                    Some(cookie) => cookie.to_string(),
+                    None => crate::providers::browser_cookie_header(&["manus.im"])?,
+                };
                 Ok(ProviderFetchResult::new(
-                    self.fetch_web(cookie).await?,
+                    self.fetch_web(&cookie).await?,
                     "web",
                 ))
             }

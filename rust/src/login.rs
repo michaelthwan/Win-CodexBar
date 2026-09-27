@@ -2,7 +2,10 @@
 //!
 //! Runs CLI login commands and captures output/URLs
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "login flow types reserved for future session management integration"
+)]
 
 use regex_lite::Regex;
 use std::io::{BufRead, BufReader, Read};
@@ -106,7 +109,33 @@ where
     .await
 }
 
-/// Generic CLI login runner
+/// Run Kiro CLI login
+pub async fn run_kiro_login<F>(timeout_secs: u64, on_phase: F) -> LoginResult
+where
+    F: Fn(LoginPhase) + Send + 'static,
+{
+    // Use Kiro's own binary resolver which checks well-known Windows install
+    // locations in addition to PATH.
+    let binary_path = match crate::providers::kiro::find_kiro_cli() {
+        Some(p) => p,
+        None => return missing_binary_result("kiro-cli"),
+    };
+
+    run_cli_login_path(
+        &binary_path,
+        &["login"],
+        timeout_secs,
+        on_phase,
+        &[
+            "Successfully logged in",
+            "Login successful",
+            "Logged in successfully",
+        ],
+    )
+    .await
+}
+
+/// Generic CLI login runner (resolves binary via PATH)
 async fn run_cli_login<F>(
     binary: &str,
     args: &[&str],
@@ -122,9 +151,23 @@ where
         Err(_) => return missing_binary_result(binary),
     };
 
+    run_cli_login_path(&binary_path, args, timeout_secs, on_phase, success_markers).await
+}
+
+/// Generic CLI login runner (uses a pre-resolved binary path)
+async fn run_cli_login_path<F>(
+    binary_path: &std::path::Path,
+    args: &[&str],
+    timeout_secs: u64,
+    on_phase: F,
+    success_markers: &[&str],
+) -> LoginResult
+where
+    F: Fn(LoginPhase) + Send + 'static,
+{
     on_phase(LoginPhase::Requesting);
 
-    let mut child = match spawn_login_process(binary_path.as_path(), args) {
+    let mut child = match spawn_login_process(binary_path, args) {
         Ok(c) => c,
         Err(e) => return launch_failed_result(e),
     };
@@ -230,7 +273,8 @@ where
 
         self.auth_link = Some(m.as_str().to_string());
         (self.on_phase)(LoginPhase::WaitingBrowser);
-        let _ = open::that(m.as_str());
+        // Best-effort browser open; the link stays on screen for manual use.
+        let _opened_browser = open::that(m.as_str());
     }
 
     fn into_result(self, outcome: LoginOutcome) -> LoginResult {
@@ -265,7 +309,8 @@ fn stop_child_with_outcome<F>(
 where
     F: Fn(LoginPhase),
 {
-    let _ = child.kill();
+    // Best-effort teardown; the child may already have exited.
+    let _killed = child.kill();
     state.into_result(outcome)
 }
 
