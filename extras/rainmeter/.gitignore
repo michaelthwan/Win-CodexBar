@@ -1,0 +1,2 @@
+# The root .gitignore excludes *.ps1; this skin ships its scripts.
+!*.ps1
