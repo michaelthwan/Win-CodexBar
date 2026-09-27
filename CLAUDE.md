@@ -14,6 +14,10 @@ Keep fork-only work out of upstream files so merges stay conflict-free:
   prebuilt binaries). Re-check it after every upstream merge.
 - Build locally from this tree (`pnpm --dir apps/desktop-tauri run tauri:build`); do not use
   `scripts/windows-release-build.ps1`, which clones upstream and drops the updater patch.
+- Never push `v*` tags to origin: they trigger `.github/workflows/release.yml` on the fork.
+- The root `.gitignore` ignores `*.ps1`; scripts under `extras/` need a local `!*.ps1` re-include.
+- `apps/desktop-tauri/src/lib/paceBudget.test.ts` fails outside UTC (timezone-dependent test); run with `TZ=UTC`.
+- Dated handoff notes from past syncs live in `extras/handoffs/`.
 
 ## What this is
 
